@@ -14,7 +14,9 @@ const POLL_MS = 1_000;
 function runtime(threads: Record<string, { status: DelegationThreadStatus; turnId?: string }>) {
   const sent: ThreadSendInput[] = [];
   const sendFailures: DelegationControlError[] = [];
+  const readFailure: { current?: DelegationControlError } = {};
   const read = vi.fn(async ({ threadId }: { threadId: string }) => {
+    if (readFailure.current) throw readFailure.current;
     const thread = threads[threadId];
     if (!thread) throw new DelegationControlError("THREAD_NOT_FOUND", "Thread was not found");
     const turnId = thread.turnId ?? `turn-${threadId}`;
@@ -42,7 +44,7 @@ function runtime(threads: Record<string, { status: DelegationThreadStatus; turnI
   });
   const update = (threadId: string, patch: { status?: DelegationThreadStatus; turnId?: string }) =>
     Object.assign(threads[threadId] ?? {}, patch);
-  return { threads, sent, sendFailures, read, send, update };
+  return { threads, sent, sendFailures, readFailure, read, send, update };
 }
 
 const busy = () => new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
@@ -205,6 +207,27 @@ describe("DelegationWatchService", () => {
     delete fake.threads.child;
     await vi.advanceTimersByTimeAsync(POLL_MS);
     expect(fake.sent[0]?.message).toContain("codex://threads/child no longer exists.");
+  });
+
+  it("reports unreadable only after reads keep failing", async () => {
+    const fake = runtime({ child: { status: "running" }, parent: { status: "completed" } });
+    const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
+    await service.watch({ threadId: "child", notifyThreadId: "parent", timeoutMs: 29 * 60_000 });
+
+    // A short outage is not reported.
+    fake.readFailure.current = new DelegationControlError("INTERNAL_ERROR", "read failed");
+    await vi.advanceTimersByTimeAsync(30_000);
+    delete fake.readFailure.current;
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(fake.sent).toEqual([]);
+
+    fake.readFailure.current = new DelegationControlError("INTERNAL_ERROR", "Harness is gone");
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(fake.sent).toEqual([]);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(fake.sent).toHaveLength(1);
+    expect(fake.sent[0]?.message).toContain("could not be read for 60 s");
+    expect(fake.sent[0]?.message).toContain("Harness is gone");
   });
 
   it("stops all work when closed", async () => {

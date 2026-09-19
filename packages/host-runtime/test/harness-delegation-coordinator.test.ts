@@ -510,6 +510,7 @@ describe("HarnessDelegationCoordinator", () => {
       });
       const thread = value.registered[0];
       if (!thread) throw new Error("delegated Thread was not registered");
+      expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
       // The Adapter completed the Turn as failed, then its process died.
       thread.running = false;
       thread.activeTurnId = null;

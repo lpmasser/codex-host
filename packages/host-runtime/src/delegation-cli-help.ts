@@ -12,9 +12,10 @@ Omit --model and --thinking to use the Harness native defaults.
 Reuse --request-id for an idempotent retry. Identical recent parent/target/task/configuration requests are also deduplicated briefly.
 --watch true also registers thread watch on the child with the resolved parent as the notified Thread; the response's watch field reports whether it was registered.
 The response confirms cwd and parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
-  "thread send": `codexhost thread send <thread> --message <text> [--format json|compact]
+  "thread send": `codexhost thread send <thread> --message <text> [--watch true|false] [--watch-timeout-ms <n>] [--notify <thread>] [--format json|compact]
 Start a new Turn in an idle writable Thread and return immediately.
-THREAD_BUSY means the current Turn is still active: wait or cancel before sending. Messages are not queued.`,
+THREAD_BUSY means the current Turn is still active: wait or cancel before sending. Messages are not queued.
+--watch true also registers thread watch on the Turn this message starts; the response's watch field reports whether it was registered. See thread watch --help for --notify and the notification.`,
   "thread cancel": `codexhost thread cancel <thread> [--format json|compact]
 Request cancellation of the active Turn while preserving the Thread and history.
 cancelled=true (compact: cancelRequested=true) means the cancellation request was accepted. Read or wait to confirm the terminal state. An idle Thread returns false.`,
@@ -30,9 +31,9 @@ timedOut=true is a running checkpoint: the child keeps running. The response alr
 Message pagination uses --view messages, default limit 25, maximum 100. hasMore is for current pages; nextCursor also supports future incremental reads.`,
   "thread watch": `codexhost thread watch <thread> [--notify <thread>] [--timeout-ms <n>] [--format json|compact]
 Ask the Host to notify one Thread, once, when the watched Thread's current Turn stops. Returns immediately; no waiting or polling by the caller is needed, and the caller may end its Turn.
---notify defaults to the calling Thread when the Host provides it; otherwise pass it explicitly (delegate start reports the caller as its parent).
-The notification starts a new Turn in the notified Thread with the watched Thread's link and outcome: completed, failed, interrupted, superseded (a newer Turn already started), timedOut, or notFound. It reports execution state only; read the Thread to judge the work.
---timeout-ms defaults to 1740000 (29 min). timedOut means the Thread had not reached a terminal state, which also covers a Harness that stopped without reporting it; watch again to keep waiting.
+--notify defaults to the calling Thread. A caller the Host cannot identify directly (native Codex) is inferred as the only other Thread with an active Turn; PARENT_THREAD_AMBIGUOUS requires an explicit --notify (delegate start reports the caller as its parent).
+The notification starts a new Turn in the notified Thread with the watched Thread's link and outcome: completed, failed, interrupted, superseded (a newer Turn already started), timedOut, unreadable, or notFound. It reports execution state only; read the Thread to judge the work.
+--timeout-ms defaults to 1740000 (29 min). timedOut means the Thread had not reached a terminal state, which also covers a Harness that stopped without reporting it; watch again to keep waiting. unreadable means reads failed for 60 s, so the state is unknown.
 state=watching means registered. state=alreadyTerminal means the Thread was not running: nothing was registered and nothing will be sent.
 A busy notified Thread is notified after its Turn ends (retried for up to 6 hours); notifications due together arrive as one message. THREAD_BUSY is never treated as delivered.
 A watch is one-shot and cannot be cancelled. Watches live in Host Runtime memory and are lost when it restarts.`,

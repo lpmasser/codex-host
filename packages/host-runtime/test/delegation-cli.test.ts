@@ -517,9 +517,8 @@ describe("delegation CLI", () => {
     });
   });
 
-  it("requires an explicit notified Thread when the caller is unknown", async () => {
+  it("lets the Host infer the notified Thread when the caller is unknown", async () => {
     const fetchImpl = successfulFetch({});
-    const diagnosticOutput = new PassThrough();
     expect(
       await runDelegationCli({
         arguments: ["thread", "watch", "child"],
@@ -528,14 +527,56 @@ describe("delegation CLI", () => {
           [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
         },
         output: new PassThrough(),
-        diagnosticOutput,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    const [, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
+    expect(JSON.parse(String(init?.body))).toEqual({ threadId: "child", timeoutMs: 1_740_000 });
+  });
+
+  it("asks thread send to watch the Turn it starts only when requested", async () => {
+    const environment = {
+      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+      [DELEGATION_THREAD_ID_ENV]: "caller",
+    };
+    const fetchImpl = successfulFetch({});
+    const base = ["thread", "send", "child", "--message", "continue"];
+    await runDelegationCli({ arguments: base, environment, output: new PassThrough(), fetchImpl });
+    await runDelegationCli({
+      arguments: [...base, "--watch", "true"],
+      environment,
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    await runDelegationCli({
+      arguments: [...base, "--watch", "true", "--notify", "codex://threads/other"],
+      environment,
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    const bodies = vi
+      .mocked(fetchImpl)
+      .mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+    expect(bodies[0]).toEqual({ threadId: "child", message: "continue" });
+    expect(bodies[1]).toEqual({
+      threadId: "child",
+      message: "continue",
+      watchTimeoutMs: 1_740_000,
+      notifyThreadId: "caller",
+    });
+    expect(bodies[2]).toMatchObject({ notifyThreadId: "other" });
+
+    expect(
+      await runDelegationCli({
+        arguments: [...base, "--notify", "other"],
+        environment,
+        output: new PassThrough(),
+        diagnosticOutput: new PassThrough(),
         fetchImpl,
       }),
     ).toBe(1);
-    expect(JSON.parse(outputText(diagnosticOutput))).toMatchObject({
-      error: { code: "INVALID_ARGUMENT" },
-    });
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 
   it("asks delegate start to watch the child only when requested", async () => {

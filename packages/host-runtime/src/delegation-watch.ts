@@ -3,7 +3,6 @@ import {
   DelegationControlError,
   type DelegationControlApi,
   type DelegationThreadSnapshot,
-  type DelegationWatchApi,
   type ThreadWatchEntry,
   type ThreadWatchInput,
   type ThreadWatchListResult,
@@ -16,6 +15,8 @@ const DEFAULT_POLL_INTERVAL_MS = 2_000;
 /** How long a fired notification may wait for a busy or unreachable subscriber. */
 const DELIVERY_WINDOW_MS = 6 * 60 * 60_000;
 const MAX_UNDELIVERABLE_ENTRIES = 50;
+/** Reads failing for this long are reported instead of waiting for the timeout. */
+const UNREADABLE_GRACE_MS = 60_000;
 
 interface Watch extends ThreadWatchEntry {
   /** Turn observed at registration; a different Turn means the watched one ended. */
@@ -23,6 +24,8 @@ interface Watch extends ThreadWatchEntry {
   timeoutMs: number;
   deadline: number;
   deliveryDeadline?: number;
+  unreadableSince?: number;
+  lastReadError?: string;
 }
 
 function terminal(status: DelegationThreadSnapshot["status"]): boolean {
@@ -42,6 +45,8 @@ function describe(watch: Watch): string {
   switch (watch.outcome) {
     case "timedOut":
       return `${link} has not reached a terminal state after ${Math.round(watch.timeoutMs / 60_000)} min; this watch expired. Run 'codexhost thread watch' again to keep waiting.`;
+    case "unreadable":
+      return `${link} could not be read for ${Math.round(UNREADABLE_GRACE_MS / 1_000)} s, so its state is unknown (${watch.lastReadError ?? "unknown error"}).`;
     case "notFound":
       return `${link} no longer exists.`;
     case "superseded":
@@ -63,7 +68,7 @@ function notification(watches: readonly Watch[]): string {
  * operations, so it is independent of Harness, Desktop and delegation lineage.
  * State is in memory: watches do not survive a Host Runtime restart.
  */
-export class DelegationWatchService implements DelegationWatchApi {
+export class DelegationWatchService {
   readonly #api: Pick<DelegationControlApi, "read" | "send">;
   readonly #pollIntervalMs: number;
   readonly #watches: Watch[] = [];
@@ -182,9 +187,13 @@ export class DelegationWatchService implements DelegationWatchApi {
       const turnId = snapshot.turn?.turnId ?? null;
       if (watch.turnId && turnId && turnId !== watch.turnId) return "superseded";
       watch.turnId ??= turnId;
+      delete watch.unreadableSince;
     } catch (error) {
       if (errorCode(error) === "THREAD_NOT_FOUND") return "notFound";
-      // Other read failures may be transient; the timeout below bounds them.
+      // Other read failures may be transient, so only a sustained failure is reported.
+      watch.unreadableSince ??= Date.now();
+      watch.lastReadError = error instanceof Error ? error.message : String(error);
+      if (Date.now() - watch.unreadableSince >= UNREADABLE_GRACE_MS) return "unreadable";
     }
     return Date.now() >= watch.deadline ? "timedOut" : undefined;
   }

@@ -17,6 +17,20 @@ function threadLink(threadId: string): string {
   return `codex://threads/${threadId}`;
 }
 
+function watchOutput(watch: DelegationStartResult["watch"]): { watch?: unknown } {
+  if (!watch) return {};
+  return {
+    watch:
+      watch.state === "notRegistered"
+        ? watch
+        : {
+            state: watch.state,
+            notify: threadLink(watch.notifyThreadId),
+            timeoutMs: watch.timeoutMs,
+          },
+  };
+}
+
 function inspectOutput({ harnessId, inspection }: HarnessInspectResult): unknown {
   if (inspection.status !== "ready") return { harnessId, ...inspection };
   const { catalog } = inspection;
@@ -99,14 +113,7 @@ export function compactDelegationOutput(
         ...(effective?.effectiveThinkingOptionId
           ? { thinking: effective.effectiveThinkingOptionId }
           : {}),
-        ...(result.watch
-          ? {
-              watch:
-                result.watch.state === "notRegistered"
-                  ? result.watch
-                  : { state: result.watch.state, timeoutMs: result.watch.timeoutMs },
-            }
-          : {}),
+        ...watchOutput(result.watch),
       };
     }
     case "thread send": {
@@ -115,6 +122,7 @@ export function compactDelegationOutput(
         thread: threadLink(result.threadId),
         harnessId: result.harnessId,
         status: result.status,
+        ...watchOutput(result.watch),
       };
     }
     case "thread cancel": {

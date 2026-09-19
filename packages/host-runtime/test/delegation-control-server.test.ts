@@ -185,8 +185,9 @@ describe("delegation control server", () => {
       parentThreadId: "parent",
       next: { read: "read", wait: "wait" },
     }));
-    const watch = vi.fn(async (input: { threadId: string; notifyThreadId: string }) => ({
-      ...input,
+    const watch = vi.fn(async (input: { threadId: string; notifyThreadId?: string }) => ({
+      threadId: input.threadId,
+      notifyThreadId: input.notifyThreadId ?? "inferred",
       state: "watching" as const,
       status: "running" as const,
       timeoutMs: 5_000,
@@ -234,6 +235,25 @@ describe("delegation control server", () => {
         threadId: "child",
         watch: { state: "notRegistered", reason: "synthetic watch failure" },
       });
+
+      api.send.mockResolvedValue({
+        threadId: "child",
+        turnId: "turn-2",
+        harnessId: "pi",
+        status: "running",
+        next: { read: "read", wait: "wait" },
+      });
+      const sent = await fetch(
+        `${server.endpoint}/v1/thread/send`,
+        authorized({ threadId: "child", message: "continue", watchTimeoutMs: 5_000 }),
+      );
+      await expect(sent.json()).resolves.toMatchObject({
+        turnId: "turn-2",
+        watch: { state: "watching" },
+      });
+      // Only the message reaches the Host session; an omitted notified Thread is inferred.
+      expect(api.send).toHaveBeenCalledWith({ threadId: "child", message: "continue" });
+      expect(watch).toHaveBeenLastCalledWith({ threadId: "child", timeoutMs: 5_000 });
 
       const rejected = await fetch(
         `${unsupported.endpoint}/v1/thread/watch`,

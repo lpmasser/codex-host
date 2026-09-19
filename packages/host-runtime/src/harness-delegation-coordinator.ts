@@ -560,16 +560,20 @@ export class HarnessDelegationCoordinator {
     };
   }
 
-  async #resolveParent(explicit?: string): Promise<string> {
-    if (explicit) return explicit;
-    const environmentThreadId = this.#environment[DELEGATION_THREAD_ID_ENV];
-    if (environmentThreadId) return environmentThreadId;
+  /** External and native Codex Threads that currently have an active Turn. */
+  activeThreadIds(): string[] {
     const external = this.#externalRuntime
       .values()
       .filter((thread) => thread.running)
       .map((thread) => thread.id);
-    const official = this.#activeOfficialParents();
-    const active = [...external, ...official];
+    return [...external, ...this.#activeOfficialParents()];
+  }
+
+  async #resolveParent(explicit?: string): Promise<string> {
+    if (explicit) return explicit;
+    const environmentThreadId = this.#environment[DELEGATION_THREAD_ID_ENV];
+    if (environmentThreadId) return environmentThreadId;
+    const active = this.activeThreadIds();
     const onlyActive = active.length === 1 ? active[0] : undefined;
     if (onlyActive) return onlyActive;
     throw new DelegationControlError(

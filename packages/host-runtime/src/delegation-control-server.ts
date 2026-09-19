@@ -12,7 +12,7 @@ import {
   type ThreadSendInput,
   type ThreadReadInput,
   type ThreadWaitInput,
-  type ThreadWatchInput,
+  type ThreadWatchRequest,
 } from "./delegation-types.js";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -79,6 +79,14 @@ function watchApi(api: DelegationWatchApi | undefined): DelegationWatchApi {
   return api;
 }
 
+/** The Turn already started, so a watch failure is reported beside it, not thrown. */
+function watchStartedTurn(watches: DelegationWatchApi, request: ThreadWatchRequest) {
+  return watches.watch(request).catch((error: unknown) => ({
+    state: "notRegistered" as const,
+    reason: error instanceof Error ? error.message : String(error),
+  }));
+}
+
 /** `delegate start --watch`: the Host-resolved parent is the notified Thread. */
 async function startWithWatch(
   api: DelegationControlApi,
@@ -87,20 +95,27 @@ async function startWithWatch(
 ): Promise<unknown> {
   const { watchTimeoutMs, ...start } = body;
   const result = await api.start(start as unknown as DelegationStartInput);
-  if (!result.parentThreadId) {
-    return { ...result, watch: { state: "notRegistered", reason: "Parent Thread is unknown" } };
-  }
-  // The delegation already exists, so a watch failure is reported, not thrown.
-  const watch = await watches
-    .watch({
-      threadId: result.threadId,
-      notifyThreadId: result.parentThreadId,
-      timeoutMs: watchTimeoutMs as number,
-    })
-    .catch((error: unknown) => ({
-      state: "notRegistered" as const,
-      reason: error instanceof Error ? error.message : String(error),
-    }));
+  const watch = await watchStartedTurn(watches, {
+    threadId: result.threadId,
+    timeoutMs: watchTimeoutMs as number,
+    ...(result.parentThreadId ? { notifyThreadId: result.parentThreadId } : {}),
+  });
+  return { ...result, watch };
+}
+
+/** `thread send --watch`: notify the caller when the Turn this message starts stops. */
+async function sendWithWatch(
+  api: DelegationControlApi,
+  watches: DelegationWatchApi,
+  body: Record<string, unknown>,
+): Promise<unknown> {
+  const { watchTimeoutMs, notifyThreadId, ...send } = body;
+  const result = await api.send(send as unknown as ThreadSendInput);
+  const watch = await watchStartedTurn(watches, {
+    threadId: result.threadId,
+    timeoutMs: watchTimeoutMs as number,
+    ...(typeof notifyThreadId === "string" ? { notifyThreadId } : {}),
+  });
   return { ...result, watch };
 }
 
@@ -141,7 +156,13 @@ export async function startDelegationControlServer(input: {
           );
           return;
         case "/v1/thread/send":
-          writeJson(response, 200, await input.api.send(body as unknown as ThreadSendInput));
+          writeJson(
+            response,
+            200,
+            body.watchTimeoutMs === undefined
+              ? await input.api.send(body as unknown as ThreadSendInput)
+              : await sendWithWatch(input.api, watchApi(input.watchApi), body),
+          );
           return;
         case "/v1/thread/cancel":
           writeJson(response, 200, await input.api.cancel(body as unknown as ThreadCancelInput));
@@ -156,7 +177,7 @@ export async function startDelegationControlServer(input: {
           writeJson(
             response,
             200,
-            await watchApi(input.watchApi).watch(body as unknown as ThreadWatchInput),
+            await watchApi(input.watchApi).watch(body as unknown as ThreadWatchRequest),
           );
           return;
         case "/v1/thread/watches":

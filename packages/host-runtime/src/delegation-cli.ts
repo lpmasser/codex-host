@@ -275,7 +275,7 @@ export async function runDelegationCli(input: {
       return 0;
     }
     if (group === "thread" && command === "send") {
-      rejectUnknown(parsed, ["--message"]);
+      rejectUnknown(parsed, ["--message", "--watch", "--watch-timeout-ms", "--notify"]);
       if (parsed.positionals.length !== 1) {
         throw new DelegationControlError(
           "INVALID_ARGUMENT",
@@ -290,12 +290,32 @@ export async function runDelegationCli(input: {
           "Thread identifier and --message are required",
         );
       }
+      const watch = value(parsed, "--watch");
+      if (watch !== undefined && watch !== "true" && watch !== "false")
+        throw new DelegationControlError("INVALID_ARGUMENT", "--watch must be true or false");
+      if (watch !== "true" && (value(parsed, "--watch-timeout-ms") || value(parsed, "--notify")))
+        throw new DelegationControlError(
+          "INVALID_ARGUMENT",
+          "--watch-timeout-ms and --notify require --watch true",
+        );
+      const notifyThread = value(parsed, "--notify") ?? environment[DELEGATION_THREAD_ID_ENV];
       writeResult(
         "thread send",
         await requestRuntime({
           environment,
           path: "/v1/thread/send",
-          body: { threadId: normalizeThreadId(threadId), message },
+          body: {
+            threadId: normalizeThreadId(threadId),
+            message,
+            ...(watch === "true"
+              ? {
+                  watchTimeoutMs: value(parsed, "--watch-timeout-ms")
+                    ? positiveInteger(value(parsed, "--watch-timeout-ms"), "--watch-timeout-ms")
+                    : DEFAULT_WATCH_TIMEOUT_MS,
+                  ...(notifyThread ? { notifyThreadId: normalizeThreadId(notifyThread) } : {}),
+                }
+              : {}),
+          },
           ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
         }),
       );
@@ -382,12 +402,9 @@ export async function runDelegationCli(input: {
           "thread watch requires one Thread identifier",
         );
       const threadId = parsed.positionals[0];
+      if (!threadId)
+        throw new DelegationControlError("INVALID_ARGUMENT", "Thread identifier is required");
       const notifyThread = value(parsed, "--notify") ?? environment[DELEGATION_THREAD_ID_ENV];
-      if (!threadId || !notifyThread)
-        throw new DelegationControlError(
-          "INVALID_ARGUMENT",
-          "The notified Thread cannot be inferred here; pass --notify <thread> (delegate start reports the caller as its parent)",
-        );
       writeResult(
         "thread watch",
         await requestRuntime({
@@ -395,7 +412,7 @@ export async function runDelegationCli(input: {
           path: "/v1/thread/watch",
           body: {
             threadId: normalizeThreadId(threadId),
-            notifyThreadId: normalizeThreadId(notifyThread),
+            ...(notifyThread ? { notifyThreadId: normalizeThreadId(notifyThread) } : {}),
             timeoutMs: value(parsed, "--timeout-ms")
               ? positiveInteger(value(parsed, "--timeout-ms"), "--timeout-ms")
               : DEFAULT_WATCH_TIMEOUT_MS,

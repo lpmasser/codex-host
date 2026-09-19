@@ -106,6 +106,8 @@ export interface ThreadSendResult {
   turnId: string;
   harnessId: RoutedHarnessId;
   status: "running";
+  /** Present only when the caller asked `thread send` to also watch the new Turn. */
+  watch?: ThreadWatchResult | { state: "notRegistered"; reason: string };
   next: { read: string; wait: string };
 }
 
@@ -169,6 +171,11 @@ export interface ThreadWatchInput {
   timeoutMs: number;
 }
 
+/** A watch as requested by a caller; the Host infers an omitted notified Thread. */
+export type ThreadWatchRequest = Omit<ThreadWatchInput, "notifyThreadId"> & {
+  notifyThreadId?: string;
+};
+
 export type ThreadWatchOutcome =
   | "completed"
   | "failed"
@@ -177,6 +184,8 @@ export type ThreadWatchOutcome =
   | "superseded"
   /** The Thread was still running when the watch expired. */
   | "timedOut"
+  /** Reads kept failing, so the state of the Thread is unknown. */
+  | "unreadable"
   | "notFound";
 
 export interface ThreadWatchResult {
@@ -207,7 +216,7 @@ export interface ThreadWatchListResult {
  * Host sessions keep implementing only the per-Thread operations.
  */
 export interface DelegationWatchApi {
-  watch(input: ThreadWatchInput): Promise<ThreadWatchResult>;
+  watch(request: ThreadWatchRequest): Promise<ThreadWatchResult>;
   watches(): Promise<ThreadWatchListResult>;
 }
 
@@ -225,6 +234,8 @@ export interface DelegationControlApi {
 export interface DelegationControlRegistration extends DelegationControlApi {
   canHandleStart(input: DelegationStartInput): boolean | Promise<boolean>;
   ownsThread(threadId: string): boolean | Promise<boolean>;
+  /** Threads with an active Turn; used to infer a caller that did not identify itself. */
+  activeThreadIds?(): string[] | Promise<string[]>;
 }
 
 export type DelegationControlErrorCode =
