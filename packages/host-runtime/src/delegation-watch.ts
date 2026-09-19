@@ -71,16 +71,18 @@ function notification(watches: readonly Watch[]): string {
 export class DelegationWatchService {
   readonly #api: Pick<DelegationControlApi, "read" | "send">;
   readonly #pollIntervalMs: number;
+  readonly #diagnose: (error: unknown) => void;
   readonly #watches: Watch[] = [];
   #timer: ReturnType<typeof setTimeout> | undefined;
   #closed = false;
 
   constructor(
     api: Pick<DelegationControlApi, "read" | "send">,
-    options: { pollIntervalMs?: number } = {},
+    options: { pollIntervalMs?: number; diagnose?: (error: unknown) => void } = {},
   ) {
     this.#api = api;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#diagnose = options.diagnose ?? (() => undefined);
   }
 
   async watch(input: ThreadWatchInput): Promise<ThreadWatchResult> {
@@ -151,10 +153,13 @@ export class DelegationWatchService {
     if (this.#closed || this.#timer) return;
     if (!this.#watches.some((watch) => watch.state !== "undeliverable")) return;
     this.#timer = setTimeout(() => {
-      void this.#tick().finally(() => {
-        this.#timer = undefined;
-        this.#schedule();
-      });
+      // A background loop must never take the Host Runtime down with it.
+      void this.#tick()
+        .catch((error: unknown) => this.#diagnose(error))
+        .finally(() => {
+          this.#timer = undefined;
+          this.#schedule();
+        });
     }, this.#pollIntervalMs);
     this.#timer.unref?.();
   }

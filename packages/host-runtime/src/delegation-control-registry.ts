@@ -25,7 +25,11 @@ function only<T>(values: readonly T[], message: string): T {
 export class DelegationControlRegistry implements DelegationControlApi, DelegationWatchApi {
   readonly #registrations = new Set<DelegationControlRegistration>();
   // Watches sit above the sessions so either end may belong to any registered session.
-  readonly #watchService = new DelegationWatchService(this);
+  readonly #watchService: DelegationWatchService;
+
+  constructor(options: { diagnose?: (error: unknown) => void } = {}) {
+    this.#watchService = new DelegationWatchService(this, options);
+  }
 
   get size(): number {
     return this.#registrations.size;

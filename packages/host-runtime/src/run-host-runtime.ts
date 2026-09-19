@@ -92,7 +92,12 @@ async function prepareDelegationRuntime(input: {
     registry: DelegationControlRegistry,
   ): Promise<number>;
 }): Promise<number> {
-  const registry = new DelegationControlRegistry();
+  const registry = new DelegationControlRegistry({
+    diagnose: (error) =>
+      process.stderr.write(
+        `codexhost delegation watch: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+      ),
+  });
   const token = randomBytes(32).toString("hex");
   const server = await startDelegationControlServer({ token, api: registry, watchApi: registry });
   const cliPath = delegationCliPath(input.environment);

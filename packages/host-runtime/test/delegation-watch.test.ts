@@ -230,6 +230,23 @@ describe("DelegationWatchService", () => {
     expect(fake.sent[0]?.message).toContain("Harness is gone");
   });
 
+  it("retries delivery after send throws synchronously", async () => {
+    const fake = runtime({ child: { status: "running" }, parent: { status: "completed" } });
+    const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
+    await service.watch({ threadId: "child", notifyThreadId: "parent", timeoutMs: 60_000 });
+    const send = fake.send.getMockImplementation();
+    fake.update("child", { status: "completed" });
+    fake.send.mockImplementationOnce(() => {
+      throw new TypeError("synthetic bug");
+    });
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(fake.sent).toEqual([]);
+
+    if (send) fake.send.mockImplementation(send);
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(fake.sent).toHaveLength(1);
+  });
+
   it("stops all work when closed", async () => {
     const fake = runtime({ child: { status: "running" }, parent: { status: "completed" } });
     const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
