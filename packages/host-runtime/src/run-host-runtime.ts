@@ -94,7 +94,7 @@ async function prepareDelegationRuntime(input: {
 }): Promise<number> {
   const registry = new DelegationControlRegistry();
   const token = randomBytes(32).toString("hex");
-  const server = await startDelegationControlServer({ token, api: registry });
+  const server = await startDelegationControlServer({ token, api: registry, watchApi: registry });
   const cliPath = delegationCliPath(input.environment);
   const environment = {
     ...input.environment,
@@ -118,6 +118,7 @@ async function prepareDelegationRuntime(input: {
   try {
     return await input.createHost(environment, (value) => registry.register(value), registry);
   } finally {
+    registry.close();
     await server.close();
   }
 }

@@ -7,6 +7,8 @@ import {
   type HarnessInspectResult,
   type ThreadCancelResult,
   type ThreadSendResult,
+  type ThreadWatchListResult,
+  type ThreadWatchResult,
 } from "./delegation-types.js";
 
 export type DelegationCliFormat = "json" | "compact";
@@ -97,6 +99,14 @@ export function compactDelegationOutput(
         ...(effective?.effectiveThinkingOptionId
           ? { thinking: effective.effectiveThinkingOptionId }
           : {}),
+        ...(result.watch
+          ? {
+              watch:
+                result.watch.state === "notRegistered"
+                  ? result.watch
+                  : { state: result.watch.state, timeoutMs: result.watch.timeoutMs },
+            }
+          : {}),
       };
     }
     case "thread send": {
@@ -118,6 +128,28 @@ export function compactDelegationOutput(
     case "thread read":
     case "thread wait":
       return snapshotOutput(body as DelegationThreadSnapshot, view);
+    case "thread watch": {
+      const result = body as ThreadWatchResult;
+      return {
+        thread: threadLink(result.threadId),
+        notify: threadLink(result.notifyThreadId),
+        state: result.state,
+        status: result.status,
+        timeoutMs: result.timeoutMs,
+      };
+    }
+    case "thread watches": {
+      const result = body as ThreadWatchListResult;
+      return {
+        watches: result.watches.map(({ threadId, notifyThreadId, state, outcome, reason }) => ({
+          thread: threadLink(threadId),
+          notify: threadLink(notifyThreadId),
+          state,
+          ...(outcome ? { outcome } : {}),
+          ...(reason ? { reason } : {}),
+        })),
+      };
+    }
     case "thread list": {
       const result = body as DelegationThreadListResult;
       return {
