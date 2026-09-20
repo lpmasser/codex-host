@@ -40,11 +40,17 @@ function threadLink(threadId: string): string {
   return `codex://threads/${threadId}`;
 }
 
+function duration(milliseconds: number): string {
+  return milliseconds < 60_000
+    ? `${Math.round(milliseconds / 1_000)} s`
+    : `${Math.round(milliseconds / 60_000)} min`;
+}
+
 function describe(watch: Watch): string {
   const link = threadLink(watch.threadId);
   switch (watch.outcome) {
     case "timedOut":
-      return `${link} has not reached a terminal state after ${Math.round(watch.timeoutMs / 60_000)} min; this watch expired. Run 'codexhost thread watch' again to keep waiting.`;
+      return `${link} has not reached a terminal state after ${duration(watch.timeoutMs)}; this watch expired. Run 'codexhost thread watch' again to keep waiting.`;
     case "unreadable":
       return `${link} could not be read for ${Math.round(UNREADABLE_GRACE_MS / 1_000)} s, so its state is unknown (${watch.lastReadError ?? "unknown error"}).`;
     case "notFound":

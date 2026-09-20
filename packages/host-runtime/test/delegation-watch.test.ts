@@ -125,6 +125,15 @@ describe("DelegationWatchService", () => {
     expect(fake.sent[0]?.message).toContain("has not reached a terminal state after 29 min");
   });
 
+  it("states a timeout shorter than a minute in seconds", async () => {
+    const fake = runtime({ child: { status: "running" }, parent: { status: "completed" } });
+    const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
+    await service.watch({ threadId: "child", notifyThreadId: "parent", timeoutMs: 15_000 });
+
+    await vi.advanceTimersByTimeAsync(15_000 + POLL_MS);
+    expect(fake.sent[0]?.message).toContain("has not reached a terminal state after 15 s");
+  });
+
   it("reports superseded when a newer Turn replaced the watched one", async () => {
     const fake = runtime({
       child: { status: "running", turnId: "turn-1" },
