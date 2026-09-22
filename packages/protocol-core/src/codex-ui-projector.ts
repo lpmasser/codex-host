@@ -2,6 +2,7 @@ import type {
   HostApprovalInteraction,
   HostFileChange,
   HostItem,
+  HistoricalItemOutcome,
   HostItemOutcome,
   HostItemUpdate,
   HostQuestionInteraction,
@@ -95,9 +96,17 @@ function withResolvedDuration(item: HostItem, durationMs: number): HostItem {
 type ProjectedInteraction =
   { type: "approval" } | { type: "question"; itemId: HostItemId; syntheticItem: boolean };
 
-function itemStatus(outcome: HostItemOutcome | null): "inProgress" | "completed" | "failed" {
-  if (!outcome) return "inProgress";
-  return outcome.status === "succeeded" ? "completed" : "failed";
+/** Live Items are unsettled while null; history can also say so explicitly. */
+type ProjectedItemOutcome = HistoricalItemOutcome | null;
+
+/** A settled native result. `unknown` has ended but attributes no success, error or exit code. */
+function knownOutcome(outcome: ProjectedItemOutcome): HostItemOutcome | null {
+  return outcome && outcome.status !== "running" && outcome.status !== "unknown" ? outcome : null;
+}
+
+function itemStatus(outcome: ProjectedItemOutcome): "inProgress" | "completed" | "failed" {
+  if (!outcome || outcome.status === "running") return "inProgress";
+  return outcome.status === "succeeded" || outcome.status === "unknown" ? "completed" : "failed";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -278,7 +287,7 @@ function itemFileChanges(item: HostItem): HostFileChange[] | null {
 }
 
 function summarizeHostFiles(
-  items: readonly { item: HostItem; outcome: HostItemOutcome | null }[],
+  items: readonly { item: HostItem; outcome: ProjectedItemOutcome }[],
   cwd: string,
 ): Extract<HostItem, { type: "fileChange" }> | null {
   const first = items.find(({ item }) => itemFileChanges(item) !== null);
@@ -455,7 +464,7 @@ function collabAgentStatus(
 
 function projectItem(
   item: HostItem,
-  outcome: HostItemOutcome | null,
+  outcome: ProjectedItemOutcome,
   defaultCwd: string,
   includeCommandOutput = true,
   senderThreadId?: string,
@@ -493,6 +502,7 @@ function projectItem(
         durationMs: item.durationMs ?? null,
       };
     case "toolExecution": {
+      const known = knownOutcome(outcome);
       const command = toolCommandLine(item.toolName, item.arguments);
       if (command) {
         return {
@@ -505,7 +515,7 @@ function projectItem(
           status: itemStatus(outcome),
           commandActions: [],
           aggregatedOutput: includeCommandOutput ? toolOutputText(item) : null,
-          exitCode: outcome ? (outcome.status === "succeeded" ? 0 : 1) : null,
+          exitCode: known ? (known.status === "succeeded" ? 0 : 1) : null,
           durationMs: item.durationMs ?? null,
         };
       }
@@ -518,7 +528,7 @@ function projectItem(
         arguments: item.arguments,
         status,
         contentItems: toolContentItems(item),
-        success: outcome ? outcome.status === "succeeded" : null,
+        success: known ? known.status === "succeeded" : null,
         durationMs: item.durationMs ?? null,
       };
     }
@@ -575,7 +585,7 @@ export function reasoningPreviewItemId(itemId: HostItemId): string {
  */
 function projectReasoningTranscriptItem(
   item: Extract<HostItem, { type: "reasoning" }>,
-  outcome: HostItemOutcome | null,
+  outcome: ProjectedItemOutcome,
   defaultCwd: string,
   durationMs: number | null = null,
 ): JsonObject {
@@ -589,7 +599,7 @@ function projectReasoningTranscriptItem(
     status: itemStatus(outcome),
     commandActions: [],
     aggregatedOutput: item.text.length > 0 ? item.text : null,
-    exitCode: outcome ? 0 : null,
+    exitCode: knownOutcome(outcome) ? 0 : null,
     durationMs,
   };
 }
