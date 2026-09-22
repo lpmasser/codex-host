@@ -87,6 +87,11 @@ export class HarnessAccountInspectionCache {
     private readonly now: () => number = Date.now,
   ) {}
 
+  invalidate(harnessId: HarnessId): void {
+    this.#results.delete(harnessId);
+    this.#flights.delete(harnessId);
+  }
+
   inspect(
     adapter: HarnessAdapter,
     descriptors: readonly HarnessPluginDescriptor[],
@@ -100,10 +105,12 @@ export class HarnessAccountInspectionCache {
     if (active) return active;
     const flight = inspectHarnessAccount(adapter, descriptors)
       .then((result) => {
-        this.#results.set(adapter.harnessId, {
-          result,
-          freshUntil: this.now() + this.ttlMs,
-        });
+        if (this.#flights.get(adapter.harnessId) === flight) {
+          this.#results.set(adapter.harnessId, {
+            result,
+            freshUntil: this.now() + this.ttlMs,
+          });
+        }
         return result;
       })
       .finally(() => {

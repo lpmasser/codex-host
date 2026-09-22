@@ -460,6 +460,7 @@ export class MappingStore {
         revision: 1,
         hostThreadId: input.hostThreadId,
         createRequestId: input.createRequestId,
+        ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
         harnessId: input.harnessId,
         state: "creating",
         cwd: input.cwd,

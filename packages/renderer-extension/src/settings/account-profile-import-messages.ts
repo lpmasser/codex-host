@@ -1,0 +1,48 @@
+export const accountProfileImportEnglish = {
+  title: "Antigravity accounts",
+  hint: "Import the account JSON exported by Antigravity Manager. New Antigravity tasks are assigned these accounts automatically. Accounts are imported to this computer.",
+  choose: "Import Antigravity Manager JSON",
+  importing: "Importing…",
+  emptyFile: "The selected file is empty.",
+  tooLarge: "The selected file is larger than 1 MiB.",
+  readFailed: "Could not read the selected file.",
+  failed: "Import did not complete. Make sure the local Host is running, then try again.",
+  noEntries: "The file contains no accounts.",
+  unknownLabel: "(no email)",
+  imported: "Imported",
+  updated: "Updated",
+  failedEntry: "Failed",
+  errors: {
+    invalidEntry: "The entry is missing a valid email or refresh token.",
+    conflictingEntries: "The file contains conflicting entries for this email.",
+    authenticationFailed:
+      "Authorization failed. Re-authorize it in Antigravity Manager and export again.",
+    identityMismatch: "The authorized account does not match this email.",
+    profileBusy: "This account is in use. Try again after its tasks finish.",
+    writeFailed: "Could not save this account locally.",
+  },
+};
+export type AccountProfileImportMessages = typeof accountProfileImportEnglish;
+export const accountProfileImportChinese: AccountProfileImportMessages = {
+  title: "Antigravity 账号",
+  hint: "导入 Antigravity Manager 导出的账号 JSON，新建 Antigravity 任务将自动分配这些账号。账号导入到本机。",
+  choose: "导入 Antigravity Manager JSON",
+  importing: "正在导入…",
+  emptyFile: "所选文件为空。",
+  tooLarge: "所选文件超过 1 MiB。",
+  readFailed: "无法读取所选文件。",
+  failed: "导入未完成。请确认本地 Host 正在运行后重试。",
+  noEntries: "文件中没有账号。",
+  unknownLabel: "（无邮箱）",
+  imported: "已导入",
+  updated: "已更新",
+  failedEntry: "失败",
+  errors: {
+    invalidEntry: "该条目缺少有效的邮箱或 refresh token。",
+    conflictingEntries: "文件中该邮箱存在相互冲突的条目。",
+    authenticationFailed: "授权失败。请在 Antigravity Manager 中重新授权后再导出。",
+    identityMismatch: "授权账号与该邮箱不一致。",
+    profileBusy: "该账号正在使用，请在其任务结束后重试。",
+    writeFailed: "无法在本地保存该账号。",
+  },
+};

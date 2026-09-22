@@ -61,6 +61,8 @@ export interface DelegationStartInput {
 export interface HarnessInspectInput {
   harnessId: RoutedHarnessId;
   cwd?: string;
+  /** Inspect under the Thread's bound account Profile instead of the ambient login. */
+  accountProfileId?: string;
   refresh?: boolean;
 }
 

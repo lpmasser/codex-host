@@ -142,6 +142,7 @@ function subagentMaterializer(
         hostThreadId: hostThreadIdSchema.parse(randomUUID()),
         createRequestId,
         harnessId: parent.harnessId,
+        ...(parent.accountProfileId ? { accountProfileId: parent.accountProfileId } : {}),
         cwd: parent.cwd,
         title: child.description,
         transportModelId: parent.transportModelId,
@@ -185,6 +186,7 @@ export async function materializeExternalBackgroundTask(
       hostThreadId: hostThreadIdSchema.parse(randomUUID()),
       createRequestId,
       harnessId: parent.harnessId,
+      ...(parent.accountProfileId ? { accountProfileId: parent.accountProfileId } : {}),
       cwd: parent.cwd,
       // Stored titles are bounded; the Adapter keeps the full native facts.
       title: `Background command · ${task.description}`.slice(0, 4_096),

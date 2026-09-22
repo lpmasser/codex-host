@@ -8,6 +8,7 @@ export const ANTIGRAVITY_COMMAND_ENV = "CODEXHOST_ANTIGRAVITY_COMMAND";
 export function createHarnessAdapter(context: HarnessPluginContext): AntigravityAdapter {
   const environment = { ...context.environment };
   return new AntigravityAdapter({
+    managedRemoteHost: context.managedRemoteHost,
     ...(environment[ANTIGRAVITY_COMMAND_ENV]
       ? { command: environment[ANTIGRAVITY_COMMAND_ENV] }
       : {}),

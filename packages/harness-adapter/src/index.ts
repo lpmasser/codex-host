@@ -124,3 +124,4 @@ export {
   type LiveCommandExclusions,
   type LiveHarnessCommand,
 } from "./live-command-catalog.js";
+export type { HarnessAccountProfiles } from "./account-profiles.js";

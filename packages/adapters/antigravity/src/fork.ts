@@ -305,8 +305,13 @@ export async function forkAntigravitySession(
       sourceRef.nativeSessionId,
       derivedNativeSessionId,
       retainedTurns.length,
+      input.accountProfileId ? sessionEnvironment.HOME : undefined,
     ),
-    copyNativeBrainDirIfExists(sourceRef.nativeSessionId, derivedNativeSessionId),
+    copyNativeBrainDirIfExists(
+      sourceRef.nativeSessionId,
+      derivedNativeSessionId,
+      input.accountProfileId ? sessionEnvironment.HOME : undefined,
+    ),
   ]);
 
   const derivedNativeRef: NativeSessionRef = {

@@ -21,6 +21,7 @@ import type {
 
 import type { HostUsage } from "./usage.js";
 import type { HarnessCredentialExport, HarnessCredentialImports } from "./credential-imports.js";
+import type { HarnessAccountProfiles } from "./account-profiles.js";
 
 export type {
   HarnessInspection,
@@ -64,6 +65,7 @@ export interface HarnessError {
 export type HarnessResult<T> = { ok: true; value: T } | { ok: false; error: HarnessError };
 
 export interface InspectHarnessInput {
+  accountProfileId?: string;
   cwd?: string;
   refresh?: boolean;
 }
@@ -71,6 +73,7 @@ export interface InspectHarnessInput {
 export type HarnessExecutionPolicy = "default" | "unattended-full-access";
 
 export interface CreateSessionInput {
+  accountProfileId?: string;
   kind: "create";
   cwd: string;
   environment?: Record<string, string | undefined>;
@@ -81,6 +84,7 @@ export interface CreateSessionInput {
 }
 
 export interface ResumeSessionInput {
+  accountProfileId?: string;
   /** Saved selection hints for Harnesses that initialize configuration lazily. */
   model?: HarnessModelRef;
   thinkingOptionId?: HarnessThinkingOptionId;
@@ -93,6 +97,7 @@ export interface ResumeSessionInput {
 }
 
 export interface ForkSessionInput {
+  accountProfileId?: string;
   kind: "fork";
   sourceRef: NativeSessionRef;
   checkpoint: NativeCheckpointRef;
@@ -102,6 +107,7 @@ export interface ForkSessionInput {
 }
 
 export interface RollbackLastTurnSessionInput {
+  accountProfileId?: string;
   /** Current settings required by a derived Session before it can start native work. */
   model?: HarnessModelRef;
   thinkingOptionId?: HarnessThinkingOptionId;
@@ -566,6 +572,7 @@ export interface HarnessSession {
 
 export interface HarnessSubagentCapability {
   readSnapshot(input: {
+    accountProfileId?: string;
     parent: NativeSessionRef;
     nativeSubagentId: string;
     cwd: string;
@@ -599,6 +606,7 @@ export interface HarnessSessionImportCapability {
 }
 
 export interface HarnessAdapter {
+  readonly accountProfiles?: HarnessAccountProfiles;
   readonly credentialExport?: HarnessCredentialExport;
   readonly credentialImports?: HarnessCredentialImports;
   readonly harnessId: HarnessId;

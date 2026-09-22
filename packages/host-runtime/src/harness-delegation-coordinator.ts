@@ -123,6 +123,8 @@ export class HarnessDelegationCoordinator {
   readonly #listOfficial: (input: ThreadListInput) => Promise<DelegationThreadListResult>;
   readonly #officialThreadCwd: (threadId: string) => Promise<string | undefined>;
   readonly #activeOfficialParents: () => string[];
+  /** Per-request tails: the same Request ID never runs two creations at once. */
+  readonly #requestTails = new Map<string, Promise<void>>();
 
   constructor(input: {
     adapters: Map<ExternalHarnessId, HarnessAdapter>;
@@ -187,6 +189,7 @@ export class HarnessDelegationCoordinator {
       harnessId: input.harnessId,
       inspection: await adapter.inspect({
         ...(input.cwd ? { cwd: path.resolve(input.cwd) } : {}),
+        ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
         ...(input.refresh !== undefined ? { refresh: input.refresh } : {}),
       }),
     };
@@ -194,6 +197,31 @@ export class HarnessDelegationCoordinator {
 
   async start(input: DelegationStartInput): Promise<DelegationStartResult> {
     validateStart(input);
+    if (input.harnessId === "codex") return this.#start(input);
+    return this.#serializeRequest(input.requestId, () => this.#start(input));
+  }
+
+  /** External Harness only: distinct Request IDs run in parallel, one request is ordered. */
+  async #serializeRequest<T>(
+    requestId: string | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!requestId) return operation();
+    const previous = this.#requestTails.get(requestId) ?? Promise.resolve();
+    const result = previous.then(operation);
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#requestTails.set(requestId, tail);
+    try {
+      return await result;
+    } finally {
+      if (this.#requestTails.get(requestId) === tail) this.#requestTails.delete(requestId);
+    }
+  }
+
+  async #start(input: DelegationStartInput): Promise<DelegationStartResult> {
     const parentThreadId = await this.#resolveParent(input.parentThreadId);
     const parent = await this.#parentMetadata(parentThreadId);
     const selectedCwd = input.cwd ?? parent.cwd ?? process.cwd();
@@ -241,35 +269,64 @@ export class HarnessDelegationCoordinator {
         },
       );
     }
+    const createRequestId = input.requestId ? `delegation:${input.requestId}` : randomUUID();
+    // A retried Request ID must continue the Thread a previous attempt already persisted, so
+    // allocation, Profile selection and the account-scoped Model check all agree.
+    const existingRecord = input.requestId
+      ? await this.#repository.findByCreateRequest(createRequestId)
+      : null;
+    if (existingRecord && existingRecord.harnessId !== targetHarnessId) {
+      throw new DelegationControlError(
+        "INVALID_ARGUMENT",
+        "Request ID is already associated with another Delegation configuration",
+      );
+    }
+    let selectedProfileId: string | undefined;
+    if (existingRecord) {
+      // The stored binding wins, including an absent Profile: a retry never polls again.
+      selectedProfileId = existingRecord.accountProfileId;
+    } else {
+      try {
+        selectedProfileId = await adapter.accountProfiles?.select();
+      } catch {
+        throw new DelegationControlError(
+          "DELEGATION_FAILED",
+          "Target Harness account Profile could not be selected",
+        );
+      }
+    }
     if (input.model || input.thinkingOptionId) {
       const inspected = await this.inspect({
         harnessId: targetHarnessId,
         cwd: startInput.cwd,
+        ...(selectedProfileId ? { accountProfileId: selectedProfileId } : {}),
       });
       this.#validateConfiguration(inspected.inspection, input.model, input.thinkingOptionId);
     }
     const delegationId = hostThreadIdSchema.parse(randomUUID());
-    const childThreadId = hostThreadIdSchema.parse(randomUUID());
     const turnId = hostTurnIdSchema.parse(randomUUID());
-    const createRequestId = input.requestId ? `delegation:${input.requestId}` : randomUUID();
-    let record = await this.#repository.createProvisional(
-      createExternalThreadRecordInput({
-        hostThreadId: childThreadId,
-        createRequestId,
-        harnessId: harnessIdSchema.parse(targetHarnessId),
-        cwd: startInput.cwd,
-        title: input.task.trim().slice(0, 120),
-        transportModelId:
-          input.model || input.thinkingOptionId
-            ? encodeExternalTransportSelection(targetHarnessId, {
-                ...(input.model ? { model: input.model } : {}),
-                ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
-              })
-            : transportModelIdForHarness(targetHarnessId),
-        ephemeral: false,
-        historyMode: "paginated",
-      }),
-    );
+    let record =
+      existingRecord ??
+      (await this.#repository.createProvisional(
+        createExternalThreadRecordInput({
+          hostThreadId: hostThreadIdSchema.parse(randomUUID()),
+          createRequestId,
+          harnessId: harnessIdSchema.parse(targetHarnessId),
+          ...(selectedProfileId ? { accountProfileId: selectedProfileId } : {}),
+          cwd: startInput.cwd,
+          title: input.task.trim().slice(0, 120),
+          transportModelId:
+            input.model || input.thinkingOptionId
+              ? encodeExternalTransportSelection(targetHarnessId, {
+                  ...(input.model ? { model: input.model } : {}),
+                  ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
+                })
+              : transportModelIdForHarness(targetHarnessId),
+          ephemeral: false,
+          historyMode: "paginated",
+        }),
+      ));
+    const childThreadId = record.hostThreadId;
     let delegation: StoredDelegationRecordV1 | null = null;
     let session: HarnessSession | null = null;
     return this.#externalRuntime.idleRelease.runOperation(childThreadId, async () => {
@@ -287,6 +344,9 @@ export class HarnessDelegationCoordinator {
         const opened = await adapter.open({
           kind: "create",
           cwd: record.cwd,
+          // A retried create request returns the stored record; its binding wins over the
+          // selection made for this attempt.
+          ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
           environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: childThreadId },
           executionPolicy: "unattended-full-access",
           ...(input.model ? { model: input.model } : {}),
@@ -360,7 +420,12 @@ export class HarnessDelegationCoordinator {
         this.#externalRuntime.remove(childThreadId);
         if (delegation)
           await this.#repository.removeDelegation(delegation.delegationId).catch(() => undefined);
-        await this.#repository.removeThread(childThreadId).catch(() => undefined);
+        // A record that predates this attempt is the create request's own allocation: keep it so
+        // the next retry reuses the same Thread and Profile. Only a fresh allocation, or one this
+        // attempt already carried into a Delegation, is discarded.
+        if (!existingRecord || delegation) {
+          await this.#repository.removeThread(childThreadId).catch(() => undefined);
+        }
         if (error instanceof DelegationControlError) throw error;
         throw new DelegationControlError(
           "DELEGATION_FAILED",

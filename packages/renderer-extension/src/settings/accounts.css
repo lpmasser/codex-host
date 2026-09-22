@@ -753,3 +753,22 @@
     background: Highlight;
   }
 }
+.settings-account-profile-import {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  margin-top: 28px;
+  font-size: 13px;
+}
+.settings-account-profile-import[hidden],
+.settings-account-profile-import__results:empty {
+  display: none;
+}
+.settings-account-profile-import__results {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+.settings-account-profile-import__results [data-status="failed"] {
+  color: var(--settings-muted);
+}

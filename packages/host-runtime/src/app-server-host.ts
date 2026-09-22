@@ -6,9 +6,12 @@ import {
   idleReleaseSettingsSchema,
 } from "@codexhost/shared-contracts";
 import {
+  ACCOUNT_PROFILES_METHOD,
   CREDENTIAL_IMPORTS_METHOD,
+  accountProfilesParamsSchema,
   credentialImportsParamsSchema,
 } from "@codexhost/shared-contracts";
+import { handleAccountProfiles } from "./account-profiles.js";
 import { handleCredentialImports } from "./credential-imports.js";
 import {
   rewriteDelegationMentionInput,
@@ -1025,6 +1028,27 @@ export class AppServerHost {
               "Credential operation failed. Check the source login, choose an unused Provider name, and verify Pi configuration access.",
             ),
           );
+        }
+      });
+      return;
+    }
+    if (request.method === ACCOUNT_PROFILES_METHOD) {
+      this.#dispatchDesktopRequest(async () => {
+        const params = accountProfilesParamsSchema.safeParse(request.params);
+        if (!params.success) {
+          await this.#writer.json(rpcError(request, -32602, "Invalid account profile request"));
+          return;
+        }
+        await this.#waitForPlugins();
+        try {
+          const result = await handleAccountProfiles(params.data, this.#externalAdapters.values());
+          if (result.results.some(({ status }) => status !== "failed")) {
+            this.#accountInspections.invalidate(harnessIdSchema.parse(params.data.harnessId));
+          }
+          await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
+        } catch {
+          // Adapter and parser errors may echo tokens or file contents. Never forward them.
+          await this.#writer.json(rpcError(request, -32077, "Account profile operation failed"));
         }
       });
       return;
@@ -3056,9 +3080,21 @@ export class AppServerHost {
       return;
     }
 
+    let selectedProfileId: string | undefined;
+    try {
+      selectedProfileId = await adapter.accountProfiles?.select();
+    } catch {
+      this.#routeObservationTracker.rejectCreate(request.id);
+      await this.#writer.json(
+        rpcError(request, -32076, "External Harness account Profile could not be selected"),
+      );
+      return;
+    }
+
     const recordInput = createExternalThreadRecordInput({
       harnessId: adapter.harnessId,
       cwd,
+      ...(selectedProfileId ? { accountProfileId: selectedProfileId } : {}),
       transportModelId,
       ephemeral: params.ephemeral === true,
       historyMode: params.historyMode === "paginated" ? "paginated" : "legacy",
@@ -3075,6 +3111,8 @@ export class AppServerHost {
     const sessionResult = await adapter.open({
       kind: "create",
       cwd,
+      // The persisted record owns the Profile binding, so a retried create request reuses it.
+      ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
       environment: {
         ...(this.#options.environment ?? process.env),
         [DELEGATION_THREAD_ID_ENV]: record.hostThreadId,

@@ -18,6 +18,10 @@ import {
   renderAccountRows,
   renderHarnessAccountRows,
 } from "./accounts-list.js";
+import {
+  mountAccountProfileImport,
+  type RendererAccountProfileClient,
+} from "./account-profile-import.js";
 import { createHarnessAccounts, type RendererHarnessAccountClient } from "./harness-accounts.js";
 import { mountAccountResetCountdowns } from "./accounts-reset-time.js";
 import type { AccountUsageDisplay, AccountUsageViewState } from "./accounts-usage.js";
@@ -27,7 +31,10 @@ import type { RendererSettingsMessages } from "./localization.js";
 import { shouldApplyCodexAccountSnapshot } from "../renderer-codex-account-state.js";
 
 export interface RendererCodexAccountClient
-  extends RendererHarnessAccountClient, RendererCredentialImportClient {
+  extends
+    RendererHarnessAccountClient,
+    RendererCredentialImportClient,
+    RendererAccountProfileClient {
   listCodexAccounts(): Promise<CodexAccountListResult>;
   refreshCodexAccounts?(): Promise<CodexAccountListResult>;
   inspectCodexAccountUsage?(input: CodexAccountUsageParams): Promise<CodexAccountUsageResult>;
@@ -118,7 +125,20 @@ export function createAccountsSettingsPage(
         messages.credentialImports,
         () => render(),
       );
-      context.content.append(header, status, toolbar, list, credentialImports.section);
+      const profileImport = mountAccountProfileImport(
+        document,
+        context.signal,
+        getClient,
+        messages.accountProfileImport,
+      );
+      context.content.append(
+        header,
+        status,
+        toolbar,
+        list,
+        credentialImports.section,
+        profileImport.section,
+      );
       const stopCountdowns = mountAccountResetCountdowns(list, messages, context.signal);
 
       let accounts: readonly CodexAccountSummary[] = [];
@@ -317,6 +337,7 @@ export function createAccountsSettingsPage(
       }
       const harnessAccounts = createHarnessAccounts(context.signal, getClient, render);
       void credentialImports.refresh();
+      void profileImport.refresh();
       void harnessAccounts.refresh();
       load();
       return () => {

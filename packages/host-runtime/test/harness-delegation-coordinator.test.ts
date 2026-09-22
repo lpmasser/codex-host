@@ -11,6 +11,7 @@ import { harnessIdSchema, hostThreadIdSchema, hostTurnIdSchema } from "@codexhos
 import { describe, expect, it, vi } from "vitest";
 
 import { HarnessDelegationCoordinator } from "../src/harness-delegation-coordinator.js";
+import type { DelegationStartResult } from "../src/delegation-types.js";
 import { ExternalThreadRepository } from "../src/external-thread-repository.js";
 import { ExternalThreadRuntime } from "../src/external-thread-runtime.js";
 
@@ -35,6 +36,7 @@ async function fixture(
     consumeOutputs: async () => undefined,
     diagnose: () => undefined,
   });
+  const startOfficial = vi.fn();
   const coordinator = new HarnessDelegationCoordinator({
     adapters,
     environment,
@@ -62,7 +64,7 @@ async function fixture(
     readOfficial: vi.fn(),
     sendOfficial: vi.fn(),
     cancelOfficial: vi.fn(),
-    startOfficial: vi.fn(),
+    startOfficial,
     listOfficial: vi.fn(async () => ({ threads: [], nextCursor: null })),
     officialThreadCwd,
     activeOfficialParents: () => [],
@@ -75,6 +77,7 @@ async function fixture(
     registered,
     repository,
     runtime,
+    startOfficial,
     store,
     close: async () => {
       runtime.clear();
@@ -537,6 +540,59 @@ describe("HarnessDelegationCoordinator", () => {
         value.coordinator.read({ threadId: started.threadId, view: "result" }),
       ).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
     } finally {
+      await value.close();
+    }
+  });
+
+  it("enters the official Codex handler for both starts sharing a Request ID", async () => {
+    const value = await fixture();
+    const pending: Array<(result: DelegationStartResult) => void> = [];
+    const officialResult: DelegationStartResult = {
+      delegationId: "official-delegation",
+      threadId: "official-thread",
+      turnId: "official-turn",
+      harnessId: "codex",
+      deepLink: "codex://threads/official-thread",
+      status: "running",
+      next: {
+        read: "codexhost thread read official-thread",
+        wait: "codexhost thread wait official-thread",
+      },
+    };
+    // Deferred until the assertions decide; released on exit so no start stays pending.
+    let releaseImmediately = false;
+    value.startOfficial.mockImplementation(() =>
+      releaseImmediately
+        ? Promise.resolve(officialResult)
+        : new Promise<DelegationStartResult>((resolve) => {
+            pending.push(resolve);
+          }),
+    );
+    const input = {
+      harnessId: "codex" as const,
+      task: "review auth",
+      cwd: "/synthetic",
+      parentThreadId: "parent-thread",
+      requestId: "codex-request",
+    };
+    const first = value.coordinator.start(input);
+    const second = value.coordinator.start(input);
+    try {
+      // Both requests reach the official handler while the first one is still pending.
+      await vi.waitFor(() => expect(pending).toHaveLength(2));
+      for (const resolve of pending.splice(0)) resolve(officialResult);
+      await expect(first).resolves.toMatchObject({
+        harnessId: "codex",
+        parentThreadId: "parent-thread",
+      });
+      await expect(second).resolves.toMatchObject({
+        harnessId: "codex",
+        parentThreadId: "parent-thread",
+      });
+    } finally {
+      releaseImmediately = true;
+      for (const resolve of pending.splice(0)) resolve(officialResult);
+      await Promise.allSettled([first, second]);
       await value.close();
     }
   });

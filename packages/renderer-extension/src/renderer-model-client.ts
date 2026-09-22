@@ -99,6 +99,11 @@ import {
 export const HARNESS_INSPECT_METHOD = "codexhost/harness/inspect";
 export const HARNESS_PLUGIN_LIST_METHOD = "codexhost/harness/plugins/list";
 import {
+  ACCOUNT_PROFILES_METHOD,
+  accountProfilesParamsSchema,
+  accountProfilesResultSchema,
+  type AccountProfilesParams,
+  type AccountProfilesResult,
   CREDENTIAL_IMPORTS_METHOD,
   credentialImportsParamsSchema,
   credentialImportsResultSchema,
@@ -209,6 +214,7 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
     request: CredentialImportsRequest,
     targetHarnessId?: string,
   ): Promise<CredentialImportsResult>;
+  accountProfiles?(params: AccountProfilesParams): Promise<AccountProfilesResult>;
   listCodexAccounts(): Promise<CodexAccountListResult>;
   refreshCodexAccounts(): Promise<CodexAccountListResult>;
   subscribeCodexAccounts?(listener: (state: CodexAccountChanged) => void): () => void;
@@ -522,6 +528,14 @@ export function createRendererModelClient(
         await manager.sendRequest(
           CREDENTIAL_IMPORTS_METHOD,
           credentialImportsParamsSchema.parse({ request, targetHarnessId }),
+        ),
+      );
+    },
+    async accountProfiles(params: AccountProfilesParams): Promise<AccountProfilesResult> {
+      return accountProfilesResultSchema.parse(
+        await manager.sendRequest(
+          ACCOUNT_PROFILES_METHOD,
+          accountProfilesParamsSchema.parse(params),
         ),
       );
     },

@@ -11,6 +11,7 @@ import {
   HarnessOutputChannel,
   sanitizeDiagnosticTail,
   type HarnessAdapter,
+  type HarnessAccountProfiles,
   type HarnessError,
   type HarnessCommandAccepted,
   type HarnessCommandCapability,
@@ -70,6 +71,8 @@ import {
 import { resolveAntigravityExecutable } from "./command.js";
 import { forkAntigravitySession } from "./fork.js";
 import { AntigravityHistory } from "./history.js";
+import { AntigravityAccountProfiles } from "./account-profiles.js";
+import { initializeAgmCredential } from "./agm-credentials.js";
 import {
   antigravityAvailableThinkingOptions,
   antigravityModelArguments,
@@ -109,6 +112,7 @@ import {
 } from "./tool-projection.js";
 
 export interface AntigravityAdapterOptions {
+  managedRemoteHost?: boolean;
   command?: string;
   environment?: NodeJS.ProcessEnv;
   inspectTimeoutMs?: number;
@@ -118,6 +122,7 @@ export interface AntigravityAdapterOptions {
 }
 
 interface ActiveTurn {
+  releaseProfile?: () => void;
   command: TurnStartCommand;
   /** Model passed to this CLI invocation, independent of later selections. */
   model: HarnessModelRef | undefined;
@@ -481,6 +486,9 @@ async function runBuffered(
 }
 
 class AntigravitySession implements HarnessSession {
+  readonly accountProfileId: string | undefined;
+  readonly #profiles: AntigravityAccountProfiles;
+  #preparingProfile = false;
   readonly harnessId: HarnessId = antigravityHarnessId;
   readonly capabilities = CAPABILITIES;
   readonly commands: HarnessCommandCapability;
@@ -507,6 +515,8 @@ class AntigravitySession implements HarnessSession {
   readonly #catalog: HarnessModelCatalog | undefined;
 
   constructor(input: {
+    accountProfileId?: string;
+    profiles: AntigravityAccountProfiles;
     catalog?: HarnessModelCatalog;
     cwd: string;
     environment: NodeJS.ProcessEnv;
@@ -521,6 +531,8 @@ class AntigravitySession implements HarnessSession {
     subagentObservationTimeoutMs: number;
     onClosed(): void;
   }) {
+    this.accountProfileId = input.accountProfileId;
+    this.#profiles = input.profiles;
     this.#catalog = input.catalog;
     this.#cwd = input.cwd;
     this.#environment = input.environment;
@@ -564,6 +576,7 @@ class AntigravitySession implements HarnessSession {
 
   get isActive(): boolean {
     return (
+      this.#preparingProfile ||
       this.#active !== null ||
       this.#preparingQuestions !== null ||
       [...this.#subagentObservers].some((observer) => observer.running)
@@ -638,6 +651,24 @@ class AntigravitySession implements HarnessSession {
         error: { code: "invalidRequest", message: "Antigravity Turn is empty", retryable: false },
       };
     }
+    let releaseProfile: (() => void) | undefined;
+    if (this.accountProfileId) {
+      this.#preparingProfile = true;
+      try {
+        releaseProfile = (await this.#profiles.acquire(this.accountProfileId)).release;
+      } catch {
+        return {
+          ok: false,
+          error: {
+            code: "authenticationRequired",
+            message: "Bound Antigravity Profile is unavailable or busy",
+            retryable: false,
+          },
+        };
+      } finally {
+        this.#preparingProfile = false;
+      }
+    }
 
     let questions: AntigravityQuestionBridge;
     this.#preparingQuestions = AntigravityQuestionBridge.create({
@@ -667,6 +698,7 @@ class AntigravitySession implements HarnessSession {
     try {
       questions = await this.#preparingQuestions;
     } catch (error) {
+      releaseProfile?.();
       return {
         ok: false,
         error: {
@@ -679,6 +711,7 @@ class AntigravitySession implements HarnessSession {
       this.#preparingQuestions = null;
     }
     if (this.#closed) {
+      releaseProfile?.();
       await questions.dispose();
       return { ok: false, error: invalidState("Antigravity Session is closed") };
     }
@@ -710,12 +743,14 @@ class AntigravitySession implements HarnessSession {
       });
     } catch (error) {
       await questions.dispose();
+      releaseProfile?.();
       return {
         ok: false,
         error: { code: "nativeFailure", message: errorMessage(error), retryable: true },
       };
     }
     const active: ActiveTurn = {
+      ...(releaseProfile ? { releaseProfile } : {}),
       command,
       model: this.#model,
       process: child,
@@ -1187,7 +1222,8 @@ class AntigravitySession implements HarnessSession {
         await active.questions.dispose();
         this.#subagentObservers.delete(active.subagents);
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => active.releaseProfile?.());
     this.#active = null;
     const itemOutcome: HostItemOutcome =
       outcome.status === "failed"
@@ -1392,11 +1428,14 @@ function historySubagentState(
 }
 
 export class AntigravityAdapter implements HarnessAdapter {
+  readonly #profiles: AntigravityAccountProfiles;
+  readonly accountProfiles?: HarnessAccountProfiles;
   readonly commandCatalog = ANTIGRAVITY_COMMAND_CATALOG;
   readonly harnessId: HarnessId = antigravityHarnessId;
   readonly subagents = {
     readSnapshot: async (input: {
       parent: NativeSessionRef;
+      accountProfileId?: string;
       nativeSubagentId: string;
       cwd: string;
     }): Promise<HarnessResult<HostThreadSnapshot>> => {
@@ -1423,13 +1462,19 @@ export class AntigravityAdapter implements HarnessAdapter {
           error: invalidState("Subagent does not belong to this parent Session"),
         };
       }
-      return readSubagentTranscript({
-        parentId: input.parent.nativeSessionId,
-        childId: input.nativeSubagentId,
-        status: state.status,
-        cwd: input.cwd,
-        outputLimit: this.#toolOutputLimit,
-      });
+      const context = await this.#profileContext(input.accountProfileId, this.#environment);
+      try {
+        return await readSubagentTranscript({
+          ...(input.accountProfileId ? { home: context.environment.HOME as string } : {}),
+          parentId: input.parent.nativeSessionId,
+          childId: input.nativeSubagentId,
+          status: state.status,
+          cwd: input.cwd,
+          outputLimit: this.#toolOutputLimit,
+        });
+      } finally {
+        context.release();
+      }
     },
   };
   readonly #command: string | undefined;
@@ -1450,6 +1495,20 @@ export class AntigravityAdapter implements HarnessAdapter {
   constructor(options: AntigravityAdapterOptions = {}) {
     this.#command = options.command;
     this.#environment = options.environment ?? process.env;
+    this.#profiles = new AntigravityAccountProfiles({
+      environment: this.#environment,
+      authenticate: initializeAgmCredential,
+    });
+    if (!options.managedRemoteHost)
+      this.accountProfiles = {
+        select: () => this.#profiles.select(),
+        importJson: async (content: string) => {
+          const result = await this.#profiles.importJson(content);
+          this.#inspectionCache.clear();
+          this.#quota = null;
+          return result;
+        },
+      };
     this.#inspectTimeoutMs = options.inspectTimeoutMs ?? DEFAULT_INSPECT_TIMEOUT_MS;
     this.#printTimeout = options.printTimeout ?? DEFAULT_PRINT_TIMEOUT;
     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
@@ -1461,35 +1520,63 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#subagentObservationTimeoutMs = subagentObservationTimeoutMs;
   }
 
+  async #profileContext(id: string | undefined, environment: NodeJS.ProcessEnv) {
+    if (!id) return { environment, release: () => undefined };
+    const lease = await this.#profiles.acquire(id);
+    const scoped: NodeJS.ProcessEnv = {
+      ...environment,
+      HOME: lease.home,
+      GEMINI_HOME: path.join(lease.home, ".gemini"),
+      // AGY's native SSH/headless detection pins BOTH LoadToken and SaveToken to files.
+      // This process-local marker starts no SSH connection and avoids the shared macOS Keychain.
+      SSH_CLIENT: "127.0.0.1 0 0",
+    };
+    if (process.platform === "win32") scoped.USERPROFILE = lease.home;
+    // Native override variables must not bypass the persisted account or its state directory.
+    delete scoped.JETSKI_OAUTH_TOKEN;
+    delete scoped.JETSKI_APP_DATA_DIR;
+    delete scoped.ANTIGRAVITY_APP_DATA_DIR;
+    delete scoped.AGY_ADC_AUTH;
+    return {
+      environment: scoped,
+      release: lease.release,
+    };
+  }
+
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
+    const id = input.accountProfileId ?? (await this.#profiles.catalogProfile());
+    return this.#inspectProfile({ ...input, ...(id ? { accountProfileId: id } : {}) });
+  }
+
+  async #inspectProfile(input: InspectHarnessInput): Promise<HarnessInspection> {
     if (this.#closed) {
       return { status: "unavailable", error: invalidState("Antigravity Adapter is closed") };
     }
     const cwd = path.resolve(input.cwd ?? process.cwd());
-    const inFlight = this.#inspectionInFlight.get(cwd);
+    const key = `${input.accountProfileId ?? ""}\0${cwd}`;
+    const inFlight = this.#inspectionInFlight.get(key);
     if (inFlight) return inFlight;
     if (!input.refresh) {
-      const cached = this.#inspectionCache.get(cwd);
+      const cached = this.#inspectionCache.get(key);
       if (cached) return cached;
     }
-
-    const inspection = this.#inspectCwd(cwd).then((result) => {
+    const inspection = this.#inspectCwd(cwd, input.accountProfileId).then((result) => {
       if (result.status === "ready") {
-        this.#inspectionCache.set(cwd, result);
-        this.#quotaCwd = cwd;
-        void this.refreshCredits().catch(() => undefined);
+        this.#inspectionCache.set(key, result);
+        if (!input.accountProfileId) {
+          this.#quotaCwd = cwd;
+          void this.refreshCredits().catch(() => undefined);
+        }
       }
       return result;
     });
-    this.#inspectionInFlight.set(cwd, inspection);
+    this.#inspectionInFlight.set(key, inspection);
     return inspection.finally(() => {
-      if (this.#inspectionInFlight.get(cwd) === inspection) {
-        this.#inspectionInFlight.delete(cwd);
-      }
+      if (this.#inspectionInFlight.get(key) === inspection) this.#inspectionInFlight.delete(key);
     });
   }
 
-  async #inspectCwd(cwd: string): Promise<HarnessInspection> {
+  async #inspectCwd(cwd: string, profileId?: string): Promise<HarnessInspection> {
     const executable = resolveAntigravityExecutable({
       ...(this.#command ? { command: this.#command } : {}),
       environment: this.#environment,
@@ -1505,26 +1592,28 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     }
     try {
-      const { stdout } = await runBuffered(
-        executable,
-        ["models"],
-        cwd,
-        this.#environment,
-        this.#inspectTimeoutMs,
-      );
-      return {
-        status: "ready",
-        catalog: parseAntigravityModels(stdout),
-        permissionModes: ANTIGRAVITY_PERMISSION_MODE_CATALOG,
-        capabilities: CAPABILITIES,
-      };
+      const context = await this.#profileContext(profileId, this.#environment);
+      try {
+        const { stdout } = await runBuffered(
+          executable,
+          ["models"],
+          cwd,
+          context.environment,
+          this.#inspectTimeoutMs,
+        );
+        return {
+          status: "ready",
+          catalog: parseAntigravityModels(stdout),
+          permissionModes: ANTIGRAVITY_PERMISSION_MODE_CATALOG,
+          capabilities: CAPABILITIES,
+        };
+      } finally {
+        context.release();
+      }
     } catch (error) {
       const message = errorMessage(error);
       const normalized = normalizedProcessError(message, message);
-      return {
-        status: "error",
-        error: { ...normalized, stage: "model-catalog" },
-      };
+      return { status: "error", error: { ...normalized, stage: "model-catalog" } };
     }
   }
 
@@ -1558,7 +1647,10 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   async #loadQuota(): Promise<AntigravityQuotaSnapshot | null> {
-    if (this.#closed) return null;
+    if (this.#closed || (await this.#profiles.hasProfiles())) {
+      this.#quota = null;
+      return null;
+    }
     const executable = resolveAntigravityExecutable({
       ...(this.#command ? { command: this.#command } : {}),
       environment: this.#environment,
@@ -1576,6 +1668,11 @@ export class AntigravityAdapter implements HarnessAdapter {
       );
       return stdout;
     });
+    // Import can finish while an earlier default-account request is in flight.
+    if (await this.#profiles.hasProfiles()) {
+      this.#quota = null;
+      return null;
+    }
     if (snapshot) this.#quota = snapshot;
     return snapshot;
   }
@@ -1590,6 +1687,31 @@ export class AntigravityAdapter implements HarnessAdapter {
   }
 
   async open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>> {
+    const context = await this.#profileContext(input.accountProfileId, {
+      ...this.#environment,
+      ...input.environment,
+    }).catch(() => null);
+    if (!context) {
+      return {
+        ok: false,
+        error: {
+          code: "authenticationRequired",
+          message: "Bound Antigravity Profile is unavailable or busy",
+          retryable: false,
+        },
+      };
+    }
+    try {
+      return await this.#open({ ...input, environment: context.environment }, context.environment);
+    } finally {
+      context.release();
+    }
+  }
+
+  async #open(
+    input: OpenSessionInput,
+    environment: NodeJS.ProcessEnv,
+  ): Promise<HarnessResult<HarnessSession>> {
     if (this.#closed) return { ok: false, error: invalidState("Antigravity Adapter is closed") };
     let permissionMode: AntigravityPermissionMode = "dangerously-skip-permissions";
     if (input.kind !== "fork" && input.permissionModeId) {
@@ -1623,10 +1745,22 @@ export class AntigravityAdapter implements HarnessAdapter {
       };
     }
     const cwd = path.resolve(input.cwd);
-    let catalog = this.#inspectionCache.get(cwd)?.catalog;
+    let catalog = this.#inspectionCache.get(`${input.accountProfileId ?? ""}\0${cwd}`)?.catalog;
     if (!catalog) {
-      const inspection = await this.inspect({ cwd: input.cwd });
+      const inspection = await this.#inspectProfile({
+        cwd: input.cwd,
+        ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
+      });
       if (inspection.status === "ready") catalog = inspection.catalog;
+      else if (input.accountProfileId)
+        return {
+          ok: false,
+          error: {
+            code: "nativeFailure",
+            message: inspection.error.message,
+            retryable: inspection.error.retryable,
+          },
+        };
     }
 
     if (input.kind === "fork") {
@@ -1634,7 +1768,7 @@ export class AntigravityAdapter implements HarnessAdapter {
       return forkAntigravitySession({
         harnessId: this.harnessId,
         input,
-        adapterEnvironment: this.#environment,
+        adapterEnvironment: environment,
         ...(sourceSession
           ? {
               sourceSession: {
@@ -1648,6 +1782,8 @@ export class AntigravityAdapter implements HarnessAdapter {
           : {}),
         createSession: (params) => {
           const session = new AntigravitySession({
+            profiles: this.#profiles,
+            ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
             ...(catalog ? { catalog } : {}),
             cwd: params.cwd,
             environment: params.environment,
@@ -1673,7 +1809,7 @@ export class AntigravityAdapter implements HarnessAdapter {
       return rollbackAntigravityLastTurn({
         harnessId: this.harnessId,
         input,
-        adapterEnvironment: this.#environment,
+        adapterEnvironment: environment,
         ...(sourceSession
           ? {
               sourceSession: {
@@ -1687,6 +1823,8 @@ export class AntigravityAdapter implements HarnessAdapter {
           : {}),
         createSession: (params) => {
           const session = new AntigravitySession({
+            profiles: this.#profiles,
+            ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
             ...(catalog ? { catalog } : {}),
             cwd: params.cwd,
             environment: params.environment,
@@ -1721,7 +1859,7 @@ export class AntigravityAdapter implements HarnessAdapter {
         };
       }
     }
-    const sessionEnvironment = { ...this.#environment, ...(input.environment ?? {}) };
+    const sessionEnvironment = environment;
     const history = await AntigravityHistory.open({
       environment: sessionEnvironment,
       ...(nativeRef ? { nativeSessionId: nativeRef.nativeSessionId } : {}),
@@ -1750,6 +1888,8 @@ export class AntigravityAdapter implements HarnessAdapter {
     }
     if (model || thinkingOptionId) history.setSelection(model, thinkingOptionId);
     const session = new AntigravitySession({
+      profiles: this.#profiles,
+      ...(input.accountProfileId ? { accountProfileId: input.accountProfileId } : {}),
       ...(catalog ? { catalog } : {}),
       cwd: input.cwd,
       environment: sessionEnvironment,

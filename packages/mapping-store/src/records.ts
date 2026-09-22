@@ -39,6 +39,8 @@ export const storedThreadRecordV1Schema = z
     revision: z.number().int().positive(),
     hostThreadId: storedHostThreadIdSchema,
     createRequestId: nonBlankTextSchema.max(1_024),
+    /** Opaque Adapter-owned Profile binding. Absent on records created before Profiles existed. */
+    accountProfileId: nonBlankTextSchema.max(1_024).optional(),
     harnessId: harnessIdSchema,
     state: z.enum(["creating", "ready"]),
     nativeSessionRef: nativeSessionRefSchema.optional(),
@@ -193,6 +195,7 @@ export interface CreateProvisionalThreadInput {
   hostThreadId: HostThreadId;
   createRequestId: string;
   harnessId: HarnessId;
+  accountProfileId?: string;
   cwd: string;
   title?: string;
   transportModelId: string;

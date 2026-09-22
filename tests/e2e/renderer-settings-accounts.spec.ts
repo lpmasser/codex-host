@@ -34,7 +34,7 @@ const { outputFiles } = await build({
           {harnessId:"claude-code",harnessName:"Claude Code",email:"claude@example.com",plan:"max",credits:{usedPercent:0,periodType:"five_hour",productUsage:[{product:"7-day window",usagePercent:50}]}},
         ];
         let failUsage = scenario === "error";
-        const calls = { inspect:[], imports:[] };
+        const calls = { inspect:[], imports:[], profiles:[] };
         const sources = [
           {id:"codex:fixture",harnessId:"codex",provider:"openai-codex",label:"zhaobin_jiang@163.com"},
           {id:"grok:fixture",harnessId:"grok",provider:"xai",label:"grok@example.com"},
@@ -48,6 +48,14 @@ const { outputFiles } = await build({
             return {sources,targets:[{harnessId:"pi",providers:["openai-codex","xai"],imports:imported,others:[{provider:"anthropic",type:"oauth"},{provider:"codex1",type:"oauth",label:"same@example.com",vendor:"openai-codex"},{provider:"openai-codex",type:"api_key"}]}]};
           },
           ...(scenario === "external" ? {listHarnessAccounts: async () => ({accounts:harnessAccounts})} : {}),
+          ...(scenario === "profiles" ? {accountProfiles: async (params) => {
+            calls.profiles.push(params.action);
+            return {available:true,results:params.action === "import" ? [
+              {label:"first@example.com",status:"imported"},
+              {label:"second@example.com",status:"updated"},
+              {label:"third@example.com",status:"failed",error:"authenticationFailed"},
+            ] : []};
+          }} : {}),
           listCodexAccounts: async () => accountSnapshot(),
           refreshCodexAccounts: async () => accountSnapshot(),
           inspectCodexAccountUsage: async ({accountId}) => {
@@ -242,4 +250,36 @@ test("updates compact countdowns without requests or inventing a reset", async (
   expect(
     await page.evaluate(() => Reflect.get(globalThis, "accountsFixture").calls.inspect),
   ).toEqual(inspect);
+});
+
+test("imports an Antigravity Manager file through the native file input", async ({
+  page,
+}, testInfo) => {
+  await setup(page, { scenario: "profiles" });
+  const section = page.locator(".settings-account-profile-import");
+  await expect(section).toBeVisible();
+  await expect(section).toContainText("新建 Antigravity 任务将自动分配这些账号。账号导入到本机。");
+  const input = section.locator('input[type="file"]');
+  await input.setInputFiles({
+    name: "accounts.json",
+    mimeType: "application/json",
+    buffer: Buffer.from('[{"email":"first@example.com","refresh_token":"fixture-token"}]'),
+  });
+  const results = section.locator(".settings-account-profile-import__results li");
+  await expect(results).toHaveCount(3);
+  await expect(results.nth(0)).toHaveText("first@example.com — 已导入");
+  await expect(results.nth(2)).toContainText("third@example.com — 失败 · 授权失败");
+  await expect(input).toHaveValue("");
+  await expect(section).not.toContainText("fixture-token");
+  expect(
+    await page.evaluate(() => Reflect.get(globalThis, "accountsFixture").calls.profiles),
+  ).toEqual(["status", "import"]);
+  await section.scrollIntoViewIfNeeded();
+  await section.screenshot({ path: testInfo.outputPath("account-profile-import.png") });
+});
+
+test("hides the Antigravity import when the Host does not offer it", async ({ page }) => {
+  await setup(page);
+  await expect(page.locator(".settings-account-table")).toBeVisible();
+  await expect(page.locator(".settings-account-profile-import")).toBeHidden();
 });

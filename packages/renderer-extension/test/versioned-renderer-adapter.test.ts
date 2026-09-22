@@ -391,7 +391,7 @@ describe("current Codex Renderer Agent adapter", () => {
 
   it.each(["local", "remote-ssh-discovered:mac"])(
     "installs for %s and only sends resource settings to local",
-    (hostId) => {
+    async (hostId) => {
       const requestTarget = {
         hostId,
         sendRequest: vi.fn(),
@@ -508,6 +508,22 @@ describe("current Codex Renderer Agent adapter", () => {
           }
           expect(requestTarget.sendRequest).toHaveBeenCalledTimes(1);
           expect(remoteTarget.sendRequest).not.toHaveBeenCalled();
+          // Account profile import stays on the local Host while a remote Composer is active.
+          fakeWindow.__codexhostDraftPrewarmPolicyV1 = {
+            ...policy,
+            hostId: remoteTarget.hostId,
+            requestTarget: () => remoteTarget,
+          };
+          requestTarget.sendRequest.mockResolvedValueOnce({ available: true, results: [] });
+          await expect(
+            adapter.modelControl?.accountProfiles?.({ action: "status", harnessId: "antigravity" }),
+          ).resolves.toEqual({ available: true, results: [] });
+          expect(requestTarget.sendRequest).toHaveBeenLastCalledWith(
+            "codexhost/harness/account-profiles",
+            { action: "status", harnessId: "antigravity" },
+          );
+          expect(remoteTarget.sendRequest).not.toHaveBeenCalled();
+          fakeWindow.__codexhostDraftPrewarmPolicyV1 = policy;
           // Auxiliary lookups must not disable real connection or explicit policy invalidation.
           Object.defineProperty(requestTarget, "requestClient", { value: { ...requestTarget } });
           const reconnected = adapter.modelControl?.clientForHost?.("local");

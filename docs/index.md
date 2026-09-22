@@ -34,6 +34,7 @@
 | --- | --- |
 | [`harnesses/antigravity/antigravity-tool-approval.md`](harnesses/antigravity/antigravity-tool-approval.md) | agy 的危险跳过权限、旧模式拒绝和问题桥边界；修改权限或交互时阅读。 |
 | [`harnesses/antigravity/antigravity-subagents.md`](harnesses/antigravity/antigravity-subagents.md) | agy 原生 Subagent 生命周期、Transcript 和公共投影；修改 Subagent 支持时阅读。 |
+| [`harnesses/antigravity/antigravity-account-profiles.md`](harnesses/antigravity/antigravity-account-profiles.md) | AGM 文件导入、Profile 原生凭据隔离、Thread 绑定与本机认证适配边界。 |
 | [`harnesses/antigravity/antigravity-question-interaction-postmortem.md`](harnesses/antigravity/antigravity-question-interaction-postmortem.md) | Ask Question 失败历史、后续 Hook 桥实测和限制；排查 agy 提问交互时阅读。 |
 
 ### Claude Code

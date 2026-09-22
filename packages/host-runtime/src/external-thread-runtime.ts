@@ -504,7 +504,13 @@ export class ExternalThreadRuntime {
       // Background task IDs are never Subagent IDs; each child reads its own native source.
       const readChild =
         nativeSubagentId !== undefined && subagents
-          ? () => subagents.readSnapshot({ parent, nativeSubagentId, cwd: record.cwd })
+          ? () =>
+              subagents.readSnapshot({
+                parent,
+                nativeSubagentId,
+                cwd: record.cwd,
+                ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
+              })
           : nativeBackgroundTaskId !== undefined && backgroundTasks
             ? () =>
                 backgroundTasks.readSnapshot({
@@ -552,6 +558,7 @@ export class ExternalThreadRuntime {
     const opened = await adapter.open({
       kind: "resume",
       cwd: record.cwd,
+      ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
       environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: record.hostThreadId },
       nativeRef: record.nativeSessionRef as NativeSessionRef,
       knownTurnRefs: record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),
