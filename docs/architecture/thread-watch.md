@@ -38,6 +38,7 @@
 ## 送达
 
 - 通知通过普通的 `send` 在被通知 Thread 中启动一个新 Turn，外部 Harness 与原生 Codex 使用同一路径；不做同轮注入。
+- 原生 Codex 的 `send` 在确认目标不忙后调用 `thread/resume`（只传 `threadId` 与 `excludeTurns: true`），再按恢复结果确认空闲并 `turn/start`。`thread/read` 仍为 idle 的已取消订阅任务也要恢复；恢复失败或恢复后仍忙则不启动 Turn。watch 不拦截 unsubscribe，也不保活订阅。
 - 被通知 Thread 正忙时通知保持待送达并重试，最长 6 小时。`THREAD_BUSY` 从不被当作已送达；`thread send` 自身“不排队”的语义不变。
 - 同一个被通知 Thread 同时到期的多条通知合并为一条消息，只启动一个 Turn。
 - 被通知 Thread 不存在、只读，或超过 6 小时仍无法送达时，watch 标记为 `undeliverable` 并保留原因，可由 `thread watches` 查看。

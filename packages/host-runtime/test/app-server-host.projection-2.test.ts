@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { FakeHarnessAdapter } from "@codexhost/harness-adapter/testing";
 import { MappingStore } from "@codexhost/mapping-store";
@@ -15,7 +16,11 @@ import {
   harnessThinkingOptionIdSchema,
   hostThreadIdSchema,
 } from "@codexhost/shared-contracts";
-import type { DelegationControlApi } from "../src/delegation-types.js";
+import type {
+  DelegationControlApi,
+  DelegationControlRegistration,
+} from "../src/delegation-types.js";
+import { DelegationWatchService } from "../src/delegation-watch.js";
 import { type CodexAccountControl } from "../src/account/codex-account-control.js";
 
 import {
@@ -42,6 +47,33 @@ import {
   bindOfficialThread,
   answerOfficialParentCwd,
 } from "./app-server-host-fixture.js";
+
+async function nativeSendFixture(): Promise<{
+  fixture: ReturnType<typeof createFixture>;
+  api: DelegationControlApi;
+}> {
+  let api: DelegationControlApi | undefined;
+  const fixture = createFixture({
+    onDelegationApi: (registration) => {
+      api = registration;
+      return undefined;
+    },
+  });
+  await fixture.ready;
+  await vi.waitFor(async () => expect(await fixture.mappingStore.listThreads()).toEqual([]));
+  if (!api) throw new Error("Delegation API was not registered");
+  await bindOfficialThread(fixture, "native-thread");
+  return { fixture, api };
+}
+
+function officialLine(id: unknown, body: JsonObject): string {
+  return `${JSON.stringify({ id, ...body })}\n`;
+}
+
+async function expectNoFurtherOfficialRequest(stream: PassThrough): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(stream.read()).toBeNull();
+}
 
 describe("AppServerHost HarnessAdapter projection", () => {
   it("dispatches inspection by registered Harness ID and rejects unknown Harnesses", async () => {
@@ -519,7 +551,19 @@ describe("AppServerHost HarnessAdapter projection", () => {
       params: { threadId: "native-child", includeTurns: true },
     });
     fixture.official.stdout.write(
-      `${JSON.stringify({ id: read.id, result: { thread: { id: "native-child" } } })}\n`,
+      `${JSON.stringify({
+        id: read.id,
+        result: { thread: { id: "native-child", status: { type: "idle" } } },
+      })}\n`,
+    );
+    const resume = await readJsonLine(fixture.official.stdin);
+    expect(resume).toMatchObject({ method: "thread/resume" });
+    expect(resume.params).toEqual({ threadId: "native-child", excludeTurns: true });
+    fixture.official.stdout.write(
+      `${JSON.stringify({
+        id: resume.id,
+        result: { thread: { id: "native-child", status: { type: "idle" }, turns: [] } },
+      })}\n`,
     );
     const turnStart = await readJsonLine(fixture.official.stdin);
     expect(turnStart).toMatchObject({
@@ -543,6 +587,243 @@ describe("AppServerHost HarnessAdapter projection", () => {
     fixture.official.stdout.write(`${JSON.stringify({ id: interrupt.id, result: {} })}\n`);
     await expect(cancel).resolves.toMatchObject({ turnId: "native-turn-2", cancelled: true });
     await stopFixture(fixture);
+  });
+
+  it("resumes a native Thread that still reads as idle after unsubscribe", async () => {
+    const { fixture, api } = await nativeSendFixture();
+    const send = api.send({ threadId: "native-thread", message: "notify" });
+    const read = await readJsonLine(fixture.official.stdin);
+    expect(read).toMatchObject({
+      method: "thread/read",
+      params: { threadId: "native-thread", includeTurns: true },
+    });
+    fixture.official.stdout.write(
+      officialLine(read.id, {
+        result: {
+          thread: {
+            id: "native-thread",
+            status: { type: "idle" },
+            historyMode: "paginated",
+            model: "probe-target-model",
+            turns: [{ id: "stored-turn", status: "completed", items: [] }],
+          },
+        },
+      }),
+    );
+    const resume = await readJsonLine(fixture.official.stdin);
+    expect(resume).toMatchObject({ method: "thread/resume" });
+    expect(resume.params).toEqual({ threadId: "native-thread", excludeTurns: true });
+    fixture.official.stdout.write(
+      officialLine(resume.id, {
+        result: {
+          thread: { id: "native-thread", status: { type: "idle" }, turns: [] },
+          model: "probe-target-model",
+          modelProvider: "watch-probe",
+          approvalPolicy: "on-request",
+          sandbox: { type: "readOnly", networkAccess: false },
+        },
+      }),
+    );
+    const turnStart = await readJsonLine(fixture.official.stdin);
+    expect(turnStart).toMatchObject({
+      method: "turn/start",
+      params: { threadId: "native-thread", input: [{ type: "text", text: "notify" }] },
+    });
+    expect(turnStart.params).not.toHaveProperty("model");
+    fixture.official.stdout.write(
+      officialLine(turnStart.id, { result: { turn: { id: "resumed-turn" } } }),
+    );
+    await expect(send).resolves.toMatchObject({ turnId: "resumed-turn", status: "running" });
+    await stopFixture(fixture);
+  });
+
+  it("resumes a notLoaded native Thread before starting a Turn", async () => {
+    const { fixture, api } = await nativeSendFixture();
+    const send = api.send({ threadId: "native-thread", message: "continue" });
+    const read = await readJsonLine(fixture.official.stdin);
+    fixture.official.stdout.write(
+      officialLine(read.id, {
+        result: { thread: { id: "native-thread", status: { type: "notLoaded" }, turns: [] } },
+      }),
+    );
+    const resume = await readJsonLine(fixture.official.stdin);
+    expect(resume.params).toEqual({ threadId: "native-thread", excludeTurns: true });
+    fixture.official.stdout.write(
+      officialLine(resume.id, {
+        result: { thread: { id: "native-thread", status: { type: "idle" }, turns: [] } },
+      }),
+    );
+    const turnStart = await readJsonLine(fixture.official.stdin);
+    expect(turnStart).toMatchObject({ method: "turn/start" });
+    fixture.official.stdout.write(
+      officialLine(turnStart.id, { result: { turn: { id: "loaded-turn" } } }),
+    );
+    await expect(send).resolves.toMatchObject({ turnId: "loaded-turn" });
+    await stopFixture(fixture);
+  });
+
+  it.each([
+    {
+      label: "active",
+      thread: { id: "native-thread", status: { type: "active" }, turns: [] },
+    },
+    {
+      label: "in-progress Turn",
+      thread: {
+        id: "native-thread",
+        status: { type: "idle" },
+        turns: [{ id: "live-turn", status: "inProgress" }],
+      },
+    },
+  ])("does not resume or start a loaded native Thread with an $label", async ({ thread }) => {
+    const { fixture, api } = await nativeSendFixture();
+    const send = api.send({ threadId: "native-thread", message: "continue" });
+    const read = await readJsonLine(fixture.official.stdin);
+    expect(read).toMatchObject({ method: "thread/read" });
+    fixture.official.stdout.write(officialLine(read.id, { result: { thread } }));
+    await expect(send).rejects.toMatchObject({ code: "THREAD_BUSY" });
+    await expectNoFurtherOfficialRequest(fixture.official.stdin);
+    await stopFixture(fixture);
+  });
+
+  it("does not start a Turn when resume returns an active Thread", async () => {
+    const { fixture, api } = await nativeSendFixture();
+    const send = api.send({ threadId: "native-thread", message: "continue" });
+    const read = await readJsonLine(fixture.official.stdin);
+    fixture.official.stdout.write(
+      officialLine(read.id, {
+        result: { thread: { id: "native-thread", status: { type: "idle" }, turns: [] } },
+      }),
+    );
+    const resume = await readJsonLine(fixture.official.stdin);
+    expect(resume).toMatchObject({ method: "thread/resume" });
+    fixture.official.stdout.write(
+      officialLine(resume.id, {
+        result: { thread: { id: "native-thread", status: { type: "active" }, turns: [] } },
+      }),
+    );
+    await expect(send).rejects.toMatchObject({ code: "THREAD_BUSY" });
+    await expectNoFurtherOfficialRequest(fixture.official.stdin);
+    await stopFixture(fixture);
+  });
+
+  it("does not start a Turn when native resume fails", async () => {
+    const { fixture, api } = await nativeSendFixture();
+    const send = api.send({ threadId: "native-thread", message: "continue" });
+    const read = await readJsonLine(fixture.official.stdin);
+    fixture.official.stdout.write(
+      officialLine(read.id, {
+        result: { thread: { id: "native-thread", status: { type: "idle" }, turns: [] } },
+      }),
+    );
+    const resume = await readJsonLine(fixture.official.stdin);
+    expect(resume).toMatchObject({ method: "thread/resume" });
+    fixture.official.stdout.write(
+      officialLine(resume.id, { error: { message: "resume rejected" } }),
+    );
+    await expect(send).rejects.toMatchObject({
+      code: "DELEGATION_FAILED",
+      message: "resume rejected",
+    });
+    await expectNoFurtherOfficialRequest(fixture.official.stdin);
+    await stopFixture(fixture);
+  });
+
+  it("delivers one watch notification by resuming an unsubscribed native parent", async () => {
+    let api: DelegationControlRegistration | undefined;
+    const fixture = createFixture({
+      onDelegationApi: (registration) => {
+        api = registration;
+        return undefined;
+      },
+    });
+    const service = new DelegationWatchService(
+      {
+        read: (input) => {
+          if (!api) throw new Error("Delegation API was not registered");
+          return api.read(input);
+        },
+        send: (input) => {
+          if (!api) throw new Error("Delegation API was not registered");
+          return api.send(input);
+        },
+      },
+      { pollIntervalMs: 20 },
+    );
+    try {
+      await fixture.ready;
+      const childId = await startPiThread(fixture);
+      const turnId = await startPiTurn(fixture, childId);
+      await fixture.collector.waitFor((message) => turnEvent(message, "turn/started", turnId));
+      const session = fixture.adapter.sessions[0];
+      if (!session) throw new Error("Watched Session was not opened");
+
+      const watching = service.watch({
+        threadId: childId,
+        notifyThreadId: "native-parent",
+        timeoutMs: 60_000,
+      });
+      const parentRead = await readJsonLine(fixture.official.stdin);
+      expect(parentRead).toMatchObject({
+        method: "thread/read",
+        params: { threadId: "native-parent", includeTurns: true },
+      });
+      fixture.official.stdout.write(
+        officialLine(parentRead.id, {
+          result: {
+            thread: {
+              id: "native-parent",
+              status: { type: "idle" },
+              historyMode: "paginated",
+              turns: [{ id: "parent-turn", status: "completed", items: [] }],
+            },
+          },
+        }),
+      );
+      await expect(watching).resolves.toMatchObject({ state: "watching", threadId: childId });
+
+      session.succeedTurn();
+      await fixture.collector.waitFor((message) => turnEvent(message, "turn/completed", turnId));
+
+      const sendRead = await readJsonLine(fixture.official.stdin);
+      expect(sendRead).toMatchObject({
+        method: "thread/read",
+        params: { threadId: "native-parent" },
+      });
+      fixture.official.stdout.write(
+        officialLine(sendRead.id, {
+          result: { thread: { id: "native-parent", status: { type: "idle" }, turns: [] } },
+        }),
+      );
+      const resume = await readJsonLine(fixture.official.stdin);
+      expect(resume.params).toEqual({ threadId: "native-parent", excludeTurns: true });
+      fixture.official.stdout.write(
+        officialLine(resume.id, {
+          result: { thread: { id: "native-parent", status: { type: "idle" }, turns: [] } },
+        }),
+      );
+      const turnStart = await readJsonLine(fixture.official.stdin);
+      expect(turnStart).toMatchObject({
+        method: "turn/start",
+        params: {
+          threadId: "native-parent",
+          input: [
+            {
+              type: "text",
+              text: expect.stringContaining(`codex://threads/${childId}: completed.`),
+            },
+          ],
+        },
+      });
+      fixture.official.stdout.write(
+        officialLine(turnStart.id, { result: { turn: { id: "notify-turn" } } }),
+      );
+      await vi.waitFor(async () => expect(await service.watches()).toEqual({ watches: [] }));
+      await expectNoFurtherOfficialRequest(fixture.official.stdin);
+    } finally {
+      service.close();
+      await stopFixture(fixture);
+    }
   });
 
   it("inspects native Codex Models and starts with explicit Model and Thinking", async () => {
