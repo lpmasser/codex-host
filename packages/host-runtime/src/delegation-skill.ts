@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const SKILL_VERSION = 8;
+const SKILL_VERSION = 9;
 export const DELEGATION_SKILL_NAME = "codexhost-delegation";
 const SKILL_RELATIVE_PATH = path.join("skills", DELEGATION_SKILL_NAME, "SKILL.md");
 const PREVIOUS_MANAGED_DIGESTS: readonly string[] = [
@@ -14,6 +14,7 @@ const PREVIOUS_MANAGED_DIGESTS: readonly string[] = [
   "d3ddf6db9bc5c5df825479c885bbbf0ca08da66f7057a12e02e1fdf57525149e",
   "15eb63519ff867e1536c97188a0c43738d7a49d38d4d6adeb7a1036726e7246d",
   "b9c1cce41d2556e73a6514aa55618d7d3f2f9ef935f5ae50b0da5a04941514b4",
+  "1e50787cf5b115642a55bdc276a32d9e87dd96f7443b911d6a3776b20f6cd4fb",
 ];
 
 export const CODEXHOST_DELEGATION_SKILL = `---
@@ -30,17 +31,39 @@ description: >
 
 # Execute the task
 
+This Skill describes tool operation; honor the caller's task assignment and route.
+
 Before acting, run:
 
-\`codexhost delegate --help\`
+\`"$CODEXHOST_CLI_PATH" delegate --help\`
+
+Always call the CLI through the Host-provided \`CODEXHOST_CLI_PATH\` environment
+variable. A missing variable means the current process has no matching Host
+environment: report that limitation instead of looking for a bare \`codexhost\` on
+PATH, an old app installation path, another CLI, or invoking a Harness directly.
 
 Use CLI help as the authoritative source for commands and behavior. Consult
 command-specific help for options and the Harness listing command when the
 target is unknown. Prefer compact output when supported, and use its task links
 directly for subsequent commands.
 
-Use the Harness native defaults. Inspect the target when a Model or Thinking
-selection is needed or the default is unavailable.
+## Harness and Model selection
+
+Delegate on the Harness and Model the caller, the user, or the collaboration
+policy already selected. Use the native defaults only when no selection was
+made, and do not replace an explicit selection with a native default.
+
+Resolve Model and Thinking from the selected Harness live catalog. Read it with
+the Harness inspection command, refreshing once when supported and the requested
+Model is missing. Pass the opaque Model ID it returns explicitly; never assemble
+an ID yourself, and never treat a same-named Model from another provider as the
+same route. If the Model is still missing, report the route as unavailable and
+hand the choice back to the caller instead of downgrading silently.
+
+Keep an already-selected Thinking. For Antigravity with an explicit Model and no
+Thinking selection, pass \`high\` explicitly when the catalog offers it for that
+Model, and otherwise report that a Thinking choice is needed. With no Thinking
+selection elsewhere, use the native default.
 
 For a new delegation, create an independent child session and submit the
 requested task. For an existing external session, resolve the target from the
@@ -48,6 +71,10 @@ user-provided session link, identifier, or context and operate on that Thread
 directly; it need not have been created by the current assistant. If the target
 is ambiguous, ask the user to identify it. Keep requests to view or summarize a
 session read-only.
+
+Send a follow-up that continues existing work to the original Thread instead of
+copying the task into a new one. \`THREAD_BUSY\` means the message was not queued:
+wait for or cancel the active Turn, then send again.
 
 For a new or existing task, choose the appropriate next action based on the
 user’s request and the task:
@@ -60,6 +87,14 @@ user’s request and the task:
 - watch it, so the Host notifies this Thread once when its current Turn stops
   and no waiting or polling is needed meanwhile;
 - leave it running in the background.
+
+Terminal behavior follows CLI help. \`thread watch\` is a one-shot stop
+notification: claim registration only for a receipt with \`state=watching\`; a
+receipt with \`state=alreadyTerminal\` registered nothing and sends no
+notification. \`thread read\` and \`thread wait\` obtain results, a wait timeout is
+a running checkpoint rather than completion, and a result already returned needs
+no mechanical re-read. A command exit code reports the command's own success,
+not the delegated task's.
 
 A watch notification reports execution state only. Read the Thread before
 judging or reporting its work.
