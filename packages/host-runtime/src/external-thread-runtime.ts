@@ -83,6 +83,11 @@ export interface ExternalThread {
   ignoredInteractionIds: Set<HostInteractionId>;
   /** Native Session faulted or closed; idle Threads should restore instead of reuse. */
   sessionUnavailable: boolean;
+  /**
+   * Turns that took native steered input since Desktop last read this Thread's history. Desktop
+   * still shows each as one Turn, while native history may have split it at the steered input.
+   */
+  steeredTurnIds: Set<HostTurnId>;
 }
 
 export type ExternalThreadLocation =
@@ -391,6 +396,7 @@ export class ExternalThreadRuntime {
       projectedTerminalTurnId: null,
       ignoredInteractionIds: new Set(),
       sessionUnavailable: false,
+      steeredTurnIds: new Set(),
     };
     this.idleRelease.touch(externalThread);
     externalThread.outputTask = this.#consumeOutputs(externalThread);
