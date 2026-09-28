@@ -19,6 +19,7 @@ import { describe, expect, it, vi } from "vitest";
 import { runDelegationCli } from "../src/delegation-cli.js";
 import { startDelegationControlServer } from "../src/delegation-control-server.js";
 import { HarnessDelegationCoordinator } from "../src/harness-delegation-coordinator.js";
+import type { DelegationPendingQuestion, ThreadAnswerInput } from "../src/delegation-types.js";
 import { ExternalThreadRepository } from "../src/external-thread-repository.js";
 import { ExternalThreadRuntime, type ExternalThread } from "../src/external-thread-runtime.js";
 
@@ -40,6 +41,8 @@ async function fixture(
   const registered: ReturnType<ExternalThreadRuntime["register"]>[] = [];
   const notifications: unknown[] = [];
   const delivered: string[] = [];
+  const pending: DelegationPendingQuestion[] = [];
+  const answers: ThreadAnswerInput[] = [];
   const runtime = new ExternalThreadRuntime({
     adapters,
     environment,
@@ -83,6 +86,18 @@ async function fixture(
     },
     activeOfficialParents: () => [],
     externalThreadBusy,
+    pendingQuestions: () => [...pending],
+    answerQuestion: async (input) => {
+      answers.push(input);
+      return {
+        threadId: input.threadId,
+        interactionId: input.interactionId,
+        turnId: "turn-answered",
+        harnessId: "pi",
+        status: "running",
+        next: { read: "read", wait: "wait" },
+      };
+    },
   });
   return {
     adapter,
@@ -90,6 +105,8 @@ async function fixture(
     directory,
     delivered,
     notifications,
+    pending,
+    answers,
     registered,
     repository,
     runtime,
@@ -759,6 +776,69 @@ describe("HarnessDelegationCoordinator", () => {
       await expect(
         value.repository.getDelegationByChild(hostThreadIdSchema.parse(started.threadId)),
       ).resolves.toMatchObject({ status: "running" });
+    } finally {
+      await value.close();
+    }
+  });
+
+  it("reports pending Questions in read and returns from wait without waiting", async () => {
+    const value = await fixture();
+    try {
+      const started = await value.coordinator.start({
+        harnessId: "pi",
+        task: "work",
+        parentThreadId: "parent",
+      });
+      value.pending.push({
+        interactionId: "interaction-1",
+        turnId: started.turnId,
+        questions: [
+          {
+            id: "decision",
+            type: "choice",
+            prompt: "Continue?",
+            options: [{ value: "continue", label: "Continue" }],
+            multiple: false,
+            allowOther: false,
+            optional: false,
+          },
+        ],
+      });
+
+      await expect(
+        value.coordinator.read({ threadId: started.threadId, view: "result" }),
+      ).resolves.toMatchObject({
+        status: "running",
+        pendingQuestions: [{ interactionId: "interaction-1" }],
+      });
+      // A pending Question is a ready condition, not a timeout.
+      await expect(
+        value.coordinator.wait({ threadId: started.threadId, view: "result", timeoutMs: 30_000 }),
+      ).resolves.toMatchObject({
+        timedOut: false,
+        pendingQuestions: [{ interactionId: "interaction-1" }],
+      });
+
+      // The answer goes to the owning Host session with the normalized input.
+      await expect(
+        value.coordinator.answer({
+          threadId: started.threadId,
+          interactionId: "interaction-1",
+          answers: { decision: ["continue"] },
+        }),
+      ).resolves.toMatchObject({ status: "running", interactionId: "interaction-1" });
+      expect(value.answers).toEqual([
+        {
+          threadId: started.threadId,
+          interactionId: "interaction-1",
+          answers: { decision: ["continue"] },
+        },
+      ]);
+
+      value.pending.length = 0;
+      await expect(
+        value.coordinator.wait({ threadId: started.threadId, view: "result", timeoutMs: 10 }),
+      ).resolves.toMatchObject({ timedOut: true, pendingQuestions: [] });
     } finally {
       await value.close();
     }
