@@ -2354,24 +2354,38 @@ export class AppServerHost {
       this.#nativeAccountObserver?.observe(parsed);
       return;
     }
-    const privateTelemetry =
-      isRecord(parsed) &&
-      typeof parsed.method === "string" &&
-      !("id" in parsed) &&
-      !this.#observedSessionUsage.shouldForwardNotification(parsed);
-    if (!privateTelemetry) {
-      if (forwarded === parsed) await this.#writer.frame(input.frame);
-      else await this.#writer.json(forwarded);
+    try {
+      const privateTelemetry =
+        isRecord(parsed) &&
+        typeof parsed.method === "string" &&
+        !("id" in parsed) &&
+        !this.#observedSessionUsage.shouldForwardNotification(parsed);
+      if (!privateTelemetry) {
+        if (forwarded === parsed) await this.#writer.frame(input.frame);
+        else await this.#writer.json(forwarded);
+      }
+      // Plugin startup and history I/O must never delay the official protocol. Promise
+      // callbacks preserve observation order and the original receipt timestamps.
+      void (this.#usagePluginsReady ?? Promise.resolve())
+        .then(async () => {
+          for (const threadId of this.#observedSessionUsage.observe(parsed, observedAtMs)) {
+            await this.#writer.json({ method: THREAD_USAGE_UPDATED_METHOD, params: { threadId } });
+          }
+        })
+        .catch((error: unknown) => this.#diagnose(error));
+    } finally {
+      if (
+        isRecord(parsed) &&
+        parsed.method === "turn/completed" &&
+        isRecord(parsed.params) &&
+        typeof parsed.params.threadId === "string"
+      ) {
+        // Disconnect must wait for Question cleanup and the terminal frame to be written.
+        this.#forgetPendingOfficialTurnStarts(parsed.params.threadId);
+        this.#activeOfficialTurns.delete(parsed.params.threadId);
+        this.#signalActiveWorkChanged();
+      }
     }
-    // Plugin startup and history I/O must never delay the official protocol. Promise
-    // callbacks preserve observation order and the original receipt timestamps.
-    void (this.#usagePluginsReady ?? Promise.resolve())
-      .then(async () => {
-        for (const threadId of this.#observedSessionUsage.observe(parsed, observedAtMs)) {
-          await this.#writer.json({ method: THREAD_USAGE_UPDATED_METHOD, params: { threadId } });
-        }
-      })
-      .catch((error: unknown) => this.#diagnose(error));
     this.#nativeAccountObserver?.observe(parsed);
     const deletedProjectId = observeDeletedProject(parsed);
     if (deletedProjectId) {
@@ -2507,10 +2521,7 @@ export class AppServerHost {
       }
     }
     if (value.method === "turn/completed" && typeof params.threadId === "string") {
-      this.#forgetPendingOfficialTurnStarts(params.threadId);
       const turn = isRecord(params.turn) ? params.turn : null;
-      this.#activeOfficialTurns.delete(params.threadId);
-      this.#signalActiveWorkChanged();
       await this.#questions.closeWhere(
         (request) =>
           request.threadId === params.threadId && request.interaction.turnId === turn?.id,
