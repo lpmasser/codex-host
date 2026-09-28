@@ -687,7 +687,10 @@ export class AppServerHost {
   #activeOfficialTurns = new Map<string, string>();
   /** Active reply guards by request ID; each records whether its request was answered. */
   readonly #replyGuards = new Map<unknown, Set<{ answered: boolean }>>();
-  #pendingOfficialTurnStarts = new Map<unknown, string>();
+  #pendingOfficialTurnStarts = new Map<
+    unknown,
+    { threadId: string; completedTurnIds: Set<string> }
+  >();
   #activeWorkDrainWaiters = new Set<() => void>();
   #pendingOfficialDelegationThreads = new Set<string>();
   #pendingOfficialTerminalStatuses = new Map<string, DelegationStartResult["status"]>();
@@ -1116,13 +1119,13 @@ export class AppServerHost {
 
   #observeOfficialTurnStartResponse(value: JsonValue): void {
     if (!isRecord(value) || !("id" in value)) return;
-    const threadId = this.#pendingOfficialTurnStarts.get(value.id);
-    if (!threadId) return;
+    const pending = this.#pendingOfficialTurnStarts.get(value.id);
+    if (!pending) return;
     this.#pendingOfficialTurnStarts.delete(value.id);
     const result = isRecord(value.result) ? value.result : null;
     const turn = result && isRecord(result.turn) ? result.turn : null;
-    if (turn && typeof turn.id === "string") {
-      this.#activeOfficialTurns.set(threadId, turn.id);
+    if (turn && typeof turn.id === "string" && !pending.completedTurnIds.has(turn.id)) {
+      this.#activeOfficialTurns.set(pending.threadId, turn.id);
     }
     this.#signalActiveWorkChanged();
   }
@@ -1193,13 +1196,6 @@ export class AppServerHost {
       this.#consoleReplies.delete(id);
     }
   }
-
-  #forgetPendingOfficialTurnStarts(threadId: string): void {
-    for (const [requestId, pendingThreadId] of this.#pendingOfficialTurnStarts) {
-      if (pendingThreadId === threadId) this.#pendingOfficialTurnStarts.delete(requestId);
-    }
-  }
-
   async #forwardDesktop(): Promise<void> {
     for await (const frame of readLfFrames(this.#options.desktopInput)) {
       const parsed = parseJsonFrame(frame);
@@ -2038,7 +2034,10 @@ export class AppServerHost {
         return;
       }
       if (typeof threadId === "string") {
-        this.#pendingOfficialTurnStarts.set(request.id, threadId);
+        this.#pendingOfficialTurnStarts.set(request.id, {
+          threadId,
+          completedTurnIds: new Set(),
+        });
       }
     }
     if (request.method === "turn/steer") {
@@ -2321,7 +2320,6 @@ export class AppServerHost {
     }
     const parsed = input.value;
     const observedAtMs = Date.now();
-    this.#observeOfficialTurnStartResponse(parsed);
     let forwarded: JsonValue = parsed;
     if (isRecord(parsed) && typeof parsed.method === "string" && "id" in parsed) {
       const originalId = parsed.id;
@@ -2374,15 +2372,19 @@ export class AppServerHost {
         })
         .catch((error: unknown) => this.#diagnose(error));
     } finally {
+      // A start response settles only its own request, after the response reaches Desktop.
+      this.#observeOfficialTurnStartResponse(parsed);
       if (
         isRecord(parsed) &&
         parsed.method === "turn/completed" &&
         isRecord(parsed.params) &&
         typeof parsed.params.threadId === "string"
       ) {
-        // Disconnect must wait for Question cleanup and the terminal frame to be written.
-        this.#forgetPendingOfficialTurnStarts(parsed.params.threadId);
-        this.#activeOfficialTurns.delete(parsed.params.threadId);
+        const turn = isRecord(parsed.params.turn) ? parsed.params.turn : null;
+        // An older terminal must not clear a later active Turn or any pending start request.
+        if (turn && this.#activeOfficialTurns.get(parsed.params.threadId) === turn.id) {
+          this.#activeOfficialTurns.delete(parsed.params.threadId);
+        }
         this.#signalActiveWorkChanged();
       }
     }
@@ -2516,12 +2518,17 @@ export class AppServerHost {
     if (value.method === "turn/started" && typeof params.threadId === "string") {
       const turn = isRecord(params.turn) ? params.turn : null;
       if (turn && typeof turn.id === "string") {
-        this.#forgetPendingOfficialTurnStarts(params.threadId);
         this.#activeOfficialTurns.set(params.threadId, turn.id);
       }
     }
     if (value.method === "turn/completed" && typeof params.threadId === "string") {
       const turn = isRecord(params.turn) ? params.turn : null;
+      if (turn && typeof turn.id === "string") {
+        // A terminal can precede its start response. Keep this fact only with in-flight requests.
+        for (const pending of this.#pendingOfficialTurnStarts.values()) {
+          if (pending.threadId === params.threadId) pending.completedTurnIds.add(turn.id);
+        }
+      }
       await this.#questions.closeWhere(
         (request) =>
           request.threadId === params.threadId && request.interaction.turnId === turn?.id,
