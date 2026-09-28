@@ -134,6 +134,9 @@ async function executeCurrentLastTurnRollback(input: {
     opened = await adapter.open({
       kind: "rollbackLastTurn",
       cwd: current.cwd,
+      ...(currentRecord.accountProfileId
+        ? { accountProfileId: currentRecord.accountProfileId }
+        : {}),
       environment: {
         ...(input.environment ?? process.env),
         [DELEGATION_THREAD_ID_ENV]: current.id,
@@ -332,6 +335,9 @@ export async function executeExternalThreadRollback(input: {
     opened = await adapter.open({
       kind: "fork",
       cwd: derived.cwd,
+      ...(derivedRecord.accountProfileId
+        ? { accountProfileId: derivedRecord.accountProfileId }
+        : {}),
       environment: {
         ...(input.environment ?? process.env),
         [DELEGATION_THREAD_ID_ENV]: derived.id,

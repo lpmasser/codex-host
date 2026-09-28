@@ -11,6 +11,7 @@ export function createHarnessAdapter(context: HarnessPluginContext): Antigravity
   const environment = { ...context.environment };
   return Object.assign(
     new AntigravityAdapter({
+      managedRemoteHost: context.managedRemoteHost,
       ...(environment[ANTIGRAVITY_COMMAND_ENV]
         ? { command: environment[ANTIGRAVITY_COMMAND_ENV] }
         : {}),

@@ -130,7 +130,10 @@ describe("Antigravity Adapter", () => {
     const fixture = await fakeAgy([
       JSON.stringify({ event: "command_result", command: USAGE_COMMAND }),
     ]);
-    const adapter = new AntigravityAdapter({ command: fixture.command, environment: process.env });
+    const adapter = new AntigravityAdapter({
+      command: fixture.command,
+      environment: { ...process.env, CODEXHOST_DATA_DIR: path.join(fixture.cwd, "host") },
+    });
     try {
       expect(await adapter.inspectAccount()).toMatchObject({
         credits: { label: "Gemini Models · 5-hour window", usedPercent: 0 },

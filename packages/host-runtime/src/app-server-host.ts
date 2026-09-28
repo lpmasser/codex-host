@@ -33,9 +33,11 @@ import {
   idleReleaseSettingsSchema,
 } from "@codexhost/shared-contracts";
 import {
+  ACCOUNT_PROFILES_METHOD,
   CREDENTIAL_IMPORTS_METHOD,
   credentialImportsParamsSchema,
 } from "@codexhost/shared-contracts";
+import { handleAccountProfiles } from "./account-profiles.js";
 import { handleCredentialImports } from "./credential-imports.js";
 import { HarnessDisplaySettingsStore } from "./harness-display-settings.js";
 import {
@@ -1517,6 +1519,18 @@ export class AppServerHost {
             ),
           );
         }
+      });
+      return;
+    }
+    if (request.method === ACCOUNT_PROFILES_METHOD) {
+      this.#dispatchDesktopRequest(async () => {
+        await this.#waitForPlugins();
+        const response = await handleAccountProfiles(
+          request.params,
+          this.#externalAdapters.values(),
+          this.#accountInspections,
+        );
+        await this.#writer.json(rpcEnvelope(request, response));
       });
       return;
     }
@@ -3971,9 +3985,21 @@ export class AppServerHost {
       return;
     }
 
+    let selectedProfileId: string | undefined;
+    try {
+      selectedProfileId = await adapter.accountProfiles?.select();
+    } catch {
+      this.#routeObservationTracker.rejectCreate(request.id);
+      await this.#writer.json(
+        rpcError(request, -32076, "External Harness account Profile could not be selected"),
+      );
+      return;
+    }
+
     const recordInput = createExternalThreadRecordInput({
       harnessId: adapter.harnessId,
       cwd,
+      ...(selectedProfileId ? { accountProfileId: selectedProfileId } : {}),
       transportModelId,
       ephemeral: params.ephemeral === true,
       historyMode: params.historyMode === "paginated" ? "paginated" : "legacy",
@@ -3990,6 +4016,8 @@ export class AppServerHost {
     const sessionResult = await adapter.open({
       kind: "create",
       cwd,
+      // The persisted record owns the Profile binding, so a retried create request reuses it.
+      ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
       environment: {
         ...(this.#options.environment ?? process.env),
         [DELEGATION_THREAD_ID_ENV]: record.hostThreadId,

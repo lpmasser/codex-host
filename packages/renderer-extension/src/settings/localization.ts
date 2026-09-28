@@ -3,6 +3,11 @@ import {
   credentialImportChinese,
   type CredentialImportMessages,
 } from "./credential-import-messages.js";
+import {
+  accountProfileImportChinese,
+  accountProfileImportEnglish,
+  type AccountProfileImportMessages,
+} from "./account-profile-import-messages.js";
 import type { DefaultRendererSettingsPageId } from "./pages.js";
 import {
   harnessVersionEnglish,
@@ -29,6 +34,7 @@ export interface RendererSettingsLanguageControl {
 
 export interface RendererSettingsMessages {
   readonly credentialImports: CredentialImportMessages;
+  readonly accountProfileImport: AccountProfileImportMessages;
   readonly locale: RendererSettingsLocale;
   readonly title: string;
   readonly close: string;
@@ -281,6 +287,7 @@ export interface RendererSettingsMessages {
 
 const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   credentialImports: credentialImportEnglish,
+  accountProfileImport: accountProfileImportEnglish,
   locale: "en",
   title: "Settings",
   close: "Close settings",
@@ -588,6 +595,7 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
 
 const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   credentialImports: credentialImportChinese,
+  accountProfileImport: accountProfileImportChinese,
   locale: "zh-CN",
   title: "设置",
   close: "关闭设置",

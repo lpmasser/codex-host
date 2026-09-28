@@ -115,6 +115,9 @@ export async function executeExternalThreadFork(input: {
     provisional = await repository.createProvisional(
       createExternalThreadRecordInput({
         harnessId: source.record.harnessId,
+        ...(source.record.accountProfileId
+          ? { accountProfileId: source.record.accountProfileId }
+          : {}),
         cwd: targetCwd,
         transportModelId: source.transportModelId,
         ephemeral: fork.ephemeral ?? source.record.ephemeral,
@@ -137,6 +140,7 @@ export async function executeExternalThreadFork(input: {
     opened = await adapter.open({
       kind: "fork",
       cwd: targetCwd,
+      ...(provisional.accountProfileId ? { accountProfileId: provisional.accountProfileId } : {}),
       environment: {
         ...(input.environment ?? process.env),
         [DELEGATION_THREAD_ID_ENV]: provisional.hostThreadId,

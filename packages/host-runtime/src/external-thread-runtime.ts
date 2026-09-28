@@ -776,11 +776,14 @@ export class ExternalThreadRuntime {
       }
       const subagent = record.subagent;
       const parent = record.nativeSessionRef as NativeSessionRef;
-      const snapshot = await subagents.readSnapshot({
-        parent,
-        nativeSubagentId: subagent.nativeSubagentId,
-        cwd: record.cwd,
-      });
+      const readSnapshot = () =>
+        subagents.readSnapshot({
+          parent,
+          ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
+          nativeSubagentId: subagent.nativeSubagentId,
+          cwd: record.cwd,
+        });
+      const snapshot = await readSnapshot();
       const latest = await this.#repository.find(record.hostThreadId);
       if (
         latest?.state === "ready" &&
@@ -796,12 +799,7 @@ export class ExternalThreadRuntime {
         record.harnessId,
         record.nativeSessionRef as NativeSessionRef,
         snapshot.value,
-        () =>
-          subagents.readSnapshot({
-            parent,
-            nativeSubagentId: subagent.nativeSubagentId,
-            cwd: record.cwd,
-          }),
+        readSnapshot,
       );
       const aligned = await this.#repository.alignSnapshot(record, snapshot.value);
       const sessionId = await this.#repository.sessionTreeId(aligned.record);
@@ -818,6 +816,7 @@ export class ExternalThreadRuntime {
     const opened = await adapter.open({
       kind: "resume",
       cwd: record.cwd,
+      ...(record.accountProfileId ? { accountProfileId: record.accountProfileId } : {}),
       environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: record.hostThreadId },
       nativeRef: record.nativeSessionRef as NativeSessionRef,
       knownTurnRefs: record.turnMappings.map(({ nativeTurnRef }) => nativeTurnRef),

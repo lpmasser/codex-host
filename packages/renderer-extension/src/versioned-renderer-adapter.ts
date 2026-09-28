@@ -1028,6 +1028,14 @@ export function installCurrentRendererAdapter(): {
       if (!client.credentialImports) throw new Error("Credential imports are unavailable");
       return client.credentialImports(request, targetHarnessId);
     },
+    accountProfiles: (
+      params: Parameters<NonNullable<RendererModelClient["accountProfiles"]>>[0],
+    ) => {
+      // Imported credentials belong to the local Host; never follow the Composer's remote route.
+      const client = disposed ? null : clients.forHost("local");
+      if (!client?.accountProfiles) throw new Error("Account profile import is unavailable");
+      return client.accountProfiles(params);
+    },
     listCodexAccounts: () => settingsModelClient().listCodexAccounts(),
     refreshCodexAccounts: () => {
       const client = settingsModelClient();

@@ -16,6 +16,23 @@ const snapshot: HarnessAccountSnapshot = {
 const adapter = (id: string) => new FakeHarnessAdapter(harnessIdSchema.parse(id));
 
 describe("read-only Harness accounts", () => {
+  it("does not restore a stale account cache after profile import invalidates an in-flight read", async () => {
+    const old = Promise.withResolvers<HarnessAccountSnapshot | null>();
+    const read = vi
+      .fn<() => Promise<HarnessAccountSnapshot | null>>()
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValue(null);
+    const native = Object.assign(adapter("antigravity"), { inspectAccount: read });
+    const cache = new HarnessAccountInspectionCache();
+    const pending = cache.inspect(native, []);
+    await Promise.resolve();
+    cache.invalidate(native.harnessId);
+    expect((await cache.inspect(native, [])).account).toBeNull();
+    old.resolve(snapshot);
+    await pending;
+    expect((await cache.inspect(native, [])).account).toBeNull();
+    expect(read).toHaveBeenCalledTimes(2);
+  });
   it("lists only progressive account sources with their plugin display names", () => {
     const ready = Object.assign(adapter("sample-agent"), {
       inspectAccount: vi.fn(async () => snapshot),

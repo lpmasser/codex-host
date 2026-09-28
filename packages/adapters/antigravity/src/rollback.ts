@@ -136,8 +136,13 @@ export async function rollbackAntigravityLastTurn(
       sourceRef.nativeSessionId,
       derivedNativeSessionId,
       mappedTurns.length,
+      input.accountProfileId ? sessionEnvironment.HOME : undefined,
     ),
-    copyNativeBrainDirIfExists(sourceRef.nativeSessionId, derivedNativeSessionId),
+    copyNativeBrainDirIfExists(
+      sourceRef.nativeSessionId,
+      derivedNativeSessionId,
+      input.accountProfileId ? sessionEnvironment.HOME : undefined,
+    ),
   ]);
 
   const derivedNativeRef: NativeSessionRef = {

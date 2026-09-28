@@ -346,7 +346,6 @@ export {
   type DelegationMention,
   type DelegationMentionRewrite,
 } from "./delegation-mention.js";
-
 export {
   REMOTE_SSH_SETUP_METHOD,
   remoteSshSetupParamsSchema,
@@ -371,3 +370,15 @@ export {
   type CodexSshConnection,
   type CodexSshDraft,
 } from "./remote-connections.js";
+export {
+  ACCOUNT_PROFILES_METHOD,
+  ACCOUNT_PROFILE_IMPORT_MAX_BYTES,
+  accountProfilesParamsSchema,
+  accountProfilesResultSchema,
+  accountProfileImportEntrySchema,
+} from "./account-profiles.js";
+export type {
+  AccountProfilesParams,
+  AccountProfilesResult,
+  AccountProfileImportEntry,
+} from "./account-profiles.js";
