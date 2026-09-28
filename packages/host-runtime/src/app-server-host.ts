@@ -5639,7 +5639,8 @@ export class AppServerHost {
       const { interactionId } = event;
       await this.#resolveDesktopApproval(interactionId);
       await this.#questions.closeWhere(
-        (request) => request.interaction.interactionId === interactionId,
+        (request) =>
+          request.threadId === thread.id && request.interaction.interactionId === interactionId,
       );
     }
     const ephemeralTurn =
