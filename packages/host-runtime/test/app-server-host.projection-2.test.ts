@@ -13,7 +13,6 @@ import {
 import {
   harnessIdSchema,
   harnessModelRefSchema,
-  harnessThinkingOptionIdSchema,
   hostThreadIdSchema,
 } from "@codexhost/shared-contracts";
 import type { DelegationControlApi, DelegationThreadSnapshot } from "../src/delegation-types.js";
@@ -1203,8 +1202,8 @@ describe("AppServerHost HarnessAdapter projection", () => {
       task: "review auth",
       cwd: "/synthetic",
       parentThreadId: "parent-thread",
-      model: kimiModel,
-      thinkingOptionId: harnessThinkingOptionIdSchema.parse("high"),
+      model: kimiModel.id,
+      thinking: "high",
     });
     await answerOfficialParentCwd(fixture);
     const validationList = await readJsonLine(fixture.official.stdin);
@@ -1283,7 +1282,7 @@ describe("AppServerHost HarnessAdapter projection", () => {
       task: "review auth",
       cwd: "/synthetic",
       parentThreadId: "parent-thread",
-      model: legacyModel,
+      model: legacyModel.id,
     });
     await answerOfficialParentCwd(fixture);
     const modelList = await readJsonLine(fixture.official.stdin);

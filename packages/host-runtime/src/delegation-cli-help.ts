@@ -6,11 +6,11 @@ List Harnesses available in the active Runtime.`,
   "harness inspect": `codexhost harness inspect <harness> [--cwd <path>] [--refresh true|false] [--format json|compact]
 Read available Models, native defaults, Thinking options, and configuration capabilities.
 Use the returned Model and Thinking IDs for explicit selections.`,
-  "delegate start": `codexhost delegate start --harness <id> --task <text> [--task-name <name>] [--cwd <path>] [--model <opaque-ref>] [--thinking <option-id>] [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>] [--format json|compact]
+  "delegate start": `codexhost delegate start --harness <id> --task <text> [--task-name <name>] [--cwd <path>] [--model <model>] [--thinking <thinking>] [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>] [--format json|compact]
 Create an independent child Thread, submit the task, and return immediately.
 --task-name supplies a short subtask name (1-120 characters); otherwise the first task line is used.
 The child title is "subtask name · parent title", fixed at creation; renaming the parent does not rename existing children.
-Omit --model and --thinking to use the Harness native defaults.
+Omit --model and --thinking to use the Harness native defaults. Either the catalog id or the nativeId shown by harness inspect is accepted.
 --cwd overrides the child workspace; a relative path resolves against the caller process cwd. Otherwise use the resolved parent Thread workspace, then the Host Runtime process cwd.
 --parent-thread overrides caller inference. PARENT_THREAD_AMBIGUOUS requires an explicit parent.
 Reuse --request-id for an idempotent retry. Identical recent parent/target/task/configuration requests are also deduplicated briefly.

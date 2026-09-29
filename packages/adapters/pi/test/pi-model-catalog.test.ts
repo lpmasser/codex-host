@@ -51,6 +51,10 @@ describe("Pi Model Catalog normalization", () => {
       "a-provider / same",
       "z-provider / same",
     ]);
+    expect(catalog.models.map(({ nativeId }) => nativeId)).toEqual([
+      "a-provider/same",
+      "z-provider/same",
+    ]);
     expect(catalog.models[0]?.ref).not.toEqual(catalog.models[1]?.ref);
     expect(catalog.defaultModel).toEqual(catalog.models[1]?.ref);
     expect(catalog.defaultThinkingOptionId).toBe("high");
