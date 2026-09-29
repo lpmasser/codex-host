@@ -16,12 +16,7 @@ import {
   type JsonObject,
   type RoutedHarnessId,
 } from "@codexhost/protocol-core";
-import {
-  catalogModelForRef,
-  harnessIdSchema,
-  hostThreadIdSchema,
-  hostTurnIdSchema,
-} from "@codexhost/shared-contracts";
+import { harnessIdSchema, hostThreadIdSchema, hostTurnIdSchema } from "@codexhost/shared-contracts";
 
 import {
   DELEGATION_THREAD_ID_ENV,
@@ -42,6 +37,10 @@ import {
   type ThreadSendResult,
   type ThreadWaitInput,
 } from "./delegation-types.js";
+import {
+  resolveDelegationConfiguration,
+  type ResolvedDelegationConfiguration,
+} from "./delegation-configuration.js";
 import { projectDelegationThreadSnapshot, validateReadOptions } from "./delegation-snapshot.js";
 import {
   createExternalThreadRecordInput,
@@ -78,15 +77,15 @@ function terminal(status: DelegationThreadSnapshot["status"]): boolean {
 }
 
 function taskDigest(
-  input: Pick<DelegationStartInput, "task" | "model" | "thinkingOptionId"> & { cwd: string },
+  input: Pick<DelegationStartInput, "task" | "model" | "thinking"> & { cwd: string },
 ): string {
   return createHash("sha256")
     .update(
       JSON.stringify({
         task: input.task,
         cwd: path.resolve(input.cwd),
-        modelId: input.model?.id ?? null,
-        thinkingOptionId: input.thinkingOptionId ?? null,
+        model: input.model ?? null,
+        thinking: input.thinking ?? null,
       }),
     )
     .digest("hex");
@@ -283,12 +282,17 @@ export class HarnessDelegationCoordinator {
         },
       );
     }
-    if (input.model || input.thinkingOptionId) {
+    let resolvedConfig: ResolvedDelegationConfiguration = {};
+    if (input.model || input.thinking) {
       const inspected = await this.inspect({
         harnessId: targetHarnessId,
         cwd: startInput.cwd,
       });
-      this.#validateConfiguration(inspected.inspection, input.model, input.thinkingOptionId);
+      resolvedConfig = this.#validateConfiguration(
+        inspected.inspection,
+        input.model,
+        input.thinking,
+      );
     }
     const delegationId = hostThreadIdSchema.parse(randomUUID());
     const childThreadId = hostThreadIdSchema.parse(randomUUID());
@@ -302,10 +306,12 @@ export class HarnessDelegationCoordinator {
         cwd: startInput.cwd,
         title,
         transportModelId:
-          input.model || input.thinkingOptionId
+          resolvedConfig.model || resolvedConfig.thinkingOptionId
             ? encodeExternalTransportSelection(targetHarnessId, {
-                ...(input.model ? { model: input.model } : {}),
-                ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
+                ...(resolvedConfig.model ? { model: resolvedConfig.model } : {}),
+                ...(resolvedConfig.thinkingOptionId
+                  ? { thinkingOptionId: resolvedConfig.thinkingOptionId }
+                  : {}),
               })
             : transportModelIdForHarness(targetHarnessId),
         ephemeral: false,
@@ -331,8 +337,10 @@ export class HarnessDelegationCoordinator {
           cwd: record.cwd,
           environment: { ...this.#environment, [DELEGATION_THREAD_ID_ENV]: childThreadId },
           executionPolicy: "unattended-full-access",
-          ...(input.model ? { model: input.model } : {}),
-          ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
+          ...(resolvedConfig.model ? { model: resolvedConfig.model } : {}),
+          ...(resolvedConfig.thinkingOptionId
+            ? { thinkingOptionId: resolvedConfig.thinkingOptionId }
+            : {}),
         });
         if (!opened.ok) throw new DelegationControlError("DELEGATION_FAILED", opened.error.message);
         session = opened.value;
@@ -354,8 +362,10 @@ export class HarnessDelegationCoordinator {
           sessionId: record.hostThreadId,
           thread: threadValue,
           turns: [],
-          ...(input.model ? { requestedModel: input.model } : {}),
-          ...(input.thinkingOptionId ? { requestedThinkingOptionId: input.thinkingOptionId } : {}),
+          ...(resolvedConfig.model ? { requestedModel: resolvedConfig.model } : {}),
+          ...(resolvedConfig.thinkingOptionId
+            ? { requestedThinkingOptionId: resolvedConfig.thinkingOptionId }
+            : {}),
           ...(session.initialState.nativeRef ? {} : { restoredState: session.initialState }),
         });
         const beforeRevision = thread.stateObserver.revision;
@@ -399,8 +409,10 @@ export class HarnessDelegationCoordinator {
         return {
           ...this.#result(delegationId, childThreadId, turnId, targetHarnessId, "running", {
             requested: {
-              ...(input.model ? { model: input.model } : {}),
-              ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}),
+              ...(resolvedConfig.model ? { model: resolvedConfig.model } : {}),
+              ...(resolvedConfig.thinkingOptionId
+                ? { thinkingOptionId: resolvedConfig.thinkingOptionId }
+                : {}),
             },
             effective: {
               ...(thread.stateObserver.state.effectiveModel
@@ -660,48 +672,27 @@ export class HarnessDelegationCoordinator {
 
   #validateConfiguration(
     inspection: Awaited<ReturnType<HarnessAdapter["inspect"]>>,
-    model: HarnessModelRef | undefined,
-    thinkingOptionId: HarnessThinkingOptionId | undefined,
-  ): void {
+    model: string | undefined,
+    thinking: string | undefined,
+  ): ResolvedDelegationConfiguration {
     if (inspection.status !== "ready") {
       throw new DelegationControlError("DELEGATION_FAILED", inspection.error.message, {
         status: inspection.status,
       });
     }
-    const selectedModel = model ?? inspection.catalog.defaultModel;
     if (model && !inspection.capabilities.configuration.selectModel) {
       throw new DelegationControlError(
         "INVALID_ARGUMENT",
         "Harness does not support Model selection",
       );
     }
-    if (model && !catalogModelForRef(inspection.catalog, model)) {
-      throw new DelegationControlError(
-        "INVALID_ARGUMENT",
-        "Model is unavailable for the target Harness",
-        {
-          validModelIds: inspection.catalog.models.flatMap((candidate) =>
-            candidate.fastModel ? [candidate.ref.id, candidate.fastModel.id] : [candidate.ref.id],
-          ),
-        },
-      );
-    }
-    if (!thinkingOptionId) return;
-    if (!inspection.capabilities.configuration.selectThinkingOption) {
+    if (thinking && !inspection.capabilities.configuration.selectThinkingOption) {
       throw new DelegationControlError(
         "INVALID_ARGUMENT",
         "Harness does not support Thinking selection",
       );
     }
-    const modelEntry = catalogModelForRef(inspection.catalog, selectedModel);
-    const validThinkingOptionIds = modelEntry?.supportedThinkingOptionIds ?? [];
-    if (!validThinkingOptionIds.includes(thinkingOptionId)) {
-      throw new DelegationControlError(
-        "INVALID_ARGUMENT",
-        "Thinking option is unavailable for the selected Model",
-        { validThinkingOptionIds },
-      );
-    }
+    return resolveDelegationConfiguration(inspection.catalog, { model, thinking });
   }
 
   async #parentMetadata(
