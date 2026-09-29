@@ -1007,6 +1007,9 @@ export class CodexTurnProjector {
 
   #startItem(event: ItemStartedEvent, startedAtMs: number): CodexTurnProjection {
     this.#requireStarted();
+    if (event.item.type === "userMessage" && event.item.clientUserMessageId) {
+      this.bindUserMessageClientId(event.item.itemId, event.item.clientUserMessageId);
+    }
     if (this.#items.has(event.item.itemId)) throw new Error("Host Item started more than once");
     const projected: ProjectedItem = {
       item: event.item,
@@ -1233,7 +1236,8 @@ export class CodexTurnProjector {
   }
 
   #completeTurn(event: TurnCompletedEvent, completedAtMs: number): CodexTurnProjection {
-    this.#requireStarted();
+    // An accepted input may be withdrawn or fail before native execution starts.
+    if (event.outcome.status === "succeeded") this.#requireStarted();
     if (this.#interactions.size > 0) {
       throw new Error("Host Turn completed with pending Interactions");
     }

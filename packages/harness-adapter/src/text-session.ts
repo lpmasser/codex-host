@@ -146,13 +146,15 @@ export interface TurnStartCommand {
 /**
  * Native same-Turn input, sent only when `capabilities.steer` is true. The Adapter hands it to the
  * Harness's own insertion primitive, which takes it at its safe boundary without cancelling the
- * Turn, and succeeds once the Harness accepts it. The Host shows the accepted input live; history
- * snapshots group it however the native history does.
+ * Turn, and succeeds once the Harness accepts it. The Host normally projects the accepted input;
+ * an Adapter that reports inputProjection: "adapter" publishes its own userMessage Item when the
+ * actual consuming Turn is known, including the supplied clientUserMessageId.
  */
 export interface TurnSteerCommand {
   type: "turn.steer";
   turnId: HostTurnId;
   input: HostTextInput[];
+  clientUserMessageId?: string;
 }
 
 export interface TurnCancelCommand {
@@ -282,6 +284,8 @@ export interface TurnStartAccepted {
 
 export interface TurnSteerAccepted {
   accepted: true;
+  /** The Adapter publishes the input Item once its actual native Turn is known. */
+  inputProjection?: "adapter";
 }
 
 export interface TurnCancelAccepted {
@@ -316,11 +320,12 @@ export interface HostAgentMessageItem {
   phase?: "commentary" | "final_answer";
 }
 
-/** User input steered into a running Turn; the Host publishes it when the Harness accepts it. */
+/** Accepted user input, projected in the Turn that actually consumes it. */
 export interface HostUserMessageItem {
   type: "userMessage";
   itemId: HostItemId;
   input: HostTextInput[];
+  clientUserMessageId?: string;
 }
 
 export interface HostReasoningItem {
@@ -463,6 +468,12 @@ export interface SessionStateChangedEvent {
   state: HarnessSessionState;
 }
 
+/** Native activity can span multiple Turns, independently of background task lifetime. */
+export interface SessionActivityChangedEvent {
+  type: "session.activity.changed";
+  activity: "idle" | "running" | "requires_action";
+}
+
 export interface SessionUsageChangedEvent {
   type: "session.usage.changed";
   usage: HostUsage | null;
@@ -496,6 +507,7 @@ export interface SubagentTranscriptChangedEvent {
   nativeSubagentId: string;
 }
 
+/** Actual execution started; an accepted input can fail or be cancelled before this event. */
 export interface TurnStartedEvent {
   type: "turn.started";
   turnId: HostTurnId;
@@ -559,6 +571,7 @@ export interface SessionFaultedEvent {
 
 export type HostEvent =
   | SessionStateChangedEvent
+  | SessionActivityChangedEvent
   | SessionUsageChangedEvent
   | UsageRequestEvent
   | UsageHistoryEvent

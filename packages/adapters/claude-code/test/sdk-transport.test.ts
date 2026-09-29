@@ -14,8 +14,8 @@ import {
   type ClaudeSdkTransportOptions,
 } from "../src/sdk-transport.js";
 import {
-  ClaudeSteerMissedTurnError,
   type ClaudeTransportTurnResult,
+  type ClaudeSessionEvent,
   type ClaudeTurnEvent,
 } from "../src/transport.js";
 import { FakeQuery } from "./fake-sdk-query.js";
@@ -53,53 +53,128 @@ function fixture(
     onPlanLimit,
     queryFactory,
   });
+  let activeSegment: number | undefined;
+  let continuations: ObservedTurn[] = [];
+  let threadHandler: ((event: ClaudeTurnEvent) => void) | null = null;
+  const pending = new Map<
+    string,
+    {
+      onEvent(event: ClaudeTurnEvent): void;
+      resolve(result: ClaudeTransportTurnResult): void;
+      reject(error: unknown): void;
+    }
+  >();
+  const segments = new Map<
+    number,
+    { onEvent(event: ClaudeTurnEvent): void; resolve(result: ClaudeTransportTurnResult): void }
+  >();
+  transport.setEventHandler((event: ClaudeSessionEvent) => {
+    if (event.type === "thread.event") {
+      threadHandler?.(event.event);
+      return;
+    }
+    if (event.type === "segment.started") {
+      activeSegment = event.segmentId;
+      const observer = pending.get(event.inputIds[0] ?? "");
+      if (observer) {
+        segments.set(event.segmentId, observer);
+        pending.delete(event.inputIds[0] as string);
+      } else {
+        const turn: ObservedTurn = {
+          nativeTurnKey: event.inputIds[0],
+          events: [],
+          terminal: undefined,
+        };
+        continuations.push(turn);
+        segments.set(event.segmentId, {
+          onEvent: (e) => turn.events.push(e),
+          resolve: (result) => {
+            turn.terminal = result;
+          },
+        });
+      }
+    } else if (event.type === "segment.event") segments.get(event.segmentId)?.onEvent(event.event);
+    else if (event.type === "segment.completed") {
+      segments.get(event.segmentId)?.resolve(event.result);
+      segments.delete(event.segmentId);
+      activeSegment = undefined;
+    }
+  });
+  const close = transport.close.bind(transport);
+  transport.close = async () => {
+    await close();
+    for (const observer of pending.values())
+      observer.reject(new Error("Claude SDK transport closed"));
+    for (const observer of segments.values()) {
+      if ("reject" in observer)
+        (observer as { reject(error: Error): void }).reject(
+          new Error("Claude SDK transport closed"),
+        );
+    }
+  };
+  function startTurn(
+    text: string,
+    id: string,
+    onEvent: (event: ClaudeTurnEvent) => void,
+  ): Promise<ClaudeTransportTurnResult> {
+    const result = new Promise<ClaudeTransportTurnResult>((resolve, reject) => {
+      pending.set(id, { onEvent, resolve, reject });
+    });
+    void transport
+      .submitInput(text, id, "later")
+      .catch((error: unknown) => pending.get(id)?.reject(error));
+    fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: id,
+    } as unknown as SDKMessage);
+    fakeQuery.push({
+      type: "command_lifecycle",
+      state: "started",
+      command_uuid: id,
+    } as unknown as SDKMessage);
+    fakeQuery.push({ type: "system", subtype: "init" } as SDKMessage);
+    return result;
+  }
   return {
     fakeQuery,
     onFault,
     onPermissionModeChanged,
     onPlanLimit,
     queryFactory,
+    transport,
+    startTurn,
+    compact: (
+      id: string,
+      instructions: string | undefined,
+      onEvent: (event: ClaudeTurnEvent) => void,
+    ) => startTurn(`/compact${instructions ? ` ${instructions}` : ""}`, id, onEvent),
+    init: (id: string, onEvent: (event: ClaudeTurnEvent) => void) =>
+      startTurn("/init", id, onEvent),
+    recap: (id: string, onEvent: (event: ClaudeTurnEvent) => void) =>
+      startTurn("/recap", id, onEvent),
+    steer: (text: string, id: string) => transport.submitInput(text, id, "next"),
+    abort: async () => {
+      await vi.waitFor(() => expect(activeSegment).toBeDefined());
+      await transport.abort(activeSegment as number);
+    },
+    observeContinuations: (turns: ObservedTurn[]) => {
+      continuations = turns;
+    },
+    observeThreadEvents: (handler: ((event: ClaudeTurnEvent) => void) | null) => {
+      threadHandler = handler;
+    },
     queryInput: () => {
       if (!queryInput) throw new Error("SDK query was not created");
       return queryInput;
     },
-    transport,
   };
 }
 
-interface RecordedAutonomousTurn {
-  nativeTurnKey: string;
+interface ObservedTurn {
+  nativeTurnKey: string | undefined;
   events: ClaudeTurnEvent[];
-  result?: ClaudeTransportTurnResult;
-}
-
-/** Records each autonomous Turn as the Transport streams it: start, live events, Terminal. */
-function recordAutonomousTurns(transport: ClaudeSdkTransport): RecordedAutonomousTurn[] {
-  const turns: RecordedAutonomousTurn[] = [];
-  const current = (): RecordedAutonomousTurn => {
-    const turn = turns.at(-1);
-    if (!turn || turn.result) throw new Error("Autonomous output arrived outside a started Turn");
-    return turn;
-  };
-  transport.setAutonomousTurnHandler({
-    start: (nativeTurnKey) => {
-      if (turns.at(-1) && !turns.at(-1)?.result) throw new Error("Autonomous Turns overlapped");
-      turns.push({ nativeTurnKey, events: [] });
-    },
-    onEvent: (event) => current().events.push(event),
-    onTerminal: (result) => {
-      current().result = result;
-    },
-  });
-  return turns;
-}
-
-function ended(turns: readonly RecordedAutonomousTurn[]): RecordedAutonomousTurn[] {
-  return turns.filter((turn) => turn.result !== undefined);
-}
-
-function texts(events: readonly ClaudeTurnEvent[]): string[] {
-  return events.flatMap((event) => (event.type === "text.delta" ? [event.delta] : []));
+  terminal: ClaudeTransportTurnResult | undefined;
 }
 
 function completeTurn(fakeQuery: FakeQuery): void {
@@ -140,6 +215,50 @@ function pushAssistantText(
     parent_tool_use_id: null,
     uuid,
     session_id: "00000000-0000-4000-8000-000000000001",
+  } as unknown as SDKMessage);
+}
+
+function pushToolUse(
+  fakeQuery: FakeQuery,
+  callId: string,
+  toolName: string,
+  input: Record<string, unknown>,
+  uuid = "00000000-0000-4000-8000-000000000031",
+): void {
+  fakeQuery.push({
+    type: "assistant",
+    uuid,
+    session_id: "00000000-0000-4000-8000-000000000001",
+    parent_tool_use_id: null,
+    message: {
+      content: [
+        {
+          type: "tool_use",
+          id: callId,
+          name: toolName,
+          input,
+        },
+      ],
+    },
+  } as unknown as SDKMessage);
+}
+
+function completeTool(
+  fakeQuery: FakeQuery,
+  callId: string,
+  content = "done",
+  isError = false,
+  uuid = "00000000-0000-4000-8000-000000000033",
+): void {
+  fakeQuery.push({
+    type: "user",
+    uuid,
+    session_id: "00000000-0000-4000-8000-000000000001",
+    parent_tool_use_id: callId,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: callId, content, is_error: isError }],
+    },
   } as unknown as SDKMessage);
 }
 
@@ -192,6 +311,49 @@ describe("ClaudeSdkTransport context Usage", () => {
   });
 });
 
+describe("ClaudeSdkTransport usage metering", () => {
+  it("publishes a finished model request at Session scope outside its Segment", async () => {
+    const value = fixture();
+    const threadEvents: ClaudeTurnEvent[] = [];
+    value.observeThreadEvents((event) => threadEvents.push(event));
+    await value.transport.start();
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.startTurn("hello", "00000000-0000-4000-8000-000000000010", (event) =>
+      events.push(event),
+    );
+    for (const event of [
+      {
+        type: "message_start",
+        message: { id: "msg_1", model: "claude-opus-5-5", usage: { input_tokens: 5 } },
+      },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "message_delta", delta: {}, usage: { output_tokens: 3 } },
+      { type: "message_stop" },
+    ]) {
+      value.fakeQuery.push({
+        type: "stream_event",
+        event,
+        parent_tool_use_id: null,
+        uuid: "00000000-0000-4000-8000-000000000011",
+        session_id: "00000000-0000-4000-8000-000000000001",
+      } as unknown as SDKMessage);
+    }
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    expect(threadEvents).toEqual([
+      {
+        type: "usage.request",
+        record: expect.objectContaining({
+          kind: "request",
+          request: expect.objectContaining({ requestId: "msg_1", outputTokens: 3 }),
+        }),
+      },
+    ]);
+    expect(events.some((event) => event.type === "usage.request")).toBe(false);
+    await value.transport.close();
+  });
+});
+
 describe("ClaudeSdkTransport plan-limit forwarding", () => {
   it("forwards a tracked rate-limit event regardless of active Turn state", async () => {
     const value = fixture();
@@ -223,10 +385,8 @@ describe("ClaudeSdkTransport plan-limit forwarding", () => {
     await value.transport.start();
 
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000023",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000023", (event) =>
+      events.push(event),
     );
     value.fakeQuery.push({
       type: "rate_limit_event",
@@ -246,10 +406,8 @@ describe("ClaudeSdkTransport text reconciliation", () => {
     const value = fixture();
     await value.transport.start();
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000022",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000022", (event) =>
+      events.push(event),
     );
 
     pushPartialText(value.fakeQuery, "before");
@@ -281,6 +439,14 @@ describe("ClaudeSdkTransport text reconciliation", () => {
         displayName: "Edit file",
       },
     );
+    pushToolUse(value.fakeQuery, "text-loop-tool", "Edit", { file_path: "/synthetic/file" });
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toBe(true),
+    );
     const approval = events.find(
       (event) => event.type === "interaction.requested" && event.request.type === "approval",
     );
@@ -299,6 +465,7 @@ describe("ClaudeSdkTransport text reconciliation", () => {
 
     pushPartialText(value.fakeQuery, "after", "00000000-0000-4000-8000-000000000023");
     pushAssistantText(value.fakeQuery, "after denial", "00000000-0000-4000-8000-000000000024");
+    completeTool(value.fakeQuery, "text-loop-tool", "Permission denied", true);
     completeTurn(value.fakeQuery);
 
     await expect(turn).resolves.toEqual({ status: "succeeded" });
@@ -313,10 +480,8 @@ describe("ClaudeSdkTransport text reconciliation", () => {
     const value = fixture();
     await value.transport.start();
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000024",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000024", (event) =>
+      events.push(event),
     );
 
     value.fakeQuery.push({
@@ -367,7 +532,7 @@ describe("ClaudeSdkTransport text reconciliation", () => {
     const value = fixture();
     await value.transport.start();
     const events: ClaudeTurnEvent[] = [];
-    const compact = value.transport.compact(
+    const compact = value.compact(
       "00000000-0000-4000-8000-000000000043",
       "Keep implementation details",
       (event) => events.push(event),
@@ -418,7 +583,7 @@ describe("ClaudeSdkTransport text reconciliation", () => {
     }
     const iterator = prompt[Symbol.asyncIterator]();
 
-    const init = value.transport.init("00000000-0000-4000-8000-000000000044", () => undefined);
+    const init = value.init("00000000-0000-4000-8000-000000000044", () => undefined);
     expect((await iterator.next()).value).toMatchObject({
       type: "user",
       uuid: "00000000-0000-4000-8000-000000000044",
@@ -428,7 +593,7 @@ describe("ClaudeSdkTransport text reconciliation", () => {
     await expect(init).resolves.toEqual({ status: "succeeded" });
 
     const recapEvents: ClaudeTurnEvent[] = [];
-    const recap = value.transport.recap("00000000-0000-4000-8000-000000000045", (event) =>
+    const recap = value.recap("00000000-0000-4000-8000-000000000045", (event) =>
       recapEvents.push(event),
     );
     expect((await iterator.next()).value).toMatchObject({
@@ -467,10 +632,8 @@ describe("ClaudeSdkTransport Tool interpretation", () => {
     const value = fixture();
     await value.transport.start();
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000030",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000030", (event) =>
+      events.push(event),
     );
 
     value.fakeQuery.push({
@@ -568,10 +731,8 @@ describe("ClaudeSdkTransport Tool interpretation", () => {
     await value.transport.start();
     expect(options(value).forwardSubagentText).toBe(true);
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "delegate",
-      "00000000-0000-4000-8000-000000000034",
-      (event) => events.push(event),
+    const turn = value.startTurn("delegate", "00000000-0000-4000-8000-000000000034", (event) =>
+      events.push(event),
     );
 
     value.fakeQuery.push({
@@ -697,9 +858,10 @@ describe("ClaudeSdkTransport Tool interpretation", () => {
 describe("ClaudeSdkTransport autonomous task continuation", () => {
   it("publishes Root output produced after a background task notification", async () => {
     const value = fixture();
-    const autonomous = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const threadEvents: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => threadEvents.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => threadEvents.push(event));
     await value.transport.start();
 
     value.fakeQuery.push({
@@ -726,7 +888,7 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
     );
     completeTurn(value.fakeQuery);
 
-    await vi.waitFor(() => expect(ended(autonomous)).toHaveLength(1));
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
     expect(threadEvents).toEqual([
       {
         type: "subagent.settled",
@@ -736,9 +898,9 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
         resultSummary: "Analysis complete",
       },
     ]);
-    expect(autonomous[0]).toMatchObject({
-      nativeTurnKey: "00000000-0000-4000-8000-000000000040",
-      result: { status: "succeeded" },
+    expect(turns[0]).toMatchObject({
+      nativeTurnKey: undefined,
+      terminal: { status: "succeeded" },
       events: [
         { type: "text.delta", delta: "Background analysis result" },
         { type: "message.completed" },
@@ -749,9 +911,10 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
 
   it("preserves a failed task-notification whose user content is text blocks", async () => {
     const value = fixture();
-    const autonomous = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const threadEvents: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => threadEvents.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => threadEvents.push(event));
     await value.transport.start();
 
     value.fakeQuery.push({
@@ -773,7 +936,7 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
     pushAssistantText(value.fakeQuery, "Continuation", "00000000-0000-4000-8000-000000000051");
     completeTurn(value.fakeQuery);
 
-    await vi.waitFor(() => expect(ended(autonomous)).toHaveLength(1));
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
     expect(threadEvents).toEqual([
       {
         type: "subagent.settled",
@@ -782,15 +945,17 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
         resultSummary: "Agent failed",
       },
     ]);
-    expect(autonomous[0]?.events.filter((event) => event.type === "subagent.settled")).toEqual([]);
+    expect(turns[0]?.events.filter((event) => event.type === "subagent.settled")).toEqual([]);
+    expect(turns[0]?.terminal).toEqual({ status: "succeeded" });
     await value.transport.close();
   });
 
   it("delivers a background task settlement whose Segment never produces a Terminal", async () => {
     const value = fixture();
-    const autonomous = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const threadEvents: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => threadEvents.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => threadEvents.push(event));
     await value.transport.start();
 
     // Claude may enqueue the notification without a continuation Turn: no
@@ -819,20 +984,17 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
         },
       ]),
     );
-    expect(autonomous).toEqual([]);
+    expect(turns).toEqual([]);
     await value.transport.close();
   });
 
   it("publishes a held task-notification exactly once with its native status", async () => {
     const value = fixture();
-    const events: ClaudeTurnEvent[] = [];
-    const terminals: ClaudeTransportTurnResult[] = [];
-    value.transport.setIdleTurnHandler({
-      onEvent: (event) => events.push(event),
-      onTerminal: (result) => terminals.push(result),
-    });
+    const turns: ObservedTurn[] = [];
+    const threadEvents: ClaudeTurnEvent[] = [];
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => threadEvents.push(event));
     await value.transport.start();
-    value.transport.setIdleLive(true);
 
     value.fakeQuery.push({
       type: "user",
@@ -853,8 +1015,9 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
     );
     completeTurn(value.fakeQuery);
 
-    await vi.waitFor(() => expect(terminals).toEqual([{ status: "succeeded" }]));
-    expect(events.filter((event) => event.type === "subagent.settled")).toEqual([
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    expect(turns[0]?.terminal).toEqual({ status: "succeeded" });
+    expect(threadEvents.filter((event) => event.type === "subagent.settled")).toEqual([
       {
         type: "subagent.settled",
         nativeSubagentId: "native-agent-interrupted",
@@ -863,201 +1026,6 @@ describe("ClaudeSdkTransport autonomous task continuation", () => {
       },
     ]);
     await value.transport.close();
-  });
-});
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function pushTaskNotification(fakeQuery: FakeQuery, uuid: string, taskId: string): void {
-  fakeQuery.push({
-    type: "user",
-    uuid,
-    session_id: "00000000-0000-4000-8000-000000000001",
-    parent_tool_use_id: null,
-    origin: { kind: "task-notification" },
-    message: {
-      role: "user",
-      content: `<task-notification><task-id>${taskId}</task-id><tool-use-id>toolu-${taskId}</tool-use-id><status>completed</status><summary>Command finished</summary></task-notification>`,
-    },
-  } as unknown as SDKMessage);
-}
-
-describe("ClaudeSdkTransport live autonomous continuation", () => {
-  it("streams continuation Root output before its native Result", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    const threadEvents: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => threadEvents.push(event));
-    await value.transport.start();
-    try {
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000a1", "bash-1");
-      pushAssistantText(value.fakeQuery, "PART-A", "00000000-0000-4000-8000-0000000000a2");
-      await vi.waitFor(() => expect(texts(turns[0]?.events ?? [])).toEqual(["PART-A"]));
-      expect(turns[0]).toMatchObject({ nativeTurnKey: "00000000-0000-4000-8000-0000000000a1" });
-      expect(turns[0]?.result).toBeUndefined();
-      // The settlement precedes the Turn and stays Thread-level.
-      expect(threadEvents).toEqual([
-        expect.objectContaining({ type: "subagent.settled", nativeSubagentId: "bash-1" }),
-      ]);
-      completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(turns[0]?.result).toEqual({ status: "succeeded" });
-    } finally {
-      await value.transport.close();
-    }
-  });
-
-  it("rejects a requested Turn while a continuation streams and keeps each Segment in its own Turn", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    value.transport.setThreadEventHandler(() => undefined);
-    await value.transport.start();
-    try {
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000a1", "bash-1");
-      pushAssistantText(value.fakeQuery, "PART-A", "00000000-0000-4000-8000-0000000000a2");
-      await vi.waitFor(() => expect(texts(turns[0]?.events ?? [])).toEqual(["PART-A"]));
-
-      await expect(
-        value.transport.runTurn("user message", "00000000-0000-4000-8000-0000000000b1", () => {
-          throw new Error("The continuation must not reach a requested Turn");
-        }),
-      ).rejects.toThrow("Claude SDK transport is busy");
-
-      pushAssistantText(value.fakeQuery, "PART-B", "00000000-0000-4000-8000-0000000000a3");
-      completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(texts(turns[0]?.events ?? [])).toEqual(["PART-A", "PART-B"]);
-
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000c1", "bash-2");
-      pushAssistantText(value.fakeQuery, "PART-C", "00000000-0000-4000-8000-0000000000c2");
-      completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(2));
-      expect(turns[1]).toMatchObject({ nativeTurnKey: "00000000-0000-4000-8000-0000000000c1" });
-      expect(texts(turns[1]?.events ?? [])).toEqual(["PART-C"]);
-    } finally {
-      await value.transport.close();
-    }
-  });
-
-  it("lets a requested Turn take over a Segment that has no Root output yet", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    value.transport.setThreadEventHandler(() => undefined);
-    await value.transport.start();
-    try {
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000a1", "bash-1");
-      await delay(10);
-      const events: ClaudeTurnEvent[] = [];
-      const requested = value.transport.runTurn(
-        "user message",
-        "00000000-0000-4000-8000-0000000000b1",
-        (event) => events.push(event),
-      );
-      pushAssistantText(value.fakeQuery, "ANSWER", "00000000-0000-4000-8000-0000000000b2");
-      completeTurn(value.fakeQuery);
-      await expect(requested).resolves.toEqual({ status: "succeeded" });
-      expect(texts(events)).toEqual(["ANSWER"]);
-      expect(turns).toEqual([]);
-
-      // The next continuation starts fresh instead of inheriting the abandoned Segment.
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000c1", "bash-2");
-      pushAssistantText(value.fakeQuery, "PART-C", "00000000-0000-4000-8000-0000000000c2");
-      completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(turns[0]).toMatchObject({ nativeTurnKey: "00000000-0000-4000-8000-0000000000c1" });
-      expect(texts(turns[0]?.events ?? [])).toEqual(["PART-C"]);
-    } finally {
-      await value.transport.close();
-    }
-  });
-
-  it("hands events a Segment still holds to the requested Turn that takes it over", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    await value.transport.start();
-    try {
-      // Without a Thread handler the settlement waits with its Segment.
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000a1", "bash-1");
-      await delay(10);
-      const events: ClaudeTurnEvent[] = [];
-      const requested = value.transport.runTurn(
-        "user message",
-        "00000000-0000-4000-8000-0000000000b1",
-        (event) => events.push(event),
-      );
-      expect(events).toEqual([
-        expect.objectContaining({ type: "subagent.settled", nativeSubagentId: "bash-1" }),
-      ]);
-      completeTurn(value.fakeQuery);
-      await expect(requested).resolves.toEqual({ status: "succeeded" });
-      expect(turns).toEqual([]);
-    } finally {
-      await value.transport.close();
-    }
-  });
-
-  it("does not start a Turn from Segment starts, live-task levels or untracked task frames", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    value.transport.setThreadEventHandler(() => undefined);
-    await value.transport.start();
-    try {
-      value.fakeQuery.push({ type: "system", subtype: "init" } as unknown as SDKMessage);
-      value.fakeQuery.push({
-        type: "system",
-        subtype: "background_tasks_changed",
-        tasks: [{ task_id: "agent-1" }],
-      } as unknown as SDKMessage);
-      value.fakeQuery.push({
-        type: "system",
-        subtype: "task_progress",
-        task_id: "agent-1",
-        tool_use_id: "agent-call-from-earlier-segment",
-        description: "Analyze",
-        usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1 },
-      } as unknown as SDKMessage);
-      await delay(20);
-      expect(turns).toEqual([]);
-      // Such a Segment never blocks a request.
-      const requested = value.transport.runTurn(
-        "user message",
-        "00000000-0000-4000-8000-0000000000b1",
-        () => undefined,
-      );
-      completeTurn(value.fakeQuery);
-      await expect(requested).resolves.toEqual({ status: "succeeded" });
-      expect(turns).toEqual([]);
-    } finally {
-      await value.transport.close();
-    }
-  });
-
-  it("interrupts a streaming continuation as a cancelled Turn", async () => {
-    const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    value.transport.setThreadEventHandler(() => undefined);
-    await value.transport.start();
-    try {
-      await expect(value.transport.abort()).rejects.toThrow("has no active Turn");
-      pushTaskNotification(value.fakeQuery, "00000000-0000-4000-8000-0000000000a1", "bash-1");
-      pushAssistantText(value.fakeQuery, "PART-A", "00000000-0000-4000-8000-0000000000a2");
-      await vi.waitFor(() => expect(turns).toHaveLength(1));
-      await value.transport.abort();
-      expect(value.fakeQuery.interrupt).toHaveBeenCalledOnce();
-      value.fakeQuery.push({
-        type: "result",
-        subtype: "error_during_execution",
-        is_error: true,
-        terminal_reason: "aborted_streaming",
-      } as unknown as SDKMessage);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(turns[0]?.result).toEqual({ status: "cancelled", reason: "aborted_streaming" });
-      expect(value.onFault).not.toHaveBeenCalled();
-    } finally {
-      await value.transport.close();
-    }
   });
 });
 
@@ -1306,6 +1274,7 @@ describe("ClaudeSdkTransport Model control", () => {
   it("merges user modelPicker.options into the inspected Model catalog", async () => {
     const value = fixture();
     value.fakeQuery.initializationResult.mockResolvedValueOnce({
+      session_state: "idle",
       models: [
         {
           value: "default",
@@ -1390,12 +1359,12 @@ describe("ClaudeSdkTransport abort", () => {
   it("interrupts the active Query without closing the transport", async () => {
     const value = fixture();
     await value.transport.start();
-    const turn = value.transport.runTurn(
+    const turn = value.startTurn(
       "synthetic",
       "00000000-0000-4000-8000-000000000030",
       () => undefined,
     );
-    await value.transport.abort();
+    await value.abort();
     expect(value.fakeQuery.interrupt).toHaveBeenCalledOnce();
     value.fakeQuery.push({
       type: "result",
@@ -1426,13 +1395,15 @@ describe("ClaudeSdkTransport abort", () => {
       queryFactory: value.queryFactory,
     });
     await transport.start();
-    const turn = transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000031",
-      () => undefined,
+    let segmentId: number | undefined;
+    transport.setEventHandler((event) => {
+      if (event.type === "segment.started") segmentId = event.segmentId;
+    });
+    value.fakeQuery.push({ type: "system", subtype: "init" } as SDKMessage);
+    await vi.waitFor(() => expect(segmentId).toBeDefined());
+    await expect(transport.abort(segmentId as number)).rejects.toThrow(
+      "Claude SDK interrupt timed out",
     );
-    await expect(transport.abort()).rejects.toThrow("Claude SDK interrupt timed out");
-    await expect(turn).rejects.toThrow("Claude SDK transport closed");
     expect(value.onFault).not.toHaveBeenCalled();
   });
 });
@@ -1460,10 +1431,8 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     const value = fixture();
     await value.transport.start();
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000002",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000002", (event) =>
+      events.push(event),
     );
     const assistantId = "00000000-0000-4000-8000-000000000003";
     value.fakeQuery.push({
@@ -1509,17 +1478,35 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
 
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000002",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000002", (event) =>
+      events.push(event),
     );
+    // Callback arrives before tool_use
     const permission = canUseTool("AskUserQuestion", questionInput(), {
       signal: new AbortController().signal,
       toolUseID: "native-tool",
       requestId: "native-request",
     });
+    pushToolUse(value.fakeQuery, "native-tool", "AskUserQuestion", questionInput());
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) => event.type === "interaction.requested" && event.request.type === "question",
+        ),
+      ).toBe(true),
+    );
     expect(events).toEqual([
+      {
+        type: "tool.started",
+        callId: "native-tool",
+        toolName: "AskUserQuestion",
+        arguments: questionInput(),
+      },
+      {
+        type: "message.completed",
+        messageId: "00000000-0000-4000-8000-000000000031",
+        checkpointId: "00000000-0000-4000-8000-000000000031",
+      },
       {
         type: "interaction.requested",
         request: {
@@ -1563,6 +1550,7 @@ describe("ClaudeSdkTransport Question callbacks", () => {
       }),
     ).rejects.toThrow("not pending");
 
+    completeTool(value.fakeQuery, "native-tool", "Alpha");
     completeTurn(value.fakeQuery);
     await expect(turn).resolves.toEqual({ status: "succeeded" });
     await value.transport.close();
@@ -1575,12 +1563,14 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
 
+    const outsideController = new AbortController();
+    outsideController.abort();
     await expect(
       canUseTool(
         "Read",
         {},
         {
-          signal: new AbortController().signal,
+          signal: outsideController.signal,
           toolUseID: "outside-tool",
           requestId: "outside-request",
         },
@@ -1588,11 +1578,10 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     ).resolves.toMatchObject({ behavior: "deny", toolUseID: "outside-tool" });
 
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000003",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000003", (event) =>
+      events.push(event),
     );
+    pushToolUse(value.fakeQuery, "bad-tool", "AskUserQuestion", { questions: [] });
     await expect(
       canUseTool(
         "AskUserQuestion",
@@ -1604,13 +1593,15 @@ describe("ClaudeSdkTransport Question callbacks", () => {
         },
       ),
     ).resolves.toMatchObject({ behavior: "deny", toolUseID: "bad-tool" });
-    expect(events).toEqual([]);
+    expect(events.filter((e) => e.type === "interaction.requested")).toEqual([]);
 
+    pushToolUse(value.fakeQuery, "duplicate-tool", "AskUserQuestion", questionInput());
     const first = canUseTool("AskUserQuestion", questionInput(), {
       signal: new AbortController().signal,
       toolUseID: "duplicate-tool",
       requestId: "duplicate-request",
     });
+    pushToolUse(value.fakeQuery, "second-tool", "AskUserQuestion", questionInput());
     await expect(
       canUseTool("AskUserQuestion", questionInput(), {
         signal: new AbortController().signal,
@@ -1618,6 +1609,13 @@ describe("ClaudeSdkTransport Question callbacks", () => {
         requestId: "duplicate-request",
       }),
     ).resolves.toMatchObject({ behavior: "deny", toolUseID: "second-tool" });
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) => event.type === "interaction.requested" && event.request.type === "question",
+        ),
+      ).toBe(true),
+    );
     const requested = events.find(
       (event) => event.type === "interaction.requested" && event.request.type === "question",
     );
@@ -1645,55 +1643,27 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000005",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000005", (event) =>
+      events.push(event),
     );
+    pushToolUse(value.fakeQuery, "close-tool", "AskUserQuestion", questionInput());
     const permission = canUseTool("AskUserQuestion", questionInput(), {
       signal: new AbortController().signal,
       toolUseID: "close-tool",
       requestId: "close-request",
     });
+    await vi.waitFor(() =>
+      expect(events.some((e) => e.type === "interaction.requested")).toBe(true),
+    );
 
     const turnClosed = expect(turn).rejects.toThrow("transport closed");
     await value.transport.close();
     await expect(permission).resolves.toMatchObject({ behavior: "deny", toolUseID: "close-tool" });
     await turnClosed;
-    expect(events.map(({ type }) => type)).toEqual(["interaction.requested", "interaction.closed"]);
-    expect(events.at(-1)).toMatchObject({ reason: "cancelled" });
-  });
-
-  it("denies a held agent approval when the transport closes", async () => {
-    const value = fixture();
-    const idleEvents: ClaudeTurnEvent[] = [];
-    value.transport.setIdleTurnHandler({
-      onEvent: (event) => idleEvents.push(event),
-      onTerminal: () => undefined,
-    });
-    await value.transport.start();
-    const canUseTool = options(value).canUseTool;
-    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
-    value.transport.setIdleLive(true);
-    const permission = canUseTool(
-      "Bash",
-      { command: "ls" },
-      {
-        signal: new AbortController().signal,
-        toolUseID: "agent-bash-tool",
-        requestId: "agent-bash-control",
-        displayName: "Bash",
-        agentID: "agent-1",
-      },
+    expect(events.filter((e) => e.type.startsWith("interaction.")).map(({ type }) => type)).toEqual(
+      ["interaction.requested", "interaction.closed"],
     );
-    expect(idleEvents).toMatchObject([{ type: "interaction.requested", agentScoped: true }]);
-
-    await value.transport.close();
-    await expect(permission).resolves.toMatchObject({
-      behavior: "deny",
-      toolUseID: "agent-bash-tool",
-    });
-    expect(idleEvents.at(-1)).toMatchObject({ type: "interaction.closed", reason: "cancelled" });
+    expect(events.at(-1)).toMatchObject({ reason: "cancelled" });
   });
 
   it("closes a pending callback once when its AbortSignal fires", async () => {
@@ -1702,23 +1672,27 @@ describe("ClaudeSdkTransport Question callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000004",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000004", (event) =>
+      events.push(event),
     );
+    pushToolUse(value.fakeQuery, "abort-tool", "AskUserQuestion", questionInput());
     const controller = new AbortController();
     const permission = canUseTool("AskUserQuestion", questionInput(), {
       signal: controller.signal,
       toolUseID: "abort-tool",
       requestId: "abort-request",
     });
+    await vi.waitFor(() =>
+      expect(events.some((e) => e.type === "interaction.requested")).toBe(true),
+    );
     controller.abort();
     await expect(permission).resolves.toMatchObject({
       behavior: "deny",
       toolUseID: "abort-tool",
     });
-    expect(events.map(({ type }) => type)).toEqual(["interaction.requested", "interaction.closed"]);
+    expect(events.filter((e) => e.type.startsWith("interaction.")).map(({ type }) => type)).toEqual(
+      ["interaction.requested", "interaction.closed"],
+    );
     expect(events.at(-1)).toMatchObject({ reason: "cancelled" });
     await expect(
       value.transport.respondToInteraction({
@@ -1743,11 +1717,12 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
       const canUseTool = options(value).canUseTool;
       if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
       const events: ClaudeTurnEvent[] = [];
-      const turn = value.transport.runTurn("synthetic", "plan-turn", (event) => events.push(event));
+      const turn = value.startTurn("synthetic", "plan-turn", (event) => events.push(event));
       const input = {
         plan: `# Plan\n${"Review the change.\n".repeat(80)}`,
         planFilePath: "/private/plan.md",
       };
+      pushToolUse(value.fakeQuery, "exit-tool", "ExitPlanMode", input);
       const permission = canUseTool("ExitPlanMode", input, {
         signal: new AbortController().signal,
         toolUseID: "exit-tool",
@@ -1755,6 +1730,14 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         title: "Allow once",
         suggestions: [{ type: "setMode", mode: "bypassPermissions", destination: "session" }],
       });
+      await vi.waitFor(() =>
+        expect(
+          events.some(
+            (event) =>
+              event.type === "interaction.requested" && event.request.type === "planApproval",
+          ),
+        ).toBe(true),
+      );
       expect(events).toContainEqual({
         type: "interaction.requested",
         request: { type: "planApproval", requestId: "claude-approval-1", plan: input.plan },
@@ -1791,7 +1774,11 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
       const canUseTool = options(value).canUseTool;
       if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
       const events: ClaudeTurnEvent[] = [];
-      const turn = value.transport.runTurn("synthetic", "plan-turn", (event) => events.push(event));
+      const turn = value.startTurn("synthetic", "plan-turn", (event) => events.push(event));
+      pushToolUse(value.fakeQuery, "exit-tool", "ExitPlanMode", {
+        ...(plan !== undefined ? { plan } : {}),
+        planFilePath: "/must/not/read",
+      });
       const signal = new AbortController();
       const permission = canUseTool(
         "ExitPlanMode",
@@ -1801,6 +1788,14 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
           toolUseID: "exit-tool",
           requestId: "exit-control",
         },
+      );
+      await vi.waitFor(() =>
+        expect(
+          events.some(
+            (event) =>
+              event.type === "interaction.requested" && event.request.type === "planApproval",
+          ),
+        ).toBe(true),
       );
       expect(events).toContainEqual({
         type: "interaction.requested",
@@ -1827,12 +1822,11 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000010",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000010", (event) =>
+      events.push(event),
     );
     const editInput = { file_path: "/synthetic/private", new_string: "private-content" };
+    pushToolUse(value.fakeQuery, "native-edit-tool", "Edit", editInput);
     const editPermission = canUseTool("Edit", editInput, {
       signal: new AbortController().signal,
       toolUseID: "native-edit-tool",
@@ -1849,6 +1843,7 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         },
       ],
     });
+    pushToolUse(value.fakeQuery, "native-bash-tool", "Bash", { command: "synthetic-command" });
     const bashPermission = canUseTool(
       "Bash",
       { command: "synthetic-command" },
@@ -1858,6 +1853,13 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         requestId: "native-bash-control",
         displayName: "Run command",
       },
+    );
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toHaveLength(2),
     );
 
     const requests = events.flatMap((event) =>
@@ -1891,6 +1893,7 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         cancelled: true,
       }),
     ).rejects.toThrow("type does not match");
+    pushToolUse(value.fakeQuery, "duplicate-tool", "Bash", {});
     await expect(
       canUseTool(
         "Bash",
@@ -1931,6 +1934,9 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     expect(editResult).not.toHaveProperty("updatedPermissions");
     expect(events.filter(({ type }) => type === "interaction.closed")).toHaveLength(2);
 
+    completeTool(value.fakeQuery, "native-edit-tool", "edited");
+    completeTool(value.fakeQuery, "native-bash-tool", "denied", true);
+    completeTool(value.fakeQuery, "duplicate-tool", "denied", true);
     completeTurn(value.fakeQuery);
     await expect(turn).resolves.toEqual({ status: "succeeded" });
     await value.transport.close();
@@ -1943,10 +1949,8 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000013",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000013", (event) =>
+      events.push(event),
     );
     const sessionSuggestions = [
       {
@@ -1971,30 +1975,38 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     ];
     const sessionInput = { file_path: "/synthetic/private-session" };
     const persistentInput = { command: "npm test" };
+    pushToolUse(value.fakeQuery, "session-tool", "Edit", sessionInput);
     const sessionPermission = canUseTool("Edit", sessionInput, {
       signal: new AbortController().signal,
       toolUseID: "session-tool",
       requestId: "session-control",
       suggestions: sessionSuggestions,
     });
+    pushToolUse(value.fakeQuery, "persistent-tool", "Bash", persistentInput);
     const persistentPermission = canUseTool("Bash", persistentInput, {
       signal: new AbortController().signal,
       toolUseID: "persistent-tool",
       requestId: "persistent-control",
       suggestions: persistentSuggestions,
     });
-    expect(
-      events.flatMap((event) =>
-        event.type === "interaction.requested" && event.request.type === "approval"
-          ? [event.request]
-          : [],
-      ),
-    ).toEqual([
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toHaveLength(2),
+    );
+    const approvalRequests = events.flatMap((event) =>
+      event.type === "interaction.requested" && event.request.type === "approval"
+        ? [event.request]
+        : [],
+    );
+    expect(approvalRequests).toEqual([
       expect.objectContaining({ requestId: "claude-approval-1", suggestedScope: "session" }),
       expect.objectContaining({ requestId: "claude-approval-2", suggestedScope: "always" }),
     ]);
-    expect(JSON.stringify(events)).not.toContain("projectSettings");
-    expect(JSON.stringify(events)).not.toContain("private-session");
+    expect(JSON.stringify(approvalRequests)).not.toContain("projectSettings");
+    expect(JSON.stringify(approvalRequests)).not.toContain("private-session");
 
     await expect(
       value.transport.respondToInteraction({
@@ -2040,6 +2052,8 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     expect(sessionResult.updatedPermissions).toBe(sessionSuggestions);
     expect(persistentResult.updatedPermissions).toBe(persistentSuggestions);
 
+    completeTool(value.fakeQuery, "session-tool");
+    completeTool(value.fakeQuery, "persistent-tool");
     completeTurn(value.fakeQuery);
     await turn;
     await value.transport.close();
@@ -2051,10 +2065,8 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000014",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000014", (event) =>
+      events.push(event),
     );
     const suggestionCases: Array<{ name: string; suggestions: PermissionUpdate[] }> = [
       { name: "empty", suggestions: [] },
@@ -2080,8 +2092,9 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         ],
       },
     ];
-    const permissions = suggestionCases.map(({ name, suggestions }, index) =>
-      canUseTool(
+    const permissions = suggestionCases.map(({ name, suggestions }, index) => {
+      pushToolUse(value.fakeQuery, `${name}-tool`, "Edit", {});
+      return canUseTool(
         "Edit",
         {},
         {
@@ -2090,7 +2103,14 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
           requestId: `${name}-control`,
           suggestions,
         },
-      ).then((result) => ({ index, result })),
+      ).then((result) => ({ index, result }));
+    });
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toHaveLength(suggestionCases.length),
     );
     const requests = events.flatMap((event) =>
       event.type === "interaction.requested" && event.request.type === "approval"
@@ -2130,12 +2150,11 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000011",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000011", (event) =>
+      events.push(event),
     );
 
+    pushToolUse(value.fakeQuery, "fallback-tool", "Edit", {});
     const fallback = canUseTool(
       "Edit",
       {},
@@ -2147,6 +2166,13 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         displayName: "Edit file",
         description: "Bounded description",
       },
+    );
+    await vi.waitFor(() =>
+      expect(
+        events.some(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toBe(true),
     );
     expect(events.at(-1)).toMatchObject({
       type: "interaction.requested",
@@ -2203,12 +2229,11 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000012",
-      (event) => events.push(event),
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000012", (event) =>
+      events.push(event),
     );
     const controller = new AbortController();
+    // Callback arrives before tool_use:
     const abortedPermission = canUseTool(
       "Edit",
       {},
@@ -2227,12 +2252,23 @@ describe("ClaudeSdkTransport Tool Approval callbacks", () => {
         requestId: "terminal-control",
       },
     );
+    pushToolUse(value.fakeQuery, "aborted-tool", "Edit", {});
+    pushToolUse(value.fakeQuery, "terminal-tool", "Bash", {});
+    await vi.waitFor(() =>
+      expect(
+        events.filter(
+          (event) => event.type === "interaction.requested" && event.request.type === "approval",
+        ),
+      ).toHaveLength(2),
+    );
 
     controller.abort();
     await expect(abortedPermission).resolves.toMatchObject({
       behavior: "deny",
       toolUseID: "aborted-tool",
     });
+    completeTool(value.fakeQuery, "aborted-tool", "aborted", true);
+    completeTool(value.fakeQuery, "terminal-tool", "terminal", true);
     completeTurn(value.fakeQuery);
     await expect(terminalPermission).resolves.toMatchObject({
       behavior: "deny",
@@ -2291,7 +2327,7 @@ describe("Claude history replacement fence", () => {
           subtype: "task_started",
           task_id: "still-running",
         } as unknown as SDKMessage);
-        await delay(0);
+        await new Promise((resolve) => setTimeout(resolve, 0));
         expect(value.transport.hasBackgroundTasks()).toBe(true);
         await expect(value.transport.close()).resolves.toBeUndefined();
         expect(value.fakeQuery.stopTask).toHaveBeenCalledWith("still-running");
@@ -2410,9 +2446,10 @@ function pushSettlement(
 describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
   it("keeps a background command settlement after the Tool result that detached it", async () => {
     const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
-    const immediate: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => immediate.push(event));
+    const events: ClaudeTurnEvent[] = [];
+    value.transport.setEventHandler((event) => {
+      if (event.type === "segment.event" || event.type === "thread.event") events.push(event.event);
+    });
     await value.transport.start();
     try {
       value.fakeQuery.push({
@@ -2458,9 +2495,9 @@ describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
         summary: "Background command completed",
       } as unknown as SDKMessage);
       completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(immediate).toEqual([]);
-      const events = turns[0]?.events ?? [];
+      await vi.waitFor(() =>
+        expect(events.some((event) => event.type === "subagent.settled")).toBe(true),
+      );
       const detached = events.findIndex(
         (event) => event.type === "tool.completed" && event.callId === "bash-1",
       );
@@ -2481,29 +2518,21 @@ describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
   });
 
   it.each(["unset", "cleared"])(
-    "keeps settlements in the autonomous batch when the Thread handler is %s",
+    "delivers settlements to the Thread handler when set and drops when %s",
     async (handlerState) => {
       const value = fixture();
-      const turns = recordAutonomousTurns(value.transport);
+      const turns: ObservedTurn[] = [];
       const immediate = vi.fn();
+      value.observeContinuations(turns);
       if (handlerState === "cleared") {
-        value.transport.setThreadEventHandler(immediate);
-        value.transport.setThreadEventHandler(null);
+        value.observeThreadEvents(immediate);
+        value.observeThreadEvents(null);
       }
       await value.transport.start();
       try {
         pushSettlement(value.fakeQuery, "existing-child", "completed", "existing-call");
         completeTurn(value.fakeQuery);
-        await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-        expect(turns[0]?.events).toEqual([
-          {
-            type: "subagent.settled",
-            nativeSubagentId: "existing-child",
-            callId: "existing-call",
-            status: "completed",
-            resultSummary: "Analysis finished",
-          },
-        ]);
+        expect(turns).toEqual([]);
         expect(immediate).not.toHaveBeenCalled();
       } finally {
         await value.transport.close();
@@ -2512,29 +2541,25 @@ describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
   );
 
   it.each(["completed", "failed", "stopped"])(
-    "keeps a fast %s child settlement after its buffered creation",
+    "routes child delegation to continuation and %s settlement to Thread handler",
     async (status) => {
       const value = fixture();
-      const turns = recordAutonomousTurns(value.transport);
+      const turns: ObservedTurn[] = [];
       const immediate: ClaudeTurnEvent[] = [];
-      value.transport.setThreadEventHandler((event) => immediate.push(event));
+      value.observeContinuations(turns);
+      value.observeThreadEvents((event) => immediate.push(event));
       await value.transport.start();
       try {
         pushBackgroundDelegation(value.fakeQuery, "spawn-1", "child-1");
         // No callId: the native ID learned from the launch result must suffice.
         pushSettlement(value.fakeQuery, "child-1", status);
         completeTurn(value.fakeQuery);
-        await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-        expect(immediate).toEqual([]);
+        await vi.waitFor(() => expect(turns).toHaveLength(1));
         const turn = turns[0];
         if (!turn) throw new Error("Autonomous Turn was not delivered");
-        const events = turn.events;
-        const created = events.findIndex((event) => event.type === "subagent.completed");
-        expect(created).toBeGreaterThanOrEqual(0);
-        expect(events.findIndex((event) => event.type === "subagent.settled")).toBeGreaterThan(
-          created,
-        );
-        expect(events.filter((event) => event.type === "subagent.settled")).toEqual([
+        expect(turn.events.some((event) => event.type === "subagent.completed")).toBe(true);
+        expect(turn.events.filter((event) => event.type === "subagent.settled")).toEqual([]);
+        expect(immediate).toEqual([
           {
             type: "subagent.settled",
             nativeSubagentId: "child-1",
@@ -2550,23 +2575,28 @@ describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
 
   it("uses the call ID when the launch result has not supplied a native child ID", async () => {
     const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const immediate: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => immediate.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => immediate.push(event));
     await value.transport.start();
     try {
       pushBackgroundDelegation(value.fakeQuery, "spawn-call-only", undefined);
       pushSettlement(value.fakeQuery, "child-from-notification", "completed", "spawn-call-only");
       completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(immediate).toEqual([]);
+      await vi.waitFor(() => expect(turns).toHaveLength(1));
       const turn = turns[0];
       if (!turn) throw new Error("Autonomous Turn was not delivered");
-      const created = turn.events.findIndex((event) => event.type === "subagent.completed");
-      expect(turn.events[created]).not.toHaveProperty("nativeSubagentId");
-      expect(turn.events.findIndex((event) => event.type === "subagent.settled")).toBeGreaterThan(
-        created,
-      );
+      expect(turn.events.some((event) => event.type === "subagent.completed")).toBe(true);
+      expect(immediate).toEqual([
+        {
+          type: "subagent.settled",
+          nativeSubagentId: "child-from-notification",
+          callId: "spawn-call-only",
+          status: "completed",
+          resultSummary: "Analysis finished",
+        },
+      ]);
     } finally {
       await value.transport.close();
     }
@@ -2574,81 +2604,87 @@ describe("ClaudeSdkTransport autonomous Subagent settlement ordering", () => {
 
   it("orders repeated sends to one native child independently across batches", async () => {
     const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const immediate: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => immediate.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => immediate.push(event));
     await value.transport.start();
     try {
       for (let index = 0; index < 2; index += 1) {
         pushBackgroundDelegation(value.fakeQuery, `send-${index}`, "existing-child", "send");
         pushSettlement(value.fakeQuery, "existing-child");
         completeTurn(value.fakeQuery);
-        await vi.waitFor(() => expect(ended(turns)).toHaveLength(index + 1));
+        await vi.waitFor(() => expect(turns).toHaveLength(index + 1));
         const turn = turns[index];
         if (!turn) throw new Error("Autonomous Turn was not delivered");
-        const events = turn.events;
-        expect(events.findIndex((event) => event.type === "subagent.settled")).toBeGreaterThan(
-          events.findIndex((event) => event.type === "subagent.completed"),
-        );
+        expect(turn.events.some((event) => event.type === "subagent.completed")).toBe(true);
       }
-      expect(immediate).toEqual([]);
+      expect(immediate).toHaveLength(2);
       // No creation in this new batch: do not retain a stale dependency.
       pushSettlement(value.fakeQuery, "existing-child");
-      await vi.waitFor(() => expect(immediate).toHaveLength(1));
+      await vi.waitFor(() => expect(immediate).toHaveLength(3));
     } finally {
       await value.transport.close();
     }
   });
 
-  it("streams later settlements in native order once Root output started the Turn", async () => {
+  it("does not make unrelated settlements wait for a buffered creation or Terminal", async () => {
     const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const immediate: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => immediate.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => immediate.push(event));
     await value.transport.start();
     try {
       pushBackgroundDelegation(value.fakeQuery, "spawn-new", "new-child");
       pushSettlement(value.fakeQuery, "new-child");
       pushSettlement(value.fakeQuery, "existing-child");
-      // Neither settlement waits for the Terminal: the Turn already runs live.
       await vi.waitFor(() =>
-        expect(turns[0]?.events.filter((event) => event.type === "subagent.settled")).toEqual([
+        expect(immediate).toEqual([
           expect.objectContaining({ nativeSubagentId: "new-child" }),
           expect.objectContaining({ nativeSubagentId: "existing-child" }),
         ]),
       );
-      expect(ended(turns)).toEqual([]);
-      const events = turns[0]?.events ?? [];
-      expect(events.findIndex((event) => event.type === "subagent.settled")).toBeGreaterThan(
-        events.findIndex((event) => event.type === "subagent.completed"),
-      );
+      expect(turns).toHaveLength(1);
+      expect(turns[0]?.terminal).toBeUndefined();
       completeTurn(value.fakeQuery);
-      await vi.waitFor(() => expect(ended(turns)).toHaveLength(1));
-      expect(immediate).toEqual([]);
+      await vi.waitFor(() => expect(turns[0]?.terminal).toEqual({ status: "succeeded" }));
+      const turn = turns[0];
+      if (!turn) throw new Error("Autonomous Turn was not delivered");
+      expect(turn.events.filter((event) => event.type === "subagent.settled")).toEqual([]);
     } finally {
       await value.transport.close();
     }
   });
 
-  it("leaves a started autonomous Turn for the Session to end when the transport closes", async () => {
+  it("discards unpublished lifecycle events on close without flushing orphan terminal states", async () => {
     const value = fixture();
-    const turns = recordAutonomousTurns(value.transport);
+    const turns: ObservedTurn[] = [];
     const immediate: ClaudeTurnEvent[] = [];
-    value.transport.setThreadEventHandler((event) => immediate.push(event));
+    value.observeContinuations(turns);
+    value.observeThreadEvents((event) => immediate.push(event));
     await value.transport.start();
     pushBackgroundDelegation(value.fakeQuery, "spawn-close", "unpublished-child");
     pushSettlement(value.fakeQuery, "unpublished-child");
+    pushSettlement(value.fakeQuery, "existing-child");
     try {
       await vi.waitFor(() =>
-        expect(turns[0]?.events.some((event) => event.type === "subagent.settled")).toBe(true),
+        expect(
+          immediate.some(
+            (event) =>
+              event.type === "subagent.settled" && event.nativeSubagentId === "existing-child",
+          ),
+        ).toBe(true),
       );
     } finally {
       await value.transport.close();
     }
-    // Close neither invents a Terminal nor reroutes the Turn's events.
     expect(turns).toHaveLength(1);
-    expect(turns[0]?.result).toBeUndefined();
-    expect(immediate).toEqual([]);
+    expect(turns[0]?.terminal).toBeUndefined();
+    expect(immediate).toEqual([
+      expect.objectContaining({ nativeSubagentId: "unpublished-child" }),
+      expect.objectContaining({ nativeSubagentId: "existing-child" }),
+    ]);
   });
 });
 
@@ -2789,38 +2825,6 @@ describe("ClaudeSdkTransport confirmed background stops", () => {
     } finally {
       await value.transport.close();
     }
-  });
-
-  it("interrupts a Root continuation that runs after the requested Turn", async () => {
-    const value = fixture();
-    const idleEvents: ClaudeTurnEvent[] = [];
-    const terminals: ClaudeTransportTurnResult[] = [];
-    value.transport.setIdleTurnHandler({
-      onEvent: (event) => idleEvents.push(event),
-      onTerminal: (result) => terminals.push(result),
-    });
-    await value.transport.start();
-    value.transport.setIdleLive(true);
-    value.fakeQuery.push({
-      type: "system",
-      subtype: "init",
-      session_id: "00000000-0000-4000-8000-000000000001",
-    } as unknown as SDKMessage);
-    await vi.waitFor(() => expect(idleEvents).toContainEqual({ type: "segment.started" }));
-
-    await value.transport.abortContinuation();
-    expect(value.fakeQuery.interrupt).toHaveBeenCalledOnce();
-    value.fakeQuery.push({
-      type: "result",
-      subtype: "error_during_execution",
-      is_error: true,
-      errors: [],
-      terminal_reason: "aborted_streaming",
-    } as unknown as SDKMessage);
-    await vi.waitFor(() =>
-      expect(terminals).toEqual([{ status: "cancelled", reason: "aborted_streaming" }]),
-    );
-    await value.transport.close();
   });
 });
 
@@ -3017,39 +3021,58 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
     session_id: "00000000-0000-4000-8000-000000000001",
   } as unknown as SDKMessage;
 
-  it("keeps an agent approval pending across the Root terminal and names the agent", async () => {
-    const value = fixture();
-    const idleEvents: ClaudeTurnEvent[] = [];
-    value.transport.setIdleTurnHandler({
-      onEvent: (event) => idleEvents.push(event),
-      onTerminal: () => undefined,
-    });
-    await value.transport.start();
-    const canUseTool = options(value).canUseTool;
-    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
-    const events: ClaudeTurnEvent[] = [];
-    const turn = value.transport.runTurn(
-      "synthetic",
-      "00000000-0000-4000-8000-000000000010",
-      (event) => events.push(event),
-    );
-    value.fakeQuery.push(workflowProgress);
-    await vi.waitFor(() =>
-      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.updated" })),
-    );
+  /** The Workflow tool returns once the run is launched in the background. */
+  function launchWorkflow(fakeQuery: FakeQuery): void {
+    fakeQuery.push({
+      type: "user",
+      session_id: "00000000-0000-4000-8000-000000000001",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "workflow-call", content: "Launched" }],
+      },
+      tool_use_result: { status: "async_launched", taskId: "workflow-task" },
+    } as unknown as SDKMessage);
+  }
 
-    const permission = canUseTool(
+  function agentPermission(
+    canUseTool: NonNullable<ReturnType<typeof options>["canUseTool"]>,
+    toolUseID: string,
+    requestId: string,
+  ) {
+    return canUseTool(
       "Bash",
       { command: "wc -l a.txt" },
       {
         signal: new AbortController().signal,
-        toolUseID: "agent-bash-tool",
-        requestId: "agent-bash-control",
+        toolUseID,
+        requestId,
         displayName: "Bash",
         description: "Count lines",
         agentID: "agent-a",
       },
     );
+  }
+
+  it("names the agent and routes its approval to the Root Segment that runs the Workflow", async () => {
+    const value = fixture();
+    const threadEvents: ClaudeTurnEvent[] = [];
+    value.observeThreadEvents((event) => threadEvents.push(event));
+    await value.transport.start();
+    const canUseTool = options(value).canUseTool;
+    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000010", (event) =>
+      events.push(event),
+    );
+    pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
+    value.fakeQuery.push(workflowProgress);
+    // Run progress is a Session fact: a launched run keeps reporting after its Root Segment.
+    await vi.waitFor(() =>
+      expect(threadEvents).toContainEqual(expect.objectContaining({ type: "workflow.updated" })),
+    );
+
+    const permission = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
     expect(events.at(-1)).toEqual({
       type: "interaction.requested",
       request: {
@@ -3058,14 +3081,7 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
         title: "count:a.txt: Bash",
         description: "Count lines",
       },
-      agentScoped: true,
     });
-
-    completeTurn(value.fakeQuery);
-    await expect(turn).resolves.toEqual({ status: "succeeded" });
-    expect(events.filter(({ type }) => type === "interaction.closed")).toEqual([]);
-
-    value.transport.setIdleLive(true);
     await value.transport.respondToInteraction({
       type: "approval",
       requestId: "claude-approval-1",
@@ -3075,96 +3091,50 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
       behavior: "allow",
       toolUseID: "agent-bash-tool",
     });
-    expect(idleEvents).toContainEqual({
+    expect(events.at(-1)).toEqual({
       type: "interaction.closed",
       requestId: "claude-approval-1",
       reason: "responded",
     });
+    launchWorkflow(value.fakeQuery);
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
     await value.transport.close();
   });
 
-  it("shows held continuation approvals and denies agent approvals once the held Turn ends", async () => {
+  it("denies agent approvals once the Root Segment that runs the Workflow ends", async () => {
     const value = fixture();
-    const idleEvents: ClaudeTurnEvent[] = [];
-    const terminals: ClaudeTransportTurnResult[] = [];
-    value.transport.setIdleTurnHandler({
-      onEvent: (event) => idleEvents.push(event),
-      onTerminal: (result) => terminals.push(result),
-    });
     await value.transport.start();
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
-    value.transport.setIdleLive(true);
-
-    const rootPermission = canUseTool(
-      "Edit",
-      { file_path: "/synthetic/file" },
-      {
-        signal: new AbortController().signal,
-        toolUseID: "root-edit-tool",
-        requestId: "root-edit-control",
-        displayName: "Edit file",
-      },
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000011", (event) =>
+      events.push(event),
     );
-    const agentPermission = canUseTool(
-      "Bash",
-      { command: "ls" },
-      {
-        signal: new AbortController().signal,
-        toolUseID: "agent-bash-tool",
-        requestId: "agent-bash-control",
-        displayName: "Bash",
-        agentID: "agent-unlabeled",
-      },
+    pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
+    value.fakeQuery.push(workflowProgress);
+    await vi.waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.started" })),
     );
-    expect(idleEvents).toEqual([
-      {
-        type: "interaction.requested",
-        request: { type: "approval", requestId: "claude-approval-1", title: "Edit file" },
-      },
-      {
-        type: "interaction.requested",
-        request: { type: "approval", requestId: "claude-approval-2", title: "Bash" },
-        agentScoped: true,
-      },
-    ]);
+    const pending = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
+    await vi.waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "interaction.requested" })),
+    );
 
+    launchWorkflow(value.fakeQuery);
     completeTurn(value.fakeQuery);
-    await expect(rootPermission).resolves.toMatchObject({ behavior: "deny" });
-    await vi.waitFor(() => expect(terminals).toEqual([{ status: "succeeded" }]));
-    expect(idleEvents.at(-1)).toEqual({
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    await expect(pending).resolves.toMatchObject({ behavior: "deny" });
+    expect(events.at(-1)).toEqual({
       type: "interaction.closed",
       requestId: "claude-approval-1",
       reason: "superseded",
     });
 
-    const closedEvents = idleEvents.length;
-    value.transport.setIdleLive(false);
-    await expect(agentPermission).resolves.toMatchObject({ behavior: "deny" });
-    // The Host Turn already closed its Interactions; nothing is left to notify.
-    expect(idleEvents).toHaveLength(closedEvents);
-    await value.transport.close();
-  });
-
-  it("denies agent approvals when no Host Turn can show them", async () => {
-    const value = fixture();
-    await value.transport.start();
-    const canUseTool = options(value).canUseTool;
-    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
-
-    await expect(
-      canUseTool(
-        "Bash",
-        { command: "ls" },
-        {
-          signal: new AbortController().signal,
-          toolUseID: "agent-bash-tool",
-          requestId: "agent-bash-control",
-          displayName: "Bash",
-          agentID: "agent-a",
-        },
-      ),
-    ).resolves.toMatchObject({ behavior: "deny" });
+    // No Turn can show a later request; the next native frame proves its owner is not live.
+    const late = agentPermission(canUseTool, "agent-bash-tool-2", "agent-bash-control-2");
+    value.fakeQuery.push(workflowProgress);
+    await expect(late).resolves.toMatchObject({ behavior: "deny" });
     await value.transport.close();
   });
 });
@@ -3176,11 +3146,7 @@ describe("ClaudeSdkTransport steer", () => {
     const prompt = value.queryInput().prompt;
     if (typeof prompt === "string" || !prompt) throw new Error("expected streaming input");
     const input = prompt[Symbol.asyncIterator]();
-    const turn = value.transport.runTurn(
-      "hello",
-      "00000000-0000-4000-8000-000000000030",
-      () => undefined,
-    );
+    const turn = value.startTurn("hello", "00000000-0000-4000-8000-000000000030", () => undefined);
     await expect(input.next()).resolves.toMatchObject({
       done: false,
       value: {
@@ -3191,7 +3157,7 @@ describe("ClaudeSdkTransport steer", () => {
     });
     const steerId = "00000000-0000-4000-8000-000000000031";
     let settled = false;
-    const steered = value.transport.steer("PIN", steerId).then(() => {
+    const steered = value.steer("PIN", steerId).then(() => {
       settled = true;
     });
     await expect(input.next()).resolves.toMatchObject({
@@ -3220,21 +3186,209 @@ describe("ClaudeSdkTransport steer", () => {
     await value.transport.close();
   });
 
-  it("rejects a steer when the Turn ends before Claude queues it", async () => {
+  it("resolves a late queued steer arriving after the Turn terminal", async () => {
     const value = fixture();
     await value.transport.start();
-    const turn = value.transport.runTurn(
-      "hello",
-      "00000000-0000-4000-8000-000000000034",
-      () => undefined,
-    );
-    const steered = value.transport.steer("PIN", "00000000-0000-4000-8000-000000000035");
+    const turn = value.startTurn("hello", "00000000-0000-4000-8000-000000000034", () => undefined);
+    const steerId = "00000000-0000-4000-8000-000000000035";
+    const steered = value.steer("PIN", steerId);
     completeTurn(value.fakeQuery);
-    await expect(steered).rejects.toBeInstanceOf(ClaudeSteerMissedTurnError);
     await turn;
-    await expect(
-      value.transport.steer("later", "00000000-0000-4000-8000-000000000036"),
-    ).rejects.toBeInstanceOf(ClaudeSteerMissedTurnError);
+    // Late queued arrives after terminal
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: steerId,
+      uuid: "00000000-0000-4000-8000-000000000036",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await expect(steered).resolves.toBeUndefined();
+    await value.transport.close();
+  });
+
+  it("reports acceptance uncertain when steer is not queued within 10s timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const value = fixture();
+      await value.transport.start();
+      const turn = value.startTurn(
+        "hello",
+        "00000000-0000-4000-8000-000000000037",
+        () => undefined,
+      );
+      const steered = value.steer("PIN", "00000000-0000-4000-8000-000000000038");
+      completeTurn(value.fakeQuery);
+      await turn;
+      const rejection = expect(steered).rejects.toThrow(
+        "Claude input acceptance could not be confirmed; it may still execute",
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      await rejection;
+      await value.transport.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("ClaudeSdkTransport regressions", () => {
+  it("keeps one live owner for root init, tool execution, approval and steer", async () => {
+    const value = fixture();
+    const turns: ObservedTurn[] = [];
+    value.observeContinuations(turns);
+    await value.transport.start();
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "init",
+      parent_tool_use_id: "child",
+    } as unknown as SDKMessage);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(turns).toHaveLength(0);
+    value.fakeQuery.push({ type: "system", subtype: "init" } as SDKMessage);
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    const canUseTool = options(value).canUseTool;
+    if (!canUseTool) throw new Error("Approval callback missing");
+    const approval = canUseTool(
+      "Bash",
+      { command: "echo 1" },
+      { signal: new AbortController().signal, toolUseID: "call", requestId: "approval" },
+    );
+    pushToolUse(value.fakeQuery, "call", "Bash", { command: "echo 1" });
+    let requested: Extract<ClaudeTurnEvent, { type: "interaction.requested" }> | undefined;
+    await vi.waitFor(() => {
+      requested = turns[0]?.events.find((e) => e.type === "interaction.requested");
+      expect(requested).toBeDefined();
+    });
+    if (!requested) throw new Error("Approval missing");
+    await value.transport.respondToInteraction({
+      type: "approval",
+      requestId: requested.request.requestId,
+      decision: "allowOnce",
+    });
+    await expect(approval).resolves.toMatchObject({ behavior: "allow" });
+    const steer = value.steer("adjust", "steer");
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: "steer",
+    } as unknown as SDKMessage);
+    await steer;
+    completeTool(value.fakeQuery, "call");
+    completeTurn(value.fakeQuery);
+    await vi.waitFor(() => expect(turns[0]?.terminal).toEqual({ status: "succeeded" }));
+    expect(turns).toHaveLength(1);
+    expect(
+      turns[0]?.events
+        .filter((e) => e.type === "tool.started" || e.type === "tool.completed")
+        .map((e) => e.type),
+    ).toEqual(["tool.started", "tool.completed"]);
+    await value.transport.close();
+  });
+  it("keeps an accepted input separate from a preceding native continuation", async () => {
+    const value = fixture();
+    const events: ClaudeSessionEvent[] = [];
+    value.transport.setEventHandler((event) => {
+      events.push(event);
+    });
+    await value.transport.start();
+    const accepted = value.transport.submitInput("new input", "new-input", "later");
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: "new-input",
+    } as unknown as SDKMessage);
+    await accepted;
+    value.fakeQuery.push({ type: "system", subtype: "init" } as SDKMessage);
+    pushAssistantText(value.fakeQuery, "prior continuation", "prior-message");
+    completeTurn(value.fakeQuery);
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "started",
+      command_uuid: "new-input",
+    } as unknown as SDKMessage);
+    value.fakeQuery.push({ type: "system", subtype: "init" } as SDKMessage);
+    pushAssistantText(value.fakeQuery, "new reply", "new-message");
+    completeTurn(value.fakeQuery);
+    await vi.waitFor(() =>
+      expect(events.filter((e) => e.type === "segment.completed")).toHaveLength(2),
+    );
+    const starts = events.filter((e) => e.type === "segment.started");
+    expect(starts.map((e) => e.inputIds)).toEqual([[], ["new-input"]]);
+    expect(
+      events.flatMap((e) =>
+        e.type === "segment.event" && e.event.type === "text.delta"
+          ? [{ segmentId: e.segmentId, text: e.event.delta }]
+          : [],
+      ),
+    ).toEqual([
+      { segmentId: starts[0]?.segmentId, text: "prior continuation" },
+      { segmentId: starts[1]?.segmentId, text: "new reply" },
+    ]);
+    await value.transport.close();
+  });
+
+  it("denies a background child's permission when its native parent no longer has a live output owner", async () => {
+    const value = fixture();
+    await value.transport.start();
+    const canUseTool = options(value).canUseTool;
+    if (!canUseTool) throw new Error("Tool approval callback missing");
+    const permission = canUseTool(
+      "Bash",
+      { command: "true" },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "background-child-tool",
+        requestId: "child-request",
+        agentID: "background-agent",
+      },
+    );
+    value.fakeQuery.push({
+      type: "assistant",
+      parent_tool_use_id: "finished-parent",
+      uuid: "child-assistant",
+      message: {
+        id: "child-message",
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "background-child-tool",
+            name: "Bash",
+            input: { command: "true" },
+          },
+        ],
+      },
+    } as unknown as SDKMessage);
+    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+    expect(value.transport.isRunning()).toBe(false);
+    await value.transport.close();
+  });
+  it("completes a foreground segment after a steer changes the result user_message_uuid", async () => {
+    const value = fixture();
+    await value.transport.start();
+    const running = value.startTurn("original", "original-input", () => undefined);
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "started",
+      command_uuid: "original-input",
+    } as unknown as SDKMessage);
+    pushAssistantText(value.fakeQuery, "working", "work-message");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const steer = value.steer("adjust", "steer-input");
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: "steer-input",
+    } as unknown as SDKMessage);
+    await steer;
+    value.fakeQuery.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      user_message_uuid: "steer-input",
+    } as SDKMessage);
+    await expect(running).resolves.toEqual({ status: "succeeded" });
+    expect(value.transport.isRunning()).toBe(false);
     await value.transport.close();
   });
 });

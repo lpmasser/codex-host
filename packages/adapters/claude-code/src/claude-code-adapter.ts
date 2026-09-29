@@ -78,7 +78,6 @@ import {
   type NativeTurnRef,
 } from "@codexhost/shared-contracts";
 
-import { ClaudeBackgroundOccupancy } from "./background-occupancy.js";
 import { ClaudeUltracodeUnavailableError, claudeUltracodeFailure } from "./ultracode.js";
 import { ClaudeSessionImportIndex } from "./claude-session-import.js";
 import { SessionImportScope } from "@codexhost/harness-adapter/session-import";
@@ -117,10 +116,10 @@ import { ClaudeTaskTracker } from "./task-tracker.js";
 import { ClaudeBackgroundCommandItems } from "./background-command-items.js";
 import { ClaudeToolLifecycle } from "./tool-lifecycle.js";
 import { estimateClaudeRequestCostUsd } from "./usage-estimate.js";
-import { ClaudeSteerMissedTurnError } from "./transport.js";
 import type {
   ClaudeAdapterDependencies,
   ClaudeApprovalRequest,
+  ClaudeSessionEvent,
   ClaudeInteractionRequest,
   ClaudeInteractionResponse,
   ClaudeLastRequestUsage,
@@ -140,7 +139,6 @@ export interface ClaudeCodeAdapterOptions {
   closeTimeoutMs?: number;
   cancelTimeoutMs?: number;
   toolOutputLimit?: number;
-  continuationQuiescenceMs?: number;
 }
 
 type SessionPhase = "open" | "closing" | "closed" | "faulted";
@@ -176,20 +174,6 @@ interface RequestUsageRefreshRequest {
   generation: number;
 }
 
-/**
- * A cancelled Turn that owned background tasks ends only after Claude Code confirms they
- * stopped and stays quiet: Claude answers a stopped Subagent's notification on its own.
- */
-interface TurnCancellation {
-  /** Native stops not yet confirmed. */
-  stopping: boolean;
-  /** A Root Segment Claude started during the cancellation is being interrupted. */
-  interrupting: boolean;
-  quiet: ReturnType<typeof setTimeout> | null;
-  /** A Segment Result that did not prove its interruption; the Turn fails once stops end. */
-  failure: HarnessError | null;
-}
-
 interface ActiveTurn {
   command: TurnStartCommand;
   compactionItem: HostContextCompactionItem | null;
@@ -200,16 +184,13 @@ interface ActiveTurn {
   reasoningOrdinal: number;
   pendingSubagentTranscriptCalls: Set<string>;
   subagents: ClaudeSubagentLifecycle;
-  workflows: ClaudeWorkflowLifecycle;
+  /** Native task IDs of the background Subagents this Turn launched. */
+  backgroundTaskIds: Set<string>;
   tools: ClaudeToolLifecycle;
   interactions: Map<HostInteractionId, ActiveInteraction>;
   interactionByRequestId: Map<string, HostInteractionId>;
-  /** Native requests raised by agents; they stay open while a held Turn waits for them. */
-  agentScopedRequestIds: Set<string>;
   checkpointId: string | null;
-  /** Submitted or observed native User UUID, independent of the opaque Turn identity. */
-  userMessageId: string | null;
-  nativeTurnKey: string;
+  itemKey: string;
   nativeTurnRef: NativeTurnRef | null;
   cancellationRequested: boolean;
   usageRequestIds: Set<string>;
@@ -219,13 +200,16 @@ interface ActiveTurn {
   estimatedCostAvailable: boolean;
   usageTokensCalibrated: boolean;
   usageCostCalibrated: boolean;
-  held: boolean;
-  /** Set while a cancelled Turn waits for its background work to stop. */
-  cancellation: TurnCancellation | null;
-  /** True while Claude can still produce a native result for the current Root Segment. */
-  rootSegmentActive: boolean;
   completion: Promise<void>;
   resolveCompletion(): void;
+}
+
+interface PendingInput {
+  command: TurnStartCommand;
+  kind: "turn" | "steer";
+  startAgentItem: boolean;
+  nativeIdentity: boolean;
+  clientUserMessageId?: string;
 }
 
 const claudeCodeHarnessId = harnessIdSchema.parse("claude-code");
@@ -319,11 +303,6 @@ const CONTEXT_USAGE_RETRY_DELAYS_MS = [0, 1_000, 2_000] as const;
 const CONTEXT_USAGE_TTL_MS = 10_000;
 const CONTEXT_USAGE_FAILURE_COOLDOWN_MS = 5_000;
 const REQUEST_USAGE_RETRY_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
-// Claude opens the continuation Segment within milliseconds of the Segment that
-// observed a task notification, and the number of Segments it spends on queued
-// notifications is not observable. The user task is therefore idle once the
-// native Session stops opening Segments for this long.
-const DEFAULT_CONTINUATION_QUIESCENCE_MS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -604,10 +583,18 @@ class ClaudeHarnessSession implements HarnessSession {
   readonly #sessionId: string;
   readonly #toolOutputLimit: number;
   readonly #backgroundCommands: ClaudeBackgroundCommandItems;
-  readonly #continuationQuiescenceMs: number;
+  /** Workflow runs outlive the Turn that launched them, like background commands. */
+  readonly #workflows: ClaudeWorkflowLifecycle;
   readonly #taskTracker = new ClaudeTaskTracker();
   #acceptingTurn = false;
-  #active: ActiveTurn | null = null;
+  #execution: { id: number; inputId?: string; turn: ActiveTurn | null } | null = null;
+  readonly #inputs = new Map<string, PendingInput>();
+  get #active(): ActiveTurn | null {
+    return this.#execution?.turn ?? null;
+  }
+  get #pendingTurn(): PendingInput | undefined {
+    return [...this.#inputs.values()].find((input) => input.kind === "turn");
+  }
   #closePromise: Promise<void> | null = null;
   #configurationTask: Promise<void> | null = null;
   #phase: SessionPhase = "open";
@@ -629,12 +616,7 @@ class ClaudeHarnessSession implements HarnessSession {
   #contextUsageFreshUntilMs = 0;
   #contextUsageCooldownUntilMs = 0;
   #requestUsageBoundary = 0;
-  #autonomousOrdinal = 0;
-  /** The Host Turn that receives the native Segment Claude started on its own. */
-  #autonomousTarget: ActiveTurn | null = null;
-  #occupancy = new ClaudeBackgroundOccupancy();
   #cancelEscalation: ReturnType<typeof setTimeout> | null = null;
-  #continuationQuiescence: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     cwd: string,
@@ -655,7 +637,6 @@ class ClaudeHarnessSession implements HarnessSession {
       requestedThinkingOptionId: HarnessThinkingOptionId;
       toolOutputLimit: number;
       cancelTimeoutMs: number;
-      continuationQuiescenceMs: number;
       /** Native requests already in the transcript, replayed for Host usage metering. */
       usageHistory: { requests: HostUsageRequest[]; complete: boolean };
     },
@@ -683,7 +664,10 @@ class ClaudeHarnessSession implements HarnessSession {
       outputLimit: options.toolOutputLimit,
       emit: (event) => this.#event(event),
     });
-    this.#continuationQuiescenceMs = options.continuationQuiescenceMs;
+    this.#workflows = new ClaudeWorkflowLifecycle({
+      newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
+      emit: (event) => this.#event(event),
+    });
     this.#nativeRef =
       options.nativeRef ??
       nativeSessionRefSchema.parse({
@@ -725,7 +709,14 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Claude Code Session is not open") };
     }
-    if (this.#active || this.#acceptingTurn || this.#configurationTask || this.#readingHistory) {
+    if (
+      this.#execution ||
+      this.#pendingTurn ||
+      this.#transport?.isRunning() ||
+      this.#acceptingTurn ||
+      this.#configurationTask ||
+      this.#readingHistory
+    ) {
       return {
         ok: false,
         error: {
@@ -805,6 +796,16 @@ class ClaudeHarnessSession implements HarnessSession {
           },
         };
       }
+      if (this.#execution || this.#pendingTurn || this.#transport?.isRunning()) {
+        return {
+          ok: false,
+          error: {
+            code: "sessionBusy",
+            message: "Claude execution started while reading history",
+            retryable: true,
+          },
+        };
+      }
       try {
         return {
           ok: true,
@@ -856,7 +857,13 @@ class ClaudeHarnessSession implements HarnessSession {
     if (command.type === "model.select") return this.#selectModel(command);
     if (command.type === "permissionMode.select") return this.#selectPermissionMode(command);
     if (command.type === "thinking.select") return this.#selectThinking(command);
-    if (this.#acceptingTurn || this.#active || this.#configurationTask || this.#readingHistory) {
+    if (
+      this.#acceptingTurn ||
+      this.#pendingTurn ||
+      this.#active ||
+      this.#configurationTask ||
+      this.#readingHistory
+    ) {
       return {
         ok: false,
         error: {
@@ -891,8 +898,7 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Claude Code Session closed during startup") };
     }
-    // Native Root output can start an autonomous Turn while transport admission yields.
-    if (this.#active) {
+    if (this.#pendingTurn || this.#active || transport.isRunning()) {
       return {
         ok: false,
         error: {
@@ -903,90 +909,7 @@ class ClaudeHarnessSession implements HarnessSession {
       };
     }
     if (startingTransport) this.#publishState();
-    this.#usageGeneration += 1;
-    this.#contextUsageFreshUntilMs = 0;
-    this.#contextUsageCooldownUntilMs = 0;
-    let resolveCompletion = (): void => undefined;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
-    const nativeTurnKey = this.#randomUUID();
-    const item: HostAgentMessageItem = {
-      type: "agentMessage",
-      itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
-      text: "",
-    };
-    const active: ActiveTurn = {
-      command,
-      compactionItem: null,
-      item,
-      agentMessageOrdinal: 1,
-      assistantMessageId: null,
-      reasoningItems: new Map(),
-      reasoningOrdinal: 0,
-      pendingSubagentTranscriptCalls: new Set(),
-      subagents: new ClaudeSubagentLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      workflows: new ClaudeWorkflowLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      tools: new ClaudeToolLifecycle({
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        taskTracker: this.#taskTracker,
-        nativeTurnKey,
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-        onDetached: (command) => this.#backgroundCommands.follow(command),
-      }),
-      interactions: new Map(),
-      interactionByRequestId: new Map(),
-      agentScopedRequestIds: new Set(),
-      checkpointId: null,
-      userMessageId: null,
-      nativeTurnKey,
-      nativeTurnRef: null,
-      cancellationRequested: false,
-      usageRequestIds: new Set(),
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedCostUsd: 0,
-      estimatedCostAvailable: false,
-      usageTokensCalibrated: false,
-      usageCostCalibrated: false,
-      held: false,
-      cancellation: null,
-      rootSegmentActive: true,
-      completion,
-      resolveCompletion,
-    };
-    this.#active = active;
-    this.#submittedInput = true;
-    this.#event({ type: "turn.started", turnId: command.turnId });
-    this.#event({ type: "item.started", turnId: command.turnId, item });
-    try {
-      const nativeTurnRef = nativeTurnRefSchema.parse({
-        harnessId: this.harnessId,
-        nativeSessionId: this.#sessionId,
-        nativeTurnKey,
-        formatVersion: 1,
-      });
-      const running = transport.runTurn(text, nativeTurnRef.nativeTurnKey, (event) => {
-        this.#handleTurnEvent(active, event);
-      });
-      // Claude preserves caller-assigned User Message UUIDs in native history.
-      active.userMessageId = nativeTurnRef.nativeTurnKey;
-      active.nativeTurnRef = nativeTurnRef;
-      void running.then(
-        (result) => this.#finishResult(active, result),
-        () => this.#handleTurnTransportFailure(active),
-      );
-    } catch {
-      this.#finishFailed(active, faultError());
-    }
+    this.#submitTurn(command, text, transport, true, true);
     return { ok: true, value: { turnId: command.turnId } };
   }
 
@@ -1009,15 +932,27 @@ class ClaudeHarnessSession implements HarnessSession {
     if (!transport) {
       return { ok: false, error: invalidState("Claude Code steer missed the active Turn") };
     }
+    const messageId = this.#randomUUID();
+    this.#inputs.set(messageId, {
+      command: { type: "turn.start", turnId: command.turnId, input: command.input },
+      kind: "steer",
+      startAgentItem: true,
+      nativeIdentity: true,
+      ...(command.clientUserMessageId ? { clientUserMessageId: command.clientUserMessageId } : {}),
+    });
     try {
-      await transport.steer(text, this.#randomUUID());
+      await transport.submitInput(text, messageId, "next");
     } catch (error) {
-      if (error instanceof ClaudeSteerMissedTurnError) {
-        return { ok: false, error: invalidState("Claude Code steer missed the active Turn") };
-      }
-      throw error;
+      return {
+        ok: false,
+        error: {
+          code: "nativeFailure",
+          message: error instanceof Error ? error.message : "Claude input acceptance is unknown",
+          retryable: false,
+        },
+      };
     }
-    return { ok: true, value: { accepted: true } };
+    return { ok: true, value: { accepted: true, inputProjection: "adapter" } };
   }
 
   /** Built-ins plus the live commands and skills of the started native Session. */
@@ -1045,7 +980,13 @@ class ClaudeHarnessSession implements HarnessSession {
         ? parseClaudeHarnessCommand(command)
         : { ok: true, value: { id: "slash", text: dynamicPrompt } };
     if (!parsed.ok) return parsed;
-    if (this.#acceptingTurn || this.#active || this.#configurationTask || this.#readingHistory) {
+    if (
+      this.#acceptingTurn ||
+      this.#pendingTurn ||
+      this.#active ||
+      this.#configurationTask ||
+      this.#readingHistory
+    ) {
       return {
         ok: false,
         error: {
@@ -1069,105 +1010,32 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Claude Code Session closed during startup") };
     }
-    // Commands must not replace a continuation that began during transport admission.
-    if (this.#active) {
+    if (this.#pendingTurn || this.#active || transport.isRunning()) {
       return {
         ok: false,
         error: {
           code: "sessionBusy",
-          message: "Claude Code Session already has an active operation",
+          message: "Claude Code Session already has an active Turn",
           retryable: true,
         },
       };
     }
     if (startingTransport) this.#publishState();
-    this.#usageGeneration += 1;
-    this.#contextUsageFreshUntilMs = 0;
-    this.#contextUsageCooldownUntilMs = 0;
-    let resolveCompletion = (): void => undefined;
-    const completion = new Promise<void>((resolve) => {
-      resolveCompletion = resolve;
-    });
-    const nativeTurnKey = this.#randomUUID();
-    const startAgentItem = parsed.value.id !== "claude.compact";
-    const item: HostAgentMessageItem | null = startAgentItem
-      ? {
-          type: "agentMessage",
-          itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
-          text: "",
-        }
-      : null;
-    const active: ActiveTurn = {
-      command: { type: "turn.start", turnId: command.turnId, input: [] },
-      compactionItem: null,
-      item,
-      agentMessageOrdinal: startAgentItem ? 1 : 0,
-      assistantMessageId: null,
-      reasoningItems: new Map(),
-      reasoningOrdinal: 0,
-      pendingSubagentTranscriptCalls: new Set(),
-      subagents: new ClaudeSubagentLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      workflows: new ClaudeWorkflowLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
-      tools: new ClaudeToolLifecycle({
-        cwd: this.#cwd,
-        outputLimit: this.#toolOutputLimit,
-        taskTracker: this.#taskTracker,
-        nativeTurnKey,
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-        onDetached: (command) => this.#backgroundCommands.follow(command),
-      }),
-      interactions: new Map(),
-      interactionByRequestId: new Map(),
-      agentScopedRequestIds: new Set(),
-      checkpointId: null,
-      userMessageId: null,
-      nativeTurnKey,
-      nativeTurnRef: null,
-      cancellationRequested: false,
-      usageRequestIds: new Set(),
-      estimatedInputTokens: 0,
-      estimatedOutputTokens: 0,
-      estimatedCostUsd: 0,
-      estimatedCostAvailable: false,
-      usageTokensCalibrated: false,
-      usageCostCalibrated: false,
-      held: false,
-      cancellation: null,
-      rootSegmentActive: true,
-      completion,
-      resolveCompletion,
-    };
-    this.#active = active;
-    this.#submittedInput = true;
-    this.#event({ type: "turn.started", turnId: command.turnId });
-    if (item) this.#event({ type: "item.started", turnId: command.turnId, item });
-    const running =
+    const text =
       parsed.value.id === "claude.compact"
-        ? transport.compact(nativeTurnKey, parsed.value.text, (event) =>
-            this.#handleTurnEvent(active, event),
-          )
+        ? `/compact${parsed.value.text ? ` ${parsed.value.text}` : ""}`
         : parsed.value.id === "claude.init"
-          ? transport.init(nativeTurnKey, (event) => this.#handleTurnEvent(active, event))
+          ? "/init"
           : parsed.value.id === "slash"
-            ? transport.runTurn(parsed.value.text, nativeTurnKey, (event) =>
-                this.#handleTurnEvent(active, event),
-              )
-            : transport.recap(nativeTurnKey, (event) => this.#handleTurnEvent(active, event));
-    try {
-      void running.then(
-        (result) => this.#finishResult(active, result),
-        () => this.#handleTurnTransportFailure(active),
-      );
-    } catch {
-      this.#finishFailed(active, faultError());
-    }
+            ? parsed.value.text
+            : "/recap";
+    this.#submitTurn(
+      { type: "turn.start", turnId: command.turnId, input: [] },
+      text,
+      transport,
+      parsed.value.id !== "claude.compact",
+      false,
+    );
     return { ok: true, value: { turnId: command.turnId } };
   }
 
@@ -1214,7 +1082,8 @@ class ClaudeHarnessSession implements HarnessSession {
     return (
       this.#sessionId === sessionId &&
       (this.#phase !== "open" ||
-        this.#active !== null ||
+        this.#execution !== null ||
+        this.#pendingTurn !== undefined ||
         this.#acceptingTurn ||
         this.#configurationTask !== null ||
         this.#readingHistory)
@@ -1528,34 +1397,73 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   async #cancel(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>> {
+    const transport = this.#transport;
+    const pendingEntry = [...this.#inputs].find(
+      ([, input]) => input.kind === "turn" && input.command.turnId === command.turnId,
+    );
+    if (pendingEntry && transport) {
+      try {
+        if (await transport.cancelInput(pendingEntry[0])) {
+          await this.#handleNativeEvent({ type: "input.cancelled", messageId: pendingEntry[0] });
+          return { ok: true, value: { cancellationRequested: true } };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          error: {
+            code: "nativeFailure",
+            message:
+              error instanceof Error ? error.message : "Input cancellation was not confirmed",
+            retryable: true,
+          },
+        };
+      }
+    }
     const active = this.#active;
-    if (!active || active.command.turnId !== command.turnId) {
+    const execution = this.#execution;
+    if (!active || !execution || active.command.turnId !== command.turnId || !transport) {
       return {
         ok: false,
-        error: invalidState("Claude Code Turn Cancel must reference the active Turn"),
+        error: invalidState("Claude Code cancellation target is not the active execution"),
       };
     }
-    if (active.cancellationRequested) {
-      return { ok: true, value: { cancellationRequested: true } };
-    }
+    if (active.cancellationRequested) return { ok: true, value: { cancellationRequested: true } };
     active.cancellationRequested = true;
-    const transport = this.#transport;
-    const taskIds = this.#backgroundTaskIds(active);
-    if (
-      transport &&
-      (taskIds.length > 0 ||
-        (active.held && (active.rootSegmentActive || this.#occupancy.awaitingContinuation)))
-    ) {
-      await this.#cancelBackgroundWork(active, transport, taskIds);
-      return { ok: true, value: { cancellationRequested: true } };
-    }
-    if (active.held) {
-      this.#finish(active, { status: "cancelled", reason: "Cancelled by user" });
-      return { ok: true, value: { cancellationRequested: true } };
-    }
+    // Withdraw only inputs submitted to this Turn, never another accepted foreground input.
+    const queued = [...this.#inputs]
+      .filter(([, input]) => input.kind === "steer" && input.command.turnId === command.turnId)
+      .map(([messageId]) => messageId);
+    const withdrawn = await Promise.allSettled(
+      queued.map((messageId) => transport.cancelInput(messageId)),
+    );
+    // Background work this Turn launched keeps running past an interrupt; stop it as well and
+    // wait until Claude Code confirms each task ended.
+    const taskIds = [
+      ...this.#workflows.taskIds(active.command.turnId),
+      ...active.backgroundTaskIds,
+    ];
     const timeout = rejectAfter(this.#cancelTimeoutMs, "Claude Code interrupt timed out");
     try {
-      await Promise.race([this.#transport?.abort() ?? Promise.resolve(), timeout.promise]);
+      if (taskIds.length > 0) {
+        await Promise.race([transport.stopTasks(taskIds), timeout.promise]);
+      }
+      if (this.#active === active) {
+        const receipt = await Promise.race([transport.abort(execution.id), timeout.promise]);
+        if (
+          receipt.stillQueued?.some((id) => queued.includes(id)) ||
+          (receipt.stillQueued === null && withdrawn.some((result) => result.status === "rejected"))
+        ) {
+          return {
+            ok: false,
+            error: {
+              code: "nativeFailure",
+              message:
+                "Claude execution was interrupted, but queued input cancellation is unconfirmed",
+              retryable: false,
+            },
+          };
+        }
+      }
     } catch {
       this.#hardCancel(active);
       return { ok: true, value: { cancellationRequested: true } };
@@ -1564,88 +1472,6 @@ class ClaudeHarnessSession implements HarnessSession {
     }
     if (this.#active === active) this.#armCancelEscalation(active);
     return { ok: true, value: { cancellationRequested: true } };
-  }
-
-  /** Background Subagents and Workflow runs of this Turn that Claude Code still runs. */
-  #backgroundTaskIds(active: ActiveTurn): string[] {
-    return [...new Set([...active.workflows.taskIds(), ...this.#occupancy.runningTaskIds()])];
-  }
-
-  /**
-   * Stops the Turn's background tasks and interrupts its Root Segment, if one runs. The Turn
-   * ends once Claude Code confirms the stops and stays quiet; a stop or interrupt it does not
-   * confirm closes the native process, which ends every task it runs.
-   */
-  async #cancelBackgroundWork(
-    active: ActiveTurn,
-    transport: ClaudeTurnTransport,
-    taskIds: readonly string[],
-  ): Promise<void> {
-    const cancellation: TurnCancellation = {
-      stopping: taskIds.length > 0,
-      interrupting: false,
-      quiet: null,
-      failure: null,
-    };
-    active.cancellation = cancellation;
-    this.#clearContinuationQuiescence();
-    const timeout = rejectAfter(this.#cancelTimeoutMs, "Claude Code cancellation timed out");
-    try {
-      await Promise.race([
-        Promise.all([
-          taskIds.length > 0 ? transport.stopTasks(taskIds) : undefined,
-          active.rootSegmentActive ? this.#interruptCancelledSegment(active) : undefined,
-        ]),
-        timeout.promise,
-      ]);
-    } catch {
-      this.#hardCancel(active);
-      return;
-    } finally {
-      timeout.cancel();
-    }
-    cancellation.stopping = false;
-    this.#settleCancellation(active);
-  }
-
-  /** Claude answers stopped work on its own; a cancelled Turn interrupts that answer too. */
-  async #interruptCancelledSegment(active: ActiveTurn): Promise<void> {
-    const cancellation = active.cancellation;
-    const transport = this.#transport;
-    if (!cancellation || cancellation.interrupting || !transport) return;
-    cancellation.interrupting = true;
-    this.#clearCancellationQuiet(cancellation);
-    await transport.abortContinuation();
-    // The interrupted Segment still owes its native terminal.
-    if (this.#active === active && cancellation.interrupting) this.#armCancelEscalation(active);
-  }
-
-  #settleCancellation(active: ActiveTurn): void {
-    const cancellation = active.cancellation;
-    if (this.#active !== active || !cancellation || this.#hardCancelTask) return;
-    if (cancellation.stopping || cancellation.interrupting || active.rootSegmentActive) return;
-    this.#clearCancellationQuiet(cancellation);
-    const quiet = setTimeout(() => {
-      cancellation.quiet = null;
-      if (
-        this.#active !== active ||
-        active.cancellation !== cancellation ||
-        cancellation.interrupting ||
-        active.rootSegmentActive
-      ) {
-        return;
-      }
-      if (cancellation.failure) this.#finishFailed(active, cancellation.failure);
-      else this.#finish(active, { status: "cancelled", reason: "Cancelled by user" });
-    }, this.#continuationQuiescenceMs);
-    quiet.unref();
-    cancellation.quiet = quiet;
-  }
-
-  #clearCancellationQuiet(cancellation: TurnCancellation): void {
-    if (!cancellation.quiet) return;
-    clearTimeout(cancellation.quiet);
-    cancellation.quiet = null;
   }
 
   async #close(): Promise<void> {
@@ -1659,7 +1485,6 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#contextRefreshWake?.();
     this.#contextRefreshWake = null;
     this.#clearCancelEscalation();
-    this.#clearContinuationQuiescence();
     const failures: unknown[] = [];
     const settle = async (task: Promise<unknown> | undefined): Promise<void> => {
       if (!task) return;
@@ -1684,9 +1509,21 @@ class ClaudeHarnessSession implements HarnessSession {
     );
     if (this.#transport !== closingTransport) await settle(this.#transport?.close());
     if (failures.length === 0) await settle(this.#releaseUnusedClaim());
+    // The closed native process ran every open Workflow run, including the active Turn's.
+    this.#workflows.abandon({ status: "cancelled", reason: "Claude Code Session closed" });
     const active = this.#active;
     if (active)
       this.#finishFailed(active, invalidState("Claude Code Session closed during active Turn"));
+    for (const input of this.#inputs.values()) {
+      if (input.kind === "turn")
+        this.#event({
+          type: "turn.completed",
+          turnId: input.command.turnId,
+          outcome: { status: "cancelled", reason: "Session closed before execution" },
+        });
+    }
+    this.#inputs.clear();
+    this.#execution = null;
     this.#backgroundCommands.abandonAll("Claude Code Session closed");
     this.#phase = "closed";
     this.#channel.end();
@@ -1736,29 +1573,7 @@ class ClaudeHarnessSession implements HarnessSession {
         onPlanLimit: (planLimit) => this.#handlePlanLimit(planLimit),
       });
       this.#transport = transport;
-      transport.setAutonomousTurnHandler({
-        start: (nativeTurnKey, userMessageId) => {
-          this.#autonomousTarget = this.#startAutonomousTurn(nativeTurnKey, userMessageId);
-        },
-        onEvent: (event) => this.#deliverLiveEvent(this.#autonomousTarget, event),
-        onTerminal: (result) => {
-          const target = this.#autonomousTarget;
-          this.#autonomousTarget = null;
-          if (target) this.#finishResult(target, result);
-        },
-      });
-      transport.setThreadEventHandler((event) => {
-        // Thread-level events (e.g. a background Subagent settling) are not
-        // Turn-scoped and must not be gated on an active Turn.
-        if (event.type === "subagent.settled") this.#settleNativeTask(event);
-      });
-      transport.setIdleTurnHandler({
-        onEvent: (event) => this.#deliverLiveEvent(this.#active, event),
-        onTerminal: (result) => {
-          const active = this.#active;
-          if (active) this.#finishResult(active, result);
-        },
-      });
+      transport.setEventHandler((event) => this.#handleNativeEvent(event));
       await transport.start();
       this.#state = {
         ...this.#configuredState(true),
@@ -1833,36 +1648,22 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   #handleTurnEvent(active: ActiveTurn, event: ClaudeTurnEvent): void {
-    // Usage belongs to the Session, so a request settling after its Turn ended still counts.
-    if (event.type === "usage.request") {
-      if (this.#phase !== "closed" && this.#phase !== "faulted") this.#meterUsage(event.record);
-      return;
-    }
     if (this.#active !== active || this.#phase === "closed" || this.#phase === "faulted") return;
     switch (event.type) {
       case "segment.started":
-        this.#observeRootOutput(active);
-        if (active.cancellation && !active.cancellation.interrupting) {
-          this.#interruptCancelledSegment(active).catch(() => this.#hardCancel(active));
-        }
         return;
       case "subagents.live":
-        this.#occupancy.observeLive(event.nativeSubagentIds);
-        this.#armContinuationQuiescence(active);
         return;
       case "compaction.started":
-        this.#observeRootOutput(active);
         this.#startCompaction(active);
         return;
       case "compaction.completed":
         this.#completeCompaction(active, event.outcome);
         return;
       case "text.delta":
-        if (event.delta.length > 0) this.#observeRootOutput(active);
         this.#appendText(active, event.messageId, event.delta);
         return;
       case "reasoning.delta":
-        if (event.delta.length > 0) this.#observeRootOutput(active);
         this.#activateAssistantMessage(active, event.messageId);
         this.#appendReasoning(active, event.messageId, event.delta);
         return;
@@ -1870,10 +1671,6 @@ class ClaudeHarnessSession implements HarnessSession {
         this.#completeReasoning(active, event.messageId, { status: "succeeded" });
         return;
       case "message.completed": {
-        // A continuation may complete its message without emitting text (for example
-        // after a tool or interaction). Keep the quiescence timer from closing the
-        // held Turn until the native result confirms this Segment is done.
-        this.#observeRootOutput(active);
         if (event.lastRequestUsage) {
           this.#requestUsageBoundary += 1;
           this.#applyLatestRequestUsage(active, event.lastRequestUsage);
@@ -1885,8 +1682,8 @@ class ClaudeHarnessSession implements HarnessSession {
         if (
           active.tools.size > 0 ||
           active.subagents.size > 0 ||
-          active.workflows.pendingCount > 0 ||
-          this.#hasRootInteractions(active) ||
+          this.#workflows.pendingCount > 0 ||
+          active.interactions.size > 0 ||
           active.compactionItem
         ) {
           return;
@@ -1895,7 +1692,6 @@ class ClaudeHarnessSession implements HarnessSession {
         return;
       }
       case "tool.started":
-        this.#observeRootOutput(active);
         for (const messageId of [...active.reasoningItems.keys()]) {
           this.#completeReasoning(active, messageId, { status: "succeeded" });
         }
@@ -1909,21 +1705,14 @@ class ClaudeHarnessSession implements HarnessSession {
         active.tools.complete(active.command.turnId, event, active.cancellationRequested);
         return;
       case "subagent.started":
-        this.#observeRootOutput(active);
         for (const messageId of [...active.reasoningItems.keys()]) {
           this.#completeReasoning(active, messageId, { status: "succeeded" });
         }
         this.#completeAgentItem(active, { status: "succeeded" }, false);
         active.subagents.start(active.command.turnId, event);
-        if (event.operation === "send") {
-          if (event.nativeSubagentId) this.#occupancy.occupyAgent(event.nativeSubagentId);
-        } else if (event.background) {
-          this.#occupancy.occupySpawn(event.callId, event.nativeSubagentId);
-        }
         return;
       case "subagent.updated":
         active.subagents.update(active.command.turnId, event);
-        if (event.nativeSubagentId) this.#occupancy.bind(event.callId, event.nativeSubagentId);
         if (
           event.status === "completed" ||
           event.status === "failed" ||
@@ -1949,39 +1738,21 @@ class ClaudeHarnessSession implements HarnessSession {
           event,
           active.cancellationRequested,
         );
-        if (subagent.status === "running") {
-          if (subagent.nativeSubagentId) {
-            this.#occupancy.bind(event.callId, subagent.nativeSubagentId);
-          }
-          return;
+        if (subagent.status === "running" && subagent.nativeSubagentId) {
+          active.backgroundTaskIds.add(subagent.nativeSubagentId);
         }
-        this.#occupancy.release(event.callId, subagent.nativeSubagentId);
         return;
       }
       case "workflow.started":
-        this.#observeRootOutput(active);
         for (const messageId of [...active.reasoningItems.keys()]) {
           this.#completeReasoning(active, messageId, { status: "succeeded" });
         }
         this.#completeAgentItem(active, { status: "succeeded" }, false);
-        active.workflows.start(event);
+        this.#workflows.start(active.command.turnId, event);
         return;
-      case "workflow.updated":
-        this.#refreshSubagentTranscripts(active.workflows.update(active.command.turnId, event));
+      case "workflow.launched":
+        this.#workflows.launched(event, active.cancellationRequested);
         return;
-      case "workflow.activity":
-        this.#refreshSubagentTranscripts(active.workflows.activity(event.callId));
-        return;
-      case "workflow.launched": {
-        const launched = active.workflows.launched(
-          active.command.turnId,
-          event,
-          active.cancellationRequested,
-        );
-        // A launched run owes the Root a continuation, like a background Subagent.
-        if (launched) this.#occupancy.occupySpawn(launched.callId, launched.taskId);
-        return;
-      }
       case "subagent.settled":
         this.#settleNativeTask(event);
         return;
@@ -1995,11 +1766,6 @@ class ClaudeHarnessSession implements HarnessSession {
         return;
       }
       case "interaction.requested":
-        if (event.agentScoped) {
-          active.agentScopedRequestIds.add(event.request.requestId);
-        } else {
-          this.#observeRootOutput(active);
-        }
         this.#startInteraction(active, event.request);
         return;
       case "interaction.closed":
@@ -2135,7 +1901,6 @@ class ClaudeHarnessSession implements HarnessSession {
     if (!interactionId)
       throw new Error("Claude Code Interaction close references an unknown request");
     active.interactionByRequestId.delete(requestId);
-    active.agentScopedRequestIds.delete(requestId);
     active.interactions.delete(interactionId);
     this.#event({
       type: "interaction.closed",
@@ -2145,35 +1910,16 @@ class ClaudeHarnessSession implements HarnessSession {
     });
   }
 
-  #closeActiveInteractions(
-    active: ActiveTurn,
-    reason: "cancelled" | "superseded",
-    keepAgentScoped = false,
-  ): void {
+  #closeActiveInteractions(active: ActiveTurn, reason: "cancelled" | "superseded"): void {
     for (const [interactionId, pending] of active.interactions) {
-      if (keepAgentScoped && active.agentScopedRequestIds.has(pending.request.requestId)) continue;
       active.interactions.delete(interactionId);
       active.interactionByRequestId.delete(pending.request.requestId);
-      active.agentScopedRequestIds.delete(pending.request.requestId);
       this.#event({
         type: "interaction.closed",
         interactionId,
         turnId: active.command.turnId,
         reason,
       });
-    }
-  }
-
-  #hasRootInteractions(active: ActiveTurn): boolean {
-    for (const requestId of active.interactionByRequestId.keys()) {
-      if (!active.agentScopedRequestIds.has(requestId)) return true;
-    }
-    return false;
-  }
-
-  #refreshSubagentTranscripts(nativeSubagentIds: readonly string[]): void {
-    for (const nativeSubagentId of new Set(nativeSubagentIds)) {
-      this.#event({ type: "subagent.transcript.changed", nativeSubagentId });
     }
   }
 
@@ -2187,11 +1933,7 @@ class ClaudeHarnessSession implements HarnessSession {
       active.agentMessageOrdinal += 1;
       active.item = {
         type: "agentMessage",
-        itemId: claudeTranscriptItemId(
-          active.nativeTurnKey,
-          "agentMessage",
-          active.agentMessageOrdinal,
-        ),
+        itemId: claudeTranscriptItemId(active.itemKey, "agentMessage", active.agentMessageOrdinal),
         text: "",
       };
       this.#event({ type: "item.started", turnId: active.command.turnId, item: active.item });
@@ -2231,7 +1973,7 @@ class ClaudeHarnessSession implements HarnessSession {
       active.reasoningOrdinal += 1;
       item = {
         type: "reasoning",
-        itemId: claudeTranscriptItemId(active.nativeTurnKey, "reasoning", active.reasoningOrdinal),
+        itemId: claudeTranscriptItemId(active.itemKey, "reasoning", active.reasoningOrdinal),
         text: "",
       };
       active.reasoningItems.set(messageId, item);
@@ -2258,34 +2000,61 @@ class ClaudeHarnessSession implements HarnessSession {
     });
   }
 
-  /**
-   * Claude started Root output in a Segment no requested Turn owns. A held Turn continues with
-   * it; otherwise it becomes a live autonomous Turn, so the Thread shows it running and a new
-   * request waits instead of absorbing it.
-   */
-  #startAutonomousTurn(segmentKey: string, userMessageId: string | null): ActiveTurn | null {
-    if (this.#phase !== "open") return null;
-    const current = this.#active;
-    if (current?.held) return current;
-    // A requested Turn still owns the Session; never merge this Segment into it.
-    if (current) return null;
-    this.#autonomousOrdinal += 1;
-    const turnId = hostTurnIdSchema.parse(this.#randomUUID());
+  #submitTurn(
+    command: TurnStartCommand,
+    text: string,
+    transport: ClaudeTurnTransport,
+    startAgentItem: boolean,
+    nativeIdentity: boolean,
+  ): void {
+    const messageId = this.#randomUUID();
+    this.#inputs.set(messageId, { command, kind: "turn", startAgentItem, nativeIdentity });
+    this.#submittedInput = true;
+    void transport.submitInput(text, messageId, "later").catch((error: unknown) => {
+      const pending = this.#inputs.get(messageId);
+      if (pending?.kind !== "turn") return;
+      this.#inputs.delete(messageId);
+      this.#event({
+        type: "turn.completed",
+        turnId: pending.command.turnId,
+        outcome: {
+          status: "failed",
+          error: {
+            code: "nativeFailure",
+            message: error instanceof Error ? error.message : "Claude input acceptance is unknown",
+            retryable: false,
+          },
+        },
+      });
+    });
+  }
+
+  #activateExecution(): ActiveTurn {
+    const execution = this.#execution;
+    if (!execution) throw new Error("Claude output has no native execution");
+    if (execution.turn) return execution.turn;
+    const pending = execution.inputId ? this.#inputs.get(execution.inputId) : undefined;
+    const foreground = pending?.kind === "turn";
+    const turnId = foreground ? pending.command.turnId : hostTurnIdSchema.parse(this.#randomUUID());
+    const nativeKey = execution.inputId;
+    const itemKey = nativeKey ?? turnId;
+    const startAgentItem = pending?.startAgentItem ?? true;
+    const item: HostAgentMessageItem | null = startAgentItem
+      ? {
+          type: "agentMessage",
+          itemId: claudeTranscriptItemId(itemKey, "agentMessage", 1),
+          text: "",
+        }
+      : null;
     let resolveCompletion = (): void => undefined;
     const completion = new Promise<void>((resolve) => {
       resolveCompletion = resolve;
     });
-    const nativeTurnKey = segmentKey || `autonomous-${this.#autonomousOrdinal}`;
-    const item: HostAgentMessageItem = {
-      type: "agentMessage",
-      itemId: claudeTranscriptItemId(nativeTurnKey, "agentMessage", 1),
-      text: "",
-    };
     const active: ActiveTurn = {
-      command: { type: "turn.start", turnId, input: [] },
+      command: foreground ? pending.command : { type: "turn.start", turnId, input: [] },
       compactionItem: null,
       item,
-      agentMessageOrdinal: 1,
+      agentMessageOrdinal: startAgentItem ? 1 : 0,
       assistantMessageId: null,
       reasoningItems: new Map(),
       reasoningOrdinal: 0,
@@ -2294,31 +2063,28 @@ class ClaudeHarnessSession implements HarnessSession {
         newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
         emit: (event) => this.#event(event),
       }),
-      workflows: new ClaudeWorkflowLifecycle({
-        newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
-        emit: (event) => this.#event(event),
-      }),
+      backgroundTaskIds: new Set(),
       tools: new ClaudeToolLifecycle({
         cwd: this.#cwd,
         outputLimit: this.#toolOutputLimit,
         taskTracker: this.#taskTracker,
-        nativeTurnKey,
         newItemId: () => hostItemIdSchema.parse(this.#randomUUID()),
         emit: (event) => this.#event(event),
         onDetached: (command) => this.#backgroundCommands.follow(command),
       }),
       interactions: new Map(),
       interactionByRequestId: new Map(),
-      agentScopedRequestIds: new Set(),
       checkpointId: null,
-      userMessageId,
-      nativeTurnKey,
-      nativeTurnRef: nativeTurnRefSchema.parse({
-        harnessId: this.harnessId,
-        nativeSessionId: this.#sessionId,
-        nativeTurnKey,
-        formatVersion: 1,
-      }),
+      itemKey,
+      nativeTurnRef:
+        nativeKey && (pending?.nativeIdentity ?? true)
+          ? nativeTurnRefSchema.parse({
+              harnessId: this.harnessId,
+              nativeSessionId: this.#sessionId,
+              nativeTurnKey: nativeKey,
+              formatVersion: 1,
+            })
+          : null,
       cancellationRequested: false,
       usageRequestIds: new Set(),
       estimatedInputTokens: 0,
@@ -2327,31 +2093,151 @@ class ClaudeHarnessSession implements HarnessSession {
       estimatedCostAvailable: false,
       usageTokensCalibrated: false,
       usageCostCalibrated: false,
-      held: false,
-      cancellation: null,
-      rootSegmentActive: true,
       completion,
       resolveCompletion,
     };
-    this.#active = active;
-    this.#event({ type: "turn.autonomous.started", turnId, input: [] });
+    execution.turn = active;
+    this.#usageGeneration += 1;
+    this.#contextUsageFreshUntilMs = 0;
+    this.#contextUsageCooldownUntilMs = 0;
+    if (!foreground) this.#event({ type: "turn.autonomous.started", turnId, input: [] });
     this.#event({ type: "turn.started", turnId });
-    this.#event({ type: "item.started", turnId, item });
+    if (item) this.#event({ type: "item.started", turnId, item });
+    if (pending && execution.inputId) this.#applyInput(active, execution.inputId);
     return active;
   }
 
-  /** Live native events outside a requested Root Segment; settlements stay Thread-level. */
-  #deliverLiveEvent(target: ActiveTurn | null, event: ClaudeTurnEvent): void {
-    // Requests belong to Session usage even when no foreground Turn owns the event.
-    if (event.type === "usage.request") {
-      this.#meterUsage(event.record);
+  #applyInput(active: ActiveTurn, messageId: string): void {
+    const pending = this.#inputs.get(messageId);
+    if (!pending) return;
+    this.#inputs.delete(messageId);
+    if (pending.kind === "turn") return;
+    const item = {
+      type: "userMessage" as const,
+      itemId: hostItemIdSchema.parse(messageId),
+      input: pending.command.input,
+      ...(pending.clientUserMessageId ? { clientUserMessageId: pending.clientUserMessageId } : {}),
+    };
+    this.#event({ type: "item.started", turnId: active.command.turnId, item });
+    this.#event({
+      type: "item.completed",
+      turnId: active.command.turnId,
+      snapshot: { item, outcome: { status: "succeeded" } },
+    });
+  }
+
+  async #handleNativeEvent(event: ClaudeSessionEvent): Promise<void> {
+    if (this.#phase === "closed" || this.#phase === "faulted") return;
+    switch (event.type) {
+      case "activity.changed":
+        this.#event({ type: "session.activity.changed", activity: event.activity });
+        return;
+      case "thread.event":
+        if (event.event.type === "subagent.settled") this.#settleNativeTask(event.event);
+        // Usage belongs to the Session, so a request settling outside a visible Turn still counts.
+        else if (event.event.type === "usage.request") this.#meterUsage(event.event.record);
+        else if (event.event.type === "workflow.updated")
+          this.#refreshSubagentTranscripts(this.#workflows.update(event.event));
+        else if (event.event.type === "workflow.activity")
+          this.#refreshSubagentTranscripts(this.#workflows.activity(event.event.callId));
+        return;
+      case "segment.started": {
+        if (this.#execution) throw new Error("Claude native executions overlap");
+        const primaryInput =
+          event.inputIds.find((id) => this.#inputs.get(id)?.kind === "turn") ??
+          event.inputIds.find((id) => this.#inputs.has(id)) ??
+          event.inputIds[0];
+        this.#execution = {
+          id: event.segmentId,
+          ...(primaryInput ? { inputId: primaryInput } : {}),
+          turn: null,
+        };
+        if (primaryInput && this.#inputs.has(primaryInput)) {
+          const active = this.#activateExecution();
+          for (const inputId of event.inputIds)
+            if (inputId !== primaryInput) this.#applyInput(active, inputId);
+        }
+        return;
+      }
+      case "input.started":
+        if (!this.#inputs.has(event.messageId)) return;
+        if (this.#execution?.id !== event.segmentId)
+          throw new Error("Claude input references another execution");
+        this.#applyInput(this.#activateExecution(), event.messageId);
+        return;
+      case "input.cancelled": {
+        const pending = this.#inputs.get(event.messageId);
+        this.#inputs.delete(event.messageId);
+        if (pending?.kind === "turn")
+          this.#event({
+            type: "turn.completed",
+            turnId: pending.command.turnId,
+            outcome: { status: "cancelled", reason: "Input withdrawn before execution" },
+          });
+        return;
+      }
+      case "segment.event":
+        if (this.#execution?.id !== event.segmentId)
+          throw new Error("Claude output references another execution");
+        // Usage alone does not make an empty autonomous notification visible.
+        if (event.event.type !== "usage.result" || this.#active)
+          this.#handleTurnEvent(this.#activateExecution(), event.event);
+        return;
+      case "segment.completed": {
+        if (this.#execution?.id !== event.segmentId)
+          throw new Error("Claude result references another execution");
+        if (this.#hardCancelTask) return;
+        if (!this.#active && event.result.status !== "succeeded") this.#activateExecution();
+        const active = this.#active;
+        if (active) {
+          if (this.#execution.inputId) this.#finishResult(active, event.result);
+          else await this.#finishContinuation(active, event.result);
+        }
+        this.#execution = null;
+        return;
+      }
+    }
+  }
+
+  async #finishContinuation(active: ActiveTurn, result: ClaudeTransportTurnResult): Promise<void> {
+    if (this.#active !== active || this.#phase !== "open") return;
+    if (!active.nativeTurnRef && active.checkpointId) {
+      // Native files can lag SDK output. Anchor identity to this exact Assistant,
+      // never to whichever user input happens to be latest when the file is read.
+      for (const retryDelay of REQUEST_USAGE_RETRY_DELAYS_MS) {
+        if (retryDelay) await delay(retryDelay);
+        if (this.#active !== active || this.#phase !== "open") return;
+        try {
+          const messages =
+            (await this.#readSessionMessages({
+              cwd: this.#cwd,
+              sessionId: this.#sessionId,
+            })) ?? [];
+          const checkpoint = messages.findIndex(
+            (message) => isRecord(message) && message.uuid === active.checkpointId,
+          );
+          if (checkpoint < 0) continue;
+          const snapshot = mapClaudeSnapshot(messages.slice(0, checkpoint + 1), this.#sessionId);
+          active.nativeTurnRef = snapshot.turns.at(-1)?.nativeTurnRef ?? null;
+          if (active.nativeTurnRef) break;
+        } catch {
+          // A transcript read failure must not close a still-running native Session.
+        }
+      }
+    }
+    if (this.#active !== active || this.#phase !== "open") return;
+    if (!active.nativeTurnRef && result.status === "succeeded") {
+      this.#finish(active, {
+        status: "failed",
+        error: {
+          code: "nativeFailure",
+          message: "Claude continuation native identity is unavailable",
+          retryable: true,
+        },
+      });
       return;
     }
-    if (target && this.#active === target) {
-      this.#handleTurnEvent(target, event);
-      return;
-    }
-    if (event.type === "subagent.settled") this.#settleNativeTask(event);
+    this.#finishResult(active, result);
   }
 
   /**
@@ -2360,13 +2246,9 @@ class ClaudeHarnessSession implements HarnessSession {
    */
   #settleNativeTask(event: Extract<ClaudeTurnEvent, { type: "subagent.settled" }>): void {
     if (this.#backgroundCommands.settle(event)) return;
-    const active = this.#active;
-    const workflow = active?.workflows.settle(active.command.turnId, event);
+    const workflow = this.#workflows.settle(event);
     if (workflow) {
       this.#refreshSubagentTranscripts(workflow.nativeSubagentIds);
-      // The run stopped, but its Root continuation runs in a later Segment.
-      this.#occupancy.notify(workflow.callId, workflow.taskId);
-      if (active?.held) this.#armContinuationQuiescence(active);
       return;
     }
     this.#settleBackgroundSubagent(
@@ -2377,16 +2259,18 @@ class ClaudeHarnessSession implements HarnessSession {
     );
   }
 
+  #refreshSubagentTranscripts(nativeSubagentIds: readonly string[]): void {
+    for (const nativeSubagentId of new Set(nativeSubagentIds)) {
+      this.#event({ type: "subagent.transcript.changed", nativeSubagentId });
+    }
+  }
+
   #settleBackgroundSubagent(
     status: "completed" | "failed" | "interrupted",
     nativeSubagentId?: string,
     callId?: string,
     resultSummary?: string,
   ): void {
-    // The Subagent stopped, but its Root continuation runs in a later Segment.
-    this.#occupancy.notify(callId, nativeSubagentId);
-    const active = this.#active;
-    if (active?.held) this.#armContinuationQuiescence(active);
     if (!nativeSubagentId) return;
     this.#event({
       type: "subagent.state.changed",
@@ -2396,34 +2280,12 @@ class ClaudeHarnessSession implements HarnessSession {
     });
   }
 
-  #interruptBackgroundSubagents(status: "failed" | "interrupted"): void {
-    for (const nativeSubagentId of this.#occupancy.interruptAll()) {
-      this.#event({ type: "subagent.state.changed", nativeSubagentId, status });
-    }
-  }
-
   #finishResult(active: ActiveTurn, result: ClaudeTransportTurnResult): void {
     // A late native terminal cannot substitute for the process shutdown already in progress.
     if (this.#active !== active || this.#hardCancelTask) return;
-    active.rootSegmentActive = false;
-    if (active.cancellation) {
-      // The Turn ends only once its background work is confirmed stopped; later Segments
-      // still reach it through the idle handler. An unproven interruption still fails it.
-      if (result.status === "failed") {
-        active.cancellation.failure ??= transportFailure(result.kind);
-      }
-      active.cancellation.interrupting = false;
-      this.#clearCancelEscalation();
-      if (!active.held) {
-        active.held = true;
-        this.#transport?.setIdleLive(true);
-      }
-      this.#settleCancellation(active);
-      return;
-    }
     if (
       result.status === "succeeded" &&
-      (active.tools.size > 0 || active.subagents.size > 0 || active.workflows.pendingCount > 0)
+      (active.tools.size > 0 || active.subagents.size > 0 || this.#workflows.pendingCount > 0)
     ) {
       this.#finishFailed(active, transportFailure("protocol"));
     } else if (result.status === "succeeded") {
@@ -2567,7 +2429,7 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   #applyLatestRequestUsage(active: ActiveTurn, usage: ClaudeLastRequestUsage): void {
-    const requestId = usage.requestId ?? `${active.nativeTurnKey}:${usage.model ?? "unknown"}`;
+    const requestId = usage.requestId ?? `${active.itemKey}:${usage.model ?? "unknown"}`;
     if (active.usageRequestIds.has(requestId)) return;
     active.usageRequestIds.add(requestId);
     active.estimatedInputTokens +=
@@ -2706,85 +2568,23 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#finish(active, { status: "failed", error });
   }
 
-  /** Completes held work after a quiet period with no further Root output. */
-  #armContinuationQuiescence(active: ActiveTurn): void {
-    if (
-      this.#active !== active ||
-      !active.held ||
-      active.cancellation ||
-      active.rootSegmentActive ||
-      this.#phase !== "open" ||
-      !this.#occupancy.awaitingContinuation
-    ) {
-      return;
-    }
-    this.#clearContinuationQuiescence();
-    const quiescence = setTimeout(() => {
-      this.#continuationQuiescence = null;
-      if (
-        this.#active !== active ||
-        !active.held ||
-        active.rootSegmentActive ||
-        this.#phase !== "open"
-      ) {
-        return;
-      }
-      this.#occupancy.releaseContinuations();
-      if (this.#occupancy.unsettled) return;
-      this.#finish(active, { status: "succeeded" });
-    }, this.#continuationQuiescenceMs);
-    quiescence.unref();
-    this.#continuationQuiescence = quiescence;
-  }
-
-  #clearContinuationQuiescence(): void {
-    if (!this.#continuationQuiescence) return;
-    clearTimeout(this.#continuationQuiescence);
-    this.#continuationQuiescence = null;
-  }
-
-  #observeRootOutput(active: ActiveTurn): void {
-    active.rootSegmentActive = true;
-    this.#clearContinuationQuiescence();
-  }
-
   #finish(active: ActiveTurn, outcome: TurnOutcome): void {
     if (this.#active !== active) return;
     this.#requestUsageBoundary += 1;
     this.#clearCancelEscalation();
-    if (active.cancellation) {
-      this.#clearCancellationQuiet(active.cancellation);
-      active.cancellation = null;
-    }
-    this.#clearContinuationQuiescence();
-    const hold =
-      outcome.status === "succeeded" && !active.cancellationRequested && this.#occupancy.unsettled;
     this.#closeActiveInteractions(
       active,
       outcome.status === "succeeded" ? "superseded" : "cancelled",
-      hold,
     );
     const itemOutcome: HostItemOutcome = outcome;
     if (active.compactionItem) this.#completeCompactionItem(active, itemOutcome);
     active.tools.finalize(active.command.turnId, itemOutcome);
     active.subagents.finalize(active.command.turnId, itemOutcome);
-    // Launched Workflow runs stay open on a held Turn; their agents report while it waits.
-    if (!hold) active.workflows.finalize(active.command.turnId, itemOutcome);
+    this.#workflows.finalize(active.command.turnId, itemOutcome);
     for (const messageId of [...active.reasoningItems.keys()]) {
       this.#completeReasoning(active, messageId, itemOutcome);
     }
     this.#completeAgentItem(active, itemOutcome, true);
-    if (hold) {
-      active.held = true;
-      active.compactionItem = null;
-      active.pendingSubagentTranscriptCalls.clear();
-      this.#transport?.setIdleLive(true);
-      this.#armContinuationQuiescence(active);
-      return;
-    }
-    if (outcome.status !== "succeeded") {
-      this.#interruptBackgroundSubagents(outcome.status === "cancelled" ? "interrupted" : "failed");
-    }
     const checkpoint = active.checkpointId
       ? nativeCheckpointRefSchema.parse({
           harnessId: this.harnessId,
@@ -2795,11 +2595,11 @@ class ClaudeHarnessSession implements HarnessSession {
       : null;
     // New Segments cannot confirm that earlier Turns have reached the transcript.
     // Only readSnapshot clears IDs after observing them all in native history.
-    if (active.userMessageId || active.checkpointId) {
+    if (active.nativeTurnRef || active.checkpointId) {
       this.#unpersistedMessageIds = [
         ...new Set([
           ...this.#unpersistedMessageIds,
-          ...(active.userMessageId ? [active.userMessageId] : []),
+          ...(active.nativeTurnRef ? [active.nativeTurnRef.nativeTurnKey] : []),
           ...(active.checkpointId ? [active.checkpointId] : []),
         ]),
       ];
@@ -2810,19 +2610,8 @@ class ClaudeHarnessSession implements HarnessSession {
       ...(active.nativeTurnRef ? { nativeTurnRef: active.nativeTurnRef } : {}),
       outcome: checkpoint ? { ...outcome, checkpoint } : outcome,
     });
-    this.#active = null;
-    this.#occupancy.clear();
-    this.#transport?.setIdleLive(false);
+    if (this.#execution) this.#execution.turn = null;
     active.resolveCompletion();
-  }
-
-  #handleTurnTransportFailure(active: ActiveTurn): void {
-    if (this.#active !== active) return;
-    if (active.cancellationRequested) {
-      this.#hardCancel(active);
-      return;
-    }
-    this.#fault(faultError());
   }
 
   #armCancelEscalation(active: ActiveTurn): void {
@@ -2855,7 +2644,10 @@ class ClaudeHarnessSession implements HarnessSession {
           if (this.#phase !== "open" || this.#active !== active) return;
           this.#transport = null;
           this.#openMode = "resume";
+          // Closing the native process ended every Workflow run it ran.
+          this.#workflows.abandon({ status: "cancelled", reason: "Cancelled by user" });
           this.#finish(active, { status: "cancelled", reason: "Cancelled by user" });
+          this.#execution = null;
         },
         () => this.#fault(faultError()),
       )
@@ -2874,8 +2666,19 @@ class ClaudeHarnessSession implements HarnessSession {
     this.#requestUsageBoundary += 1;
     this.#contextRefreshWake?.();
     this.#contextRefreshWake = null;
+    this.#workflows.abandon({ status: "failed", error });
     const active = this.#active;
     if (active) this.#finishFailed(active, error);
+    for (const input of this.#inputs.values()) {
+      if (input.kind === "turn")
+        this.#event({
+          type: "turn.completed",
+          turnId: input.command.turnId,
+          outcome: { status: "failed", error },
+        });
+    }
+    this.#inputs.clear();
+    this.#execution = null;
     this.#backgroundCommands.abandonAll("Claude Code Session faulted");
     this.#phase = "faulted";
     this.#event({ type: "session.faulted", error });
@@ -2966,7 +2769,6 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   });
   readonly #pendingSessions: ClaudePendingSessions;
   readonly #toolOutputLimit: number;
-  readonly #continuationQuiescenceMs: number;
   readonly #inspectionCache = new Map<string, HarnessInspection>();
   readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
   readonly #inspectors = new Set<ClaudeModelInspector>();
@@ -2989,14 +2791,6 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
     if (!Number.isSafeInteger(this.#toolOutputLimit) || this.#toolOutputLimit <= 0) {
       throw new RangeError("Claude Code Tool output limit must be a positive safe integer");
-    }
-    this.#continuationQuiescenceMs =
-      options.continuationQuiescenceMs ?? DEFAULT_CONTINUATION_QUIESCENCE_MS;
-    if (
-      !Number.isSafeInteger(this.#continuationQuiescenceMs) ||
-      this.#continuationQuiescenceMs <= 0
-    ) {
-      throw new RangeError("Claude Code continuation quiescence must be a positive safe integer");
     }
     this.#dependencies = dependencies ?? {
       randomUUID,
@@ -3410,7 +3204,6 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
         requestedThinkingOptionId,
         toolOutputLimit: this.#toolOutputLimit,
         cancelTimeoutMs: this.#cancelTimeoutMs,
-        continuationQuiescenceMs: this.#continuationQuiescenceMs,
       },
     );
     this.#sessions.add(session);

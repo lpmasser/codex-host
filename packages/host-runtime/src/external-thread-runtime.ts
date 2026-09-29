@@ -68,6 +68,8 @@ export interface ExternalThread {
   historyHydrated: boolean;
   running: boolean;
   activeTurnId: HostTurnId | null;
+  pendingTurnId: HostTurnId | null;
+  nativeActivity: "idle" | "running" | "requires_action" | null;
   // Terminal Turn projected by this process that is still the latest Turn
   // attempt; any later start clears it. A read may report it when native
   // history cannot be refreshed.
@@ -78,7 +80,7 @@ export interface ExternalThread {
   usageTurnId: HostTurnId | null;
   projectedTurns: Map<HostTurnId, { projector: CodexTurnProjector }>;
   responseGates: Map<HostTurnId, TurnProjectionGate>;
-  pendingSteerProjections: Set<Promise<void>>;
+  pendingSteerProjections: Map<Promise<void>, HostTurnId>;
   ephemeralTurnIds: Set<HostTurnId>;
   persistenceError: Error | null;
   ignoredInteractionIds: Set<HostInteractionId>;
@@ -402,12 +404,14 @@ export class ExternalThreadRuntime {
       historyHydrated: true,
       running,
       activeTurnId: null,
+      pendingTurnId: null,
+      nativeActivity: null,
       latestUsage: input.session.initialUsage,
       usageMeter: new UsageMeter(),
       usageTurnId: null,
       projectedTurns: new Map(),
       responseGates: new Map(),
-      pendingSteerProjections: new Set(),
+      pendingSteerProjections: new Map(),
       ephemeralTurnIds: new Set(),
       persistenceError: null,
       projectedTerminalTurnId: null,
@@ -571,14 +575,26 @@ export class ExternalThreadRuntime {
   }
 
   async refresh(thread: ExternalThread): Promise<ExternalThreadRpcError | null> {
+    // Live execution that changes after this request, including while it waits for recovery,
+    // may not be in native history yet; such a read must not replace it.
+    const active = thread.activeTurnId;
+    const pending = thread.pendingTurnId;
+    const terminal = thread.projectedTerminalTurnId;
+    const changed = () =>
+      active !== thread.activeTurnId ||
+      pending !== thread.pendingTurnId ||
+      terminal !== thread.projectedTerminalTurnId;
     try {
-      return await this.#withLifecycle(thread.id, () => this.#refresh(thread));
+      return await this.#withLifecycle(thread.id, () => this.#refresh(thread, changed));
     } catch (error) {
       return recoveryError(error);
     }
   }
 
-  async #refresh(thread: ExternalThread): Promise<ExternalThreadRpcError | null> {
+  async #refresh(
+    thread: ExternalThread,
+    changed: () => boolean,
+  ): Promise<ExternalThreadRpcError | null> {
     if (this.#threads.get(thread.id) !== thread) {
       return {
         code: -32076,
@@ -587,6 +603,10 @@ export class ExternalThreadRuntime {
     }
     const failure = this.idleRelease.failure(thread);
     if (failure) return { code: -32075, message: failure };
+    const superseded = {
+      code: -32072,
+      message: "External execution changed while reading history",
+    };
     if (thread.sessionUnavailable && this.#idleForRestore(thread)) {
       const revived = await this.#reviveIdleSession(thread);
       if (revived) return revived;
@@ -608,8 +628,10 @@ export class ExternalThreadRuntime {
         return mapExternalThreadHarnessError(snapshot.error, "read");
       }
     }
+    if (changed()) return superseded;
     try {
       const aligned = await this.#repository.alignSnapshot(thread.record, snapshot.value);
+      if (changed()) return superseded;
       thread.record = aligned.record;
       thread.turns = aligned.turns;
       thread.historyHydrated = true;

@@ -161,6 +161,7 @@ export class FakeHarnessSession implements HarnessSession {
   commands?: HarnessCommandCapability;
   readonly interactionResponses: InteractionRespondCommand[] = [];
   readonly steers: TurnSteerCommand[] = [];
+  steerInputProjection?: "adapter";
   readonly outputs: AsyncIterable<HarnessOutput>;
   snapshotReads = 0;
   usageRefreshes = 0;
@@ -257,6 +258,10 @@ export class FakeHarnessSession implements HarnessSession {
   setStateForSnapshot(state: HarnessSessionState): void {
     if (this.#closed) throw new Error("Fake Harness Session is closed");
     this.#state = cloneJson(state);
+  }
+
+  publishActivity(activity: "idle" | "running" | "requires_action"): void {
+    this.#event({ type: "session.activity.changed", activity });
   }
 
   publishEphemeralCommand(turnId: HostTurnId, item: HostItem): void {
@@ -481,7 +486,13 @@ export class FakeHarnessSession implements HarnessSession {
       this.#completeTurnDuringSteerAcceptance = false;
       this.succeedTurn();
     }
-    return { ok: true, value: { accepted: true } };
+    return {
+      ok: true,
+      value: {
+        accepted: true,
+        ...(this.steerInputProjection ? { inputProjection: this.steerInputProjection } : {}),
+      },
+    };
   }
 
   appendText(text: string): void {

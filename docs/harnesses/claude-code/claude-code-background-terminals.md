@@ -7,14 +7,14 @@ Claude 在 `run_in_background` 下启动 Bash 时，原生结果立即返回并�
 - Claude 的后台 Bash 产生一张命令卡片；其所在 Turn 正常结束，卡片保持 `inProgress`。
 - 运行中的输出尽力实时追加：原生只在给模型的结果文本里写出输出文件路径（"Output is being written to: …"），SDK 没有结构化字段或输出事件；取到路径就每秒读取新增内容，取不到就等结束时一次给出。
 - 任务结束时，卡片在原 Turn 上补发完成：成功、失败或已停止。最终输出读取原生 `task_notification` 结构化给出的输出文件，按适配器的工具输出上限截断；文件读不到时，卡片以 `Native output is unavailable.` 完成。
-- Claude 收到结束通知后常会自己接着处理（读输出、再调用工具、汇报结果）。这段续段在第一条 Root 输出时作为自主 Turn 出现，之后实时显示，Thread 显示为运行中，用户可以停止它。续段结束前发送的消息返回 `sessionBusy`，不会开始新的 Turn 并吞掉续段的剩余输出；续段还没有 Root 输出时发送的消息照常开始 Turn，由该 Turn 接手之后的原生输出。
+- Claude 收到结束通知后常会自己接着处理（读输出、再调用工具、汇报结果）。这段续段在第一条执行输出时作为自主 Turn 出现，之后实时显示，Thread 显示为运行中，用户可以停止它。原生执行段开始后、结束前（包括尚无输出时）发送的消息返回 `sessionBusy`，不会开始新的 Turn 并吞掉续段的输出；没有输出的成功空段不创建 Turn。
 
 ## 结算
 
 - 原生 `task_notification` 是后台任务唯一的终止信号（`stopTask` 之后也以 status 为 stopped 的通知收尾）。它由后台 Agent 与后台命令共用，且不带任务类型。现有的 `native-message.ts` 统一把它解析为带 `callId`（`tool_use_id`）的 `subagent.settled`，本功能只补上结构化的输出文件路径。
 - Session 在接收这一事件的唯一入口按 `callId` 分流：属于已登记的后台命令就完成该卡片，否则交给原有的 Subagent 处理。Subagent 逻辑不变。
 - 收到通知后保留跟踪直到卡片完成，但不再向该任务发送停止请求。若最终输出读取期间 Session 关闭或故障，先按已收到的原生结果完成卡片，再结束输出通道；未收到通知的卡片以取消完成。迟到的读取和重复通知不会重复完成卡片。
-- 顺序：没有请求 Turn 的原生 Segment 只在第一条 Root 输出之前暂存事件，之后按原生顺序实时交出。暂存期间，若还欠着同一 `callId` 的工具事件，结算就和它一起暂存（`canDeliverSettlementImmediately` 对 Subagent 创建事件已采用同一规则）。因此卡片登记总是先于它的结算。Segment 开始、后台任务集合与任务进度帧不算 Root 输出，不会单独开出 Turn。
+- 顺序：Transport 按原生顺序实时交出执行段事件；结算与后台任务集合属于 Session 级事件，不随执行段缓冲。登记卡片的 Bash 结果在同一原生流中先于它的通知，因此卡片登记总是先于它的结算。
 - 空闲释放与后台命令卡片无关：`hasBackgroundWork()` 直接反映 CLI 的原生活跃任务集合，任何原生后台任务都会阻止回收，因为关闭会话会停止它们。
 - Desktop 的"停止全部后台终端"（`thread/backgroundTerminals/clean`）并行停止各卡片对应的原生任务；每个停止请求与中断共用同一超时，超时作为停止失败返回（-32083）。
 

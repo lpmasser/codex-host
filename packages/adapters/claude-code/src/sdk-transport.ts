@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
 
 import {
   query,
@@ -41,22 +43,18 @@ import {
   claudeUltracodeActive,
   claudeUltracodeUnavailableReason,
 } from "./ultracode.js";
-import type {
-  ClaudeApprovalRequest,
-  ClaudeApprovalSuggestionScope,
-  ClaudeAutonomousTurnHandler,
-  ClaudeIdleTurnHandler,
-  ClaudeInteractionRequest,
-  ClaudeInteractionResponse,
-  ClaudeModelInspector,
-  ClaudePlanLimitEvent,
-  ClaudeQuestion,
-  ClaudeTransportContextUsage,
-  ClaudeTransportTurnResult,
-  ClaudeTurnEvent,
-  ClaudeTurnTransport,
+import {
+  type ClaudeApprovalRequest,
+  type ClaudeApprovalSuggestionScope,
+  type ClaudeSessionEvent,
+  type ClaudeInteractionRequest,
+  type ClaudeInteractionResponse,
+  type ClaudeModelInspector,
+  type ClaudePlanLimitEvent,
+  type ClaudeQuestion,
+  type ClaudeTransportContextUsage,
+  type ClaudeTurnTransport,
 } from "./transport.js";
-import { ClaudeSteerMissedTurnError } from "./transport.js";
 
 const CLIENT_APP = "codexhost-claude-code-adapter/0.0.0";
 // Claude Code hides generic SDK entrypoints from its native Session picker. Keep persisted
@@ -65,8 +63,8 @@ const SESSION_ENTRYPOINT = "codexhost-sdk";
 const APPROVAL_TITLE_MAX_LENGTH = 120;
 const APPROVAL_DESCRIPTION_MAX_LENGTH = 500;
 const DEFAULT_ABORT_TIMEOUT_MS = 2_000;
-/** Bounds the Workflow agent labels kept to name agent approvals. */
-const WORKFLOW_AGENT_LABEL_LIMIT = 1_000;
+/** Bounds the Workflow agents kept to name and own agent approvals. */
+const WORKFLOW_AGENT_LIMIT = 1_000;
 const INTERRUPT_TIMEOUT_MESSAGE = "Claude SDK interrupt timed out";
 
 class PushableInput<T> implements AsyncIterable<T> {
@@ -100,8 +98,9 @@ class PushableInput<T> implements AsyncIterable<T> {
 }
 
 interface PendingInteraction {
-  /** Raised by a native agent; it stays pending across the Root Segment terminal. */
-  agentScoped: boolean;
+  segment: NativeSegment | null;
+  /** The Workflow call whose agent raised the request; it owns the request like a parent call. */
+  workflowCallId?: string;
   controlRequestId: string;
   input: Record<string, unknown>;
   onAbort(): void;
@@ -112,21 +111,12 @@ interface PendingInteraction {
   toolUseId: string;
 }
 
-interface ActiveTurn {
+interface NativeSegment {
+  id: number;
   accumulator: ClaudeNativeTurnAccumulator;
-  onEvent(event: ClaudeTurnEvent): void;
-  resolve(result: ClaudeTransportTurnResult): void;
-  reject(error: unknown): void;
-}
-
-/** A native Segment that no requested Turn owns. */
-interface AutonomousSegment {
-  accumulator: ClaudeNativeTurnAccumulator;
-  /** Events held until the Segment starts its autonomous Turn. */
-  events: ClaudeTurnEvent[];
-  userMessageId: string | null;
-  /** The autonomous Turn has started; later events go to it as they arrive. */
-  live: boolean;
+  inputIds: string[];
+  tools: Map<string, boolean>;
+  started: boolean;
 }
 
 export interface ClaudeSdkTransportOptions {
@@ -379,84 +369,6 @@ function allowed(
   };
 }
 
-function canDeliverSettlementImmediately(
-  event: ClaudeTurnEvent,
-  pendingEvents: readonly ClaudeTurnEvent[],
-): boolean {
-  if (event.type !== "subagent.settled") return false;
-  // A notification without a continuation may never produce a Terminal. Deliver
-  // it now unless this batch still owes the task its creation/reactivation: a
-  // Subagent lifecycle, or the Tool result that moved a command to the background.
-  // Otherwise Host would discard the unknown task's terminal state and later
-  // replay its buffered lifecycle as running.
-  return !pendingEvents.some((pending) => {
-    if (pending.type === "tool.completed") {
-      return event.callId !== undefined && pending.callId === event.callId;
-    }
-    if (
-      pending.type === "workflow.started" ||
-      pending.type === "workflow.updated" ||
-      pending.type === "workflow.launched"
-    ) {
-      return (
-        (event.callId !== undefined && pending.callId === event.callId) ||
-        (pending.type !== "workflow.started" && pending.taskId === event.nativeSubagentId)
-      );
-    }
-    if (
-      pending.type !== "subagent.started" &&
-      pending.type !== "subagent.updated" &&
-      pending.type !== "subagent.completed"
-    ) {
-      return false;
-    }
-    return (
-      (event.callId !== undefined && pending.callId === event.callId) ||
-      pending.nativeSubagentId === event.nativeSubagentId
-    );
-  });
-}
-
-/**
- * Root output means Claude itself is answering, so its native Result will follow. Task frames,
- * settlements and live-task levels can arrive while no Root execution runs: an autonomous Turn
- * started on them could wait for a Result that never comes.
- */
-function isRootOutput(event: ClaudeTurnEvent): boolean {
-  switch (event.type) {
-    case "compaction.started":
-    case "compaction.completed":
-    case "text.delta":
-    case "reasoning.delta":
-    case "reasoning.completed":
-    case "message.completed":
-    case "tool.started":
-    case "tool.progress":
-    case "tool.completed":
-    case "subagent.started":
-    case "subagent.completed":
-    case "workflow.started":
-    case "workflow.launched":
-    case "interaction.requested":
-    case "interaction.closed":
-    case "usage.result":
-      return true;
-    case "usage.request":
-    case "segment.started":
-    case "subagents.live":
-    case "subagent.updated":
-    case "subagent.settled":
-    case "subagent.transcript.changed":
-    case "workflow.updated":
-    case "workflow.activity":
-      return false;
-    default:
-      // New event types must be classified above; at runtime an unknown one never starts a Turn.
-      event satisfies never;
-      return false;
-  }
-}
-
 export class ClaudeSdkTransport implements ClaudeTurnTransport {
   readonly sessionId: string;
   readonly #children: ChildProcessWithoutNullStreams[] = [];
@@ -477,20 +389,19 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   readonly #allowDangerouslySkipPermissions: boolean;
   readonly #queryFactory: typeof query;
   #thinkingOptionId: HarnessThinkingOptionId;
-  #active: ActiveTurn | null = null;
-  readonly #pendingSteers = new Map<
+  #segment: NativeSegment | null = null;
+  #segmentOrdinal = 0;
+  #canClearQueued = false;
+  #activity: "idle" | "running" | "requires_action" = "idle";
+  #eventHandler: ((event: ClaudeSessionEvent) => void | Promise<void>) | null = null;
+  readonly #pendingInputs = new Map<string, { resolve(): void; reject(error: Error): void }>();
+  readonly #controls = new Map<
     string,
-    { resolve(): void; reject(error: ClaudeSteerMissedTurnError): void }
+    { resolve(value: unknown): void; reject(error: Error): void }
   >();
-  #autonomous: AutonomousSegment | null = null;
-  #autonomousTurnHandler: ClaudeAutonomousTurnHandler | null = null;
-  #idleHandler: ClaudeIdleTurnHandler | null = null;
-  #threadEventHandler: ((event: ClaudeTurnEvent) => void) | null = null;
-  #idleLive = false;
-  #idleAccumulator: ClaudeNativeTurnAccumulator | null = null;
   readonly #interactions = new Map<string, PendingInteraction>();
   readonly #controlRequestIds = new Set<string>();
-  readonly #workflowAgentLabels = new Map<string, string>();
+  readonly #workflowAgents = new Map<string, { label: string; callId: string }>();
   #closePromise: Promise<void> | null = null;
   #consumeTask: Promise<void> | null = null;
   #stderrTail = "";
@@ -521,24 +432,38 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     this.#thinkingOptionId = parseClaudeThinkingOptionId(options.thinkingOptionId);
   }
 
-  setAutonomousTurnHandler(handler: ClaudeAutonomousTurnHandler): void {
-    this.#autonomousTurnHandler = handler;
+  setEventHandler(handler: (event: ClaudeSessionEvent) => void | Promise<void>): void {
+    this.#eventHandler = handler;
   }
 
-  setIdleTurnHandler(handler: ClaudeIdleTurnHandler | null): void {
-    this.#idleHandler = handler;
+  #emit(event: ClaudeSessionEvent): Promise<void> {
+    return Promise.resolve(this.#eventHandler?.(event));
   }
 
-  setThreadEventHandler(handler: ((event: ClaudeTurnEvent) => void) | null): void {
-    this.#threadEventHandler = handler;
+  #nativeSegment(): NativeSegment {
+    return (this.#segment ??= {
+      id: ++this.#segmentOrdinal,
+      accumulator: new ClaudeNativeTurnAccumulator(
+        this.#provider ? { provider: this.#provider } : {},
+      ),
+      inputIds: [],
+      tools: new Map(),
+      started: false,
+    });
   }
 
-  setIdleLive(live: boolean): void {
-    this.#idleLive = live;
-    if (live) return;
-    this.#idleAccumulator = null;
-    // The held Host Turn is over; agent approvals have no Turn left to answer them.
-    if (!this.#active) this.#closeInteractions("all", "cancelled");
+  async #startSegment(segment: NativeSegment): Promise<void> {
+    if (segment.started) return;
+    segment.started = true;
+    await this.#emit({
+      type: "segment.started",
+      segmentId: segment.id,
+      inputIds: [...segment.inputIds],
+    });
+  }
+
+  isRunning(): boolean {
+    return this.#activity !== "idle" || this.#segment?.started === true;
   }
 
   async start(): Promise<void> {
@@ -575,6 +500,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         forwardSubagentText: true,
         env: withNodeRuntimeOnPath({
           ...this.#environment,
+          CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
           CLAUDE_CODE_ENTRYPOINT: SESSION_ENTRYPOINT,
           CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
         }),
@@ -584,6 +510,13 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     this.#query = activeQuery;
     try {
       const initialization = await activeQuery.initializationResult();
+      const activity = (initialization as { session_state?: unknown }).session_state;
+      if (activity === "idle" || activity === "running" || activity === "requires_action") {
+        this.#activity = activity;
+        await this.#emit({ type: "activity.changed", activity });
+      } else {
+        throw new Error("Claude CLI does not report native Session activity");
+      }
       this.#slashCommands = parseClaudeSlashCommands(
         (initialization as { commands?: unknown }).commands,
       );
@@ -725,101 +658,76 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     this.#permissionMode = permissionMode;
   }
 
-  compact(
-    userMessageId: string,
-    customInstructions: string | undefined,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult> {
-    return this.runTurn(
-      customInstructions ? `/compact ${customInstructions}` : "/compact",
-      userMessageId,
-      onEvent,
-    );
-  }
-
-  init(
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult> {
-    return this.runTurn("/init", userMessageId, onEvent);
-  }
-
-  recap(
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult> {
-    return this.runTurn("/recap", userMessageId, onEvent);
-  }
-
-  runTurn(
-    text: string,
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult> {
+  submitInput(text: string, messageId: string, priority: "next" | "later"): Promise<void> {
     if (this.#closePromise || !this.#started || !this.#query) {
       return Promise.reject(new Error("Claude SDK transport is not started"));
     }
-    if (this.#active || this.#autonomous?.live) {
-      return Promise.reject(new Error("Claude SDK transport is busy"));
-    }
-    // A Segment without Root output has no Turn yet. The requested Turn takes over the native
-    // stream, so the events that Segment still holds must not reappear in a later Turn.
-    const unclaimed = this.#autonomous?.events ?? [];
-    this.#autonomous = null;
-    const promise = new Promise<ClaudeTransportTurnResult>((resolve, reject) => {
-      this.#active = {
-        accumulator: new ClaudeNativeTurnAccumulator(
-          this.#provider ? { provider: this.#provider } : {},
-        ),
-        onEvent,
-        resolve,
-        reject,
-      };
+    const timeout = rejectAfter(
+      10_000,
+      "Claude input acceptance could not be confirmed; it may still execute",
+    );
+    const accepted = new Promise<void>((resolve, reject) => {
+      this.#pendingInputs.set(messageId, { resolve, reject });
     });
-    for (const event of unclaimed) onEvent(event);
     this.#input.push({
       type: "user",
       message: { role: "user", content: text },
       parent_tool_use_id: null,
       session_id: this.sessionId,
-      uuid: userMessageId as `${string}-${string}-${string}-${string}-${string}`,
+      uuid: messageId as `${string}-${string}-${string}-${string}-${string}`,
       origin: { kind: "human" },
+      priority,
     });
-    return promise;
+    return Promise.race([accepted, timeout.promise]).finally(() => {
+      timeout.cancel();
+      this.#pendingInputs.delete(messageId);
+    });
   }
 
-  /**
-   * Claude accepts the input with `queued`; Claude Code 2.1.280 then emits `started` after the
-   * current tool call, when `priority: "next"` joins the running Turn. Waiting for `started` would
-   * hold the caller for a whole tool call.
-   */
-  steer(text: string, messageId: string): Promise<void> {
-    if (this.#closePromise || !this.#started || !this.#query || !this.#active) {
-      return Promise.reject(new ClaudeSteerMissedTurnError());
-    }
-    const promise = new Promise<void>((resolve, reject) => {
-      this.#pendingSteers.set(messageId, { resolve, reject });
+  async cancelInput(messageId: string): Promise<boolean> {
+    if (this.#closePromise) throw new Error("Claude SDK transport is closing");
+    const response = await this.#control({
+      subtype: "cancel_async_message",
+      message_uuid: messageId,
     });
-    try {
-      this.#input.push({
-        type: "user",
-        message: { role: "user", content: text },
-        parent_tool_use_id: null,
-        session_id: this.sessionId,
-        uuid: messageId as `${string}-${string}-${string}-${string}-${string}`,
-        origin: { kind: "human" },
-        priority: "next",
-      });
-    } catch {
-      this.#pendingSteers.delete(messageId);
-      return Promise.reject(new ClaudeSteerMissedTurnError());
+    if (!isRecord(response) || typeof response.cancelled !== "boolean") {
+      throw new Error("Claude returned an invalid input cancellation receipt");
     }
-    return promise;
+    return response.cancelled;
+  }
+
+  /** The SDK owns ordinary RPCs; this narrowly owns the missing native queue operation. */
+  #control(
+    request:
+      | { subtype: "cancel_async_message"; message_uuid: string }
+      | { subtype: "interrupt"; cancel_queued: true },
+  ): Promise<unknown> {
+    const child = this.#children[0];
+    if (!child || !this.#query)
+      return Promise.reject(new Error("Claude SDK transport is not running"));
+    const requestId = `codexhost-control-${randomUUID()}`;
+    const timeout = rejectAfter(
+      this.#abortTimeoutMs,
+      "Claude input cancellation was not confirmed",
+    );
+    const response = new Promise<unknown>((resolve, reject) => {
+      this.#controls.set(requestId, { resolve, reject });
+      child.stdin.write(
+        JSON.stringify({ type: "control_request", request_id: requestId, request }) + "\n",
+        (error) => {
+          if (error) reject(error);
+        },
+      );
+    });
+    return Promise.race([response, timeout.promise]).finally(() => {
+      timeout.cancel();
+      this.#controls.delete(requestId);
+    });
   }
 
   respondToInteraction(response: ClaudeInteractionResponse): Promise<void> {
     const pending = this.#interactions.get(response.requestId);
-    if (!pending) {
+    if (!pending?.segment) {
       return Promise.reject(new Error("Claude SDK Interaction is not pending"));
     }
     if (response.type === "approval") {
@@ -887,36 +795,27 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     return Promise.resolve();
   }
 
-  async abort(): Promise<void> {
-    const accumulator =
-      this.#active?.accumulator ?? (this.#autonomous?.live ? this.#autonomous.accumulator : null);
+  async abort(segmentId: number): Promise<{ stillQueued: string[] | null }> {
+    const segment = this.#segment;
     const activeQuery = this.#query;
-    if (!accumulator || !activeQuery) throw new Error("Claude SDK transport has no active Turn");
-    accumulator.requestCancel();
+    if (!segment?.started || segment.id !== segmentId || !activeQuery) {
+      throw new Error("Claude SDK transport has no matching execution");
+    }
+    segment.accumulator.requestCancel();
+    const timeout = rejectAfter(this.#abortTimeoutMs, INTERRUPT_TIMEOUT_MESSAGE);
     try {
-      await this.#stopRequest(activeQuery.interrupt(), INTERRUPT_TIMEOUT_MESSAGE);
+      const receipt = await Promise.race([activeQuery.interrupt(), timeout.promise]);
+      return { stillQueued: receipt?.still_queued ?? null };
     } catch (error) {
       await this.close();
       throw error instanceof Error ? error : new Error(INTERRUPT_TIMEOUT_MESSAGE);
+    } finally {
+      timeout.cancel();
     }
   }
 
-  async abortContinuation(): Promise<void> {
-    if (this.#active) return this.abort();
-    const activeQuery = this.#query;
-    if (!activeQuery) throw new Error("Claude SDK transport is not running");
-    this.#idleAccumulator?.requestCancel();
-    try {
-      await this.#stopRequest(activeQuery.interrupt(), INTERRUPT_TIMEOUT_MESSAGE);
-    } catch (error) {
-      await this.close();
-      throw error instanceof Error ? error : new Error(INTERRUPT_TIMEOUT_MESSAGE);
-    }
-  }
-
-  /** A user stop must answer: native stop requests share the abort timeout. */
-  async #stopRequest(request: Promise<unknown>, timeoutMessage: string): Promise<void> {
-    const timeout = rejectAfter(this.#abortTimeoutMs, timeoutMessage);
+  async #stopRequest(request: Promise<unknown>, message: string): Promise<void> {
+    const timeout = rejectAfter(this.#abortTimeoutMs, message);
     try {
       await Promise.race([request, timeout.promise]);
     } finally {
@@ -929,15 +828,40 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     return this.#closePromise;
   }
 
+  /**
+   * The call that owns a request: its own Tool call when this Segment saw it, else the Workflow
+   * call of the agent asking. Undefined while this Segment has not seen the owner yet.
+   */
+  #interactionOwner(pending: PendingInteraction, segment: NativeSegment): string | undefined {
+    if (segment.tools.has(pending.toolUseId)) return pending.toolUseId;
+    return pending.workflowCallId;
+  }
+
+  #routeInteraction(pending: PendingInteraction, segment: NativeSegment, owner: string): void {
+    if (segment.tools.get(owner)) {
+      pending.segment = segment;
+      void this.#emit({
+        type: "segment.event",
+        segmentId: segment.id,
+        event: { type: "interaction.requested", request: pending.request },
+      }).catch(this.#onFault);
+    } else {
+      this.#settleInteraction(
+        pending,
+        denied(pending.toolUseId, "Claude Tool has no live parent execution"),
+        "cancelled",
+      );
+    }
+  }
+
   #canUseTool(
     toolName: string,
     input: Record<string, unknown>,
     options: Parameters<CanUseTool>[2],
   ): Promise<PermissionResult> {
-    const sink = this.#interactionSink();
     const validToolName = boundedDisplayText(toolName, APPROVAL_TITLE_MAX_LENGTH);
     if (
-      !sink ||
+      this.#closePromise ||
       !validToolName ||
       typeof options.requestId !== "string" ||
       options.requestId.length === 0 ||
@@ -951,9 +875,9 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       );
     }
 
-    const agentId =
+    const workflowAgent =
       typeof options.agentID === "string" && options.agentID.length > 0
-        ? options.agentID
+        ? this.#workflowAgents.get(options.agentID)
         : undefined;
     this.#interactionOrdinal += 1;
     const requestId = `claude-${toolName === "AskUserQuestion" ? "question" : "approval"}-${this.#interactionOrdinal}`;
@@ -968,12 +892,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         plan: typeof input.plan === "string" && input.plan.trim().length > 0 ? input.plan : null,
       };
     } else {
-      request = parseApprovalRequest(
-        requestId,
-        toolName,
-        options,
-        agentId ? this.#workflowAgentLabels.get(agentId) : undefined,
-      );
+      request = parseApprovalRequest(requestId, toolName, options, workflowAgent?.label);
     }
     if (!request) {
       return Promise.resolve(
@@ -983,7 +902,8 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
 
     return new Promise<PermissionResult>((resolve) => {
       const pending: PendingInteraction = {
-        agentScoped: agentId !== undefined,
+        segment: null,
+        ...(workflowAgent ? { workflowCallId: workflowAgent.callId } : {}),
         controlRequestId: options.requestId,
         input,
         request,
@@ -1009,24 +929,10 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       this.#interactions.set(request.requestId, pending);
       this.#controlRequestIds.add(options.requestId);
       options.signal.addEventListener("abort", pending.onAbort, { once: true });
-      sink({
-        type: "interaction.requested",
-        request,
-        ...(pending.agentScoped ? { agentScoped: true } : {}),
-      });
+      const segment = this.#segment;
+      const owner = segment ? this.#interactionOwner(pending, segment) : undefined;
+      if (segment && owner !== undefined) this.#routeInteraction(pending, segment, owner);
     });
-  }
-
-  /**
-   * Where Interaction lifecycle events go: the active Turn, else the held Turn's idle
-   * Segments. Without either there is no Host Turn that could answer a request.
-   */
-  #interactionSink(): ((event: ClaudeTurnEvent) => void) | null {
-    const active = this.#active;
-    if (active) return (event) => active.onEvent(event);
-    const idle = this.#idleHandler;
-    if (this.#idleLive && idle) return (event) => idle.onEvent(event);
-    return null;
   }
 
   #settleInteraction(
@@ -1037,18 +943,18 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     if (!this.#interactions.delete(pending.request.requestId)) return;
     this.#controlRequestIds.delete(pending.controlRequestId);
     pending.signal.removeEventListener("abort", pending.onAbort);
-    this.#interactionSink()?.({
-      type: "interaction.closed",
-      requestId: pending.request.requestId,
-      reason,
-    });
+    if (pending.segment)
+      void this.#emit({
+        type: "segment.event",
+        segmentId: pending.segment.id,
+        event: { type: "interaction.closed", requestId: pending.request.requestId, reason },
+      }).catch(this.#onFault);
     pending.resolve(result);
   }
 
-  /** A Root terminal settles Root requests; agent requests stay while their agent runs. */
-  #closeInteractions(scope: "root" | "all", reason: "cancelled" | "superseded"): void {
+  #closeInteractions(segment: NativeSegment | null, reason: "cancelled" | "superseded"): void {
     for (const pending of [...this.#interactions.values()]) {
-      if (scope === "root" && pending.agentScoped) continue;
+      if (segment && pending.segment !== segment) continue;
       this.#settleInteraction(
         pending,
         denied(
@@ -1063,9 +969,21 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   async #close(): Promise<void> {
-    this.#rejectPendingSteers();
+    this.#rejectPendingInputs();
     const failures: unknown[] = [];
-    this.#closeInteractions("all", "cancelled");
+    this.#closeInteractions(null, "cancelled");
+    if (
+      this.#canClearQueued &&
+      this.#query &&
+      this.#children[0] &&
+      !processExited(this.#children[0])
+    ) {
+      try {
+        await this.#control({ subtype: "interrupt", cancel_queued: true });
+      } catch (error) {
+        failures.push(error);
+      }
+    }
     try {
       const timeout = rejectAfter(this.#closeTimeoutMs, "Claude background tasks did not stop");
       try {
@@ -1117,12 +1035,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       drainTimeout.cancel();
     }
     this.#query = null;
-    const active = this.#active;
-    this.#active = null;
-    this.#autonomous = null;
-    this.#idleAccumulator = null;
-    this.#idleLive = false;
-    active?.reject(new Error("Claude SDK transport closed"));
+    this.#segment = null;
     if (failures.length > 0)
       throw new AggregateError(failures, "Claude SDK shutdown could not be confirmed");
   }
@@ -1180,28 +1093,35 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     }
   }
 
-  #rejectPendingSteers(): void {
-    const pending = [...this.#pendingSteers.values()];
-    this.#pendingSteers.clear();
-    const error = new ClaudeSteerMissedTurnError();
-    for (const entry of pending) entry.reject(error);
+  #rejectPendingInputs(): void {
+    const error = new Error("Claude SDK transport closed before input acceptance was confirmed");
+    for (const pending of this.#pendingInputs.values()) pending.reject(error);
+    this.#pendingInputs.clear();
+    for (const pending of this.#controls.values()) pending.reject(error);
+    this.#controls.clear();
   }
 
-  /** `queued` is Claude's acceptance of this message into the running Session. */
-  #observeSteer(message: unknown): void {
+  async #observeInputLifecycle(message: unknown): Promise<void> {
     if (
-      this.#pendingSteers.size === 0 ||
       !isRecord(message) ||
-      message.type !== "command_lifecycle"
-    ) {
+      message.type !== "command_lifecycle" ||
+      typeof message.command_uuid !== "string"
+    )
       return;
+    const messageId = message.command_uuid;
+    if (message.state === "queued") {
+      this.#pendingInputs.get(messageId)?.resolve();
+    } else if (message.state === "started") {
+      const segment = this.#nativeSegment();
+      segment.inputIds.push(messageId);
+      if (segment.started)
+        await this.#emit({ type: "input.started", segmentId: segment.id, messageId });
+    } else if (message.state === "cancelled") {
+      this.#pendingInputs
+        .get(messageId)
+        ?.reject(new Error("Claude input was cancelled before acceptance"));
+      await this.#emit({ type: "input.cancelled", messageId });
     }
-    if (message.state !== "queued") return;
-    if (typeof message.command_uuid !== "string" || message.command_uuid.length === 0) return;
-    const pending = this.#pendingSteers.get(message.command_uuid);
-    if (!pending) return;
-    this.#pendingSteers.delete(message.command_uuid);
-    pending.resolve();
   }
 
   #observeBackgroundTasks(message: unknown): void {
@@ -1223,28 +1143,29 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     }
   }
 
-  /** Starts the Segment's autonomous Turn and releases the events it held, in native order. */
-  #startAutonomousTurn(autonomous: AutonomousSegment, handler: ClaudeAutonomousTurnHandler): void {
-    autonomous.live = true;
-    handler.start(autonomous.userMessageId ?? `autonomous-${Date.now()}`, autonomous.userMessageId);
-    for (const event of autonomous.events.splice(0)) handler.onEvent(event);
-  }
-
-  /** Remembers Workflow agent labels so their approvals can name the agent asking. */
+  /** Remembers Workflow agents so their approvals name the agent and reach the run's owner. */
   #observeWorkflowAgents(message: unknown): void {
-    if (!isRecord(message) || message.type !== "system" || message.subtype !== "task_progress") {
+    if (
+      !isRecord(message) ||
+      message.type !== "system" ||
+      message.subtype !== "task_progress" ||
+      typeof message.tool_use_id !== "string"
+    ) {
       return;
     }
     for (const agent of parseClaudeWorkflowAgents(message.workflow_progress) ?? []) {
       if (!agent.agentId) continue;
       if (
-        !this.#workflowAgentLabels.has(agent.agentId) &&
-        this.#workflowAgentLabels.size >= WORKFLOW_AGENT_LABEL_LIMIT
+        !this.#workflowAgents.has(agent.agentId) &&
+        this.#workflowAgents.size >= WORKFLOW_AGENT_LIMIT
       ) {
-        const oldest = this.#workflowAgentLabels.keys().next();
-        if (!oldest.done) this.#workflowAgentLabels.delete(oldest.value);
+        const oldest = this.#workflowAgents.keys().next();
+        if (!oldest.done) this.#workflowAgents.delete(oldest.value);
       }
-      this.#workflowAgentLabels.set(agent.agentId, agent.label);
+      this.#workflowAgents.set(agent.agentId, {
+        label: agent.label,
+        callId: message.tool_use_id,
+      });
     }
   }
 
@@ -1259,86 +1180,90 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           this.#permissionMode = permissionMode;
           this.#onPermissionModeChanged(permissionMode);
         }
+        if (
+          message.type === "system" &&
+          message.subtype === "init" &&
+          !("parent_tool_use_id" in message && message.parent_tool_use_id)
+        ) {
+          if (!message.capabilities?.includes("msg_lifecycle_v1"))
+            throw new Error("Claude CLI does not support input lifecycle events");
+          this.#canClearQueued = message.capabilities.includes("interrupt_cancel_queued_v1");
+        }
         const planLimit = parseClaudePlanLimitEvent(message);
         if (planLimit) this.#onPlanLimit(planLimit);
-        this.#observeSteer(message);
-        const active = this.#active;
-        if (active) {
-          const interpreted = active.accumulator.consume(message);
-          for (const event of interpreted.events) active.onEvent(event);
-          if (interpreted.terminal) {
-            this.#closeInteractions("root", "superseded");
-            this.#rejectPendingSteers();
-            this.#active = null;
-            active.resolve(interpreted.terminal);
-          }
+        if (message.type === "system" && message.subtype === "session_state_changed") {
+          this.#activity = message.state;
+          await this.#emit({ type: "activity.changed", activity: message.state });
           continue;
         }
-        if (this.#idleLive && this.#idleHandler) {
-          const idle =
-            this.#idleAccumulator ??
-            (this.#idleAccumulator = new ClaudeNativeTurnAccumulator(
-              this.#provider ? { provider: this.#provider } : {},
-            ));
-          const interpreted = idle.consume(message);
-          for (const event of interpreted.events) this.#idleHandler.onEvent(event);
-          if (interpreted.terminal) {
-            this.#closeInteractions("root", "superseded");
-            this.#idleAccumulator = null;
-            this.#idleHandler.onTerminal(interpreted.terminal);
+        await this.#observeInputLifecycle(message);
+        const segment = this.#nativeSegment();
+        if (message.type === "assistant" && typeof message.parent_tool_use_id === "string") {
+          const parent = segment.tools.get(message.parent_tool_use_id) === true;
+          for (const block of message.message.content) {
+            if (block.type === "tool_use") segment.tools.set(block.id, parent);
           }
-          continue;
         }
-        const handler = this.#autonomousTurnHandler;
-        if (!handler) continue;
-        const autonomous =
-          this.#autonomous ??
-          (this.#autonomous = {
-            accumulator: new ClaudeNativeTurnAccumulator(
-              this.#provider ? { provider: this.#provider } : {},
-            ),
-            events: [],
-            userMessageId: null,
-            live: false,
-          });
-        if (
-          autonomous.userMessageId === null &&
-          isRecord(message) &&
-          message.type === "user" &&
-          (message.parent_tool_use_id === null || message.parent_tool_use_id === undefined) &&
-          typeof message.uuid === "string" &&
-          message.uuid.length > 0
-        ) {
-          autonomous.userMessageId = message.uuid;
-        }
-        const interpreted = autonomous.accumulator.consume(message);
+        const interpreted = segment.accumulator.consume(message);
         for (const event of interpreted.events) {
-          if (autonomous.live) {
-            handler.onEvent(event);
-          } else if (
-            this.#threadEventHandler &&
-            canDeliverSettlementImmediately(event, autonomous.events)
+          // Task levels, settlements, Workflow run progress and model request usage belong to
+          // the Session, not a Segment: a launched run keeps reporting after its Root Segment.
+          if (
+            event.type === "subagents.live" ||
+            event.type === "subagent.settled" ||
+            event.type === "workflow.updated" ||
+            event.type === "workflow.activity" ||
+            event.type === "usage.request"
           ) {
-            this.#threadEventHandler(event);
-          } else {
-            autonomous.events.push(event);
-            if (isRootOutput(event)) this.#startAutonomousTurn(autonomous, handler);
+            await this.#emit({ type: "thread.event", event });
+            continue;
           }
+          if (event.type === "segment.started") {
+            await this.#startSegment(segment);
+            continue;
+          }
+          if (event.type !== "usage.result") await this.#startSegment(segment);
+          if (
+            event.type === "tool.started" ||
+            event.type === "subagent.started" ||
+            event.type === "workflow.started"
+          )
+            segment.tools.set(event.callId, true);
+          if (segment.started)
+            await this.#emit({ type: "segment.event", segmentId: segment.id, event });
+          if (event.type === "tool.completed") segment.tools.delete(event.callId);
+        }
+        for (const pending of this.#interactions.values()) {
+          const owner = pending.segment ? undefined : this.#interactionOwner(pending, segment);
+          if (owner !== undefined) this.#routeInteraction(pending, segment, owner);
+        }
+        if (
+          message.type === "user" &&
+          message.parent_tool_use_id &&
+          Array.isArray(message.message.content)
+        ) {
+          for (const block of message.message.content)
+            if (block.type === "tool_result") segment.tools.delete(block.tool_use_id);
         }
         if (interpreted.terminal) {
-          // Clear first: settling the Turn may hold it and switch this stream to idle-live.
-          this.#autonomous = null;
-          if (!autonomous.live) this.#startAutonomousTurn(autonomous, handler);
-          handler.onTerminal(interpreted.terminal);
+          this.#closeInteractions(segment, "superseded");
+          // A failed native result without any preceding output must still be visible.
+          if (!segment.started && interpreted.terminal.status !== "succeeded")
+            await this.#startSegment(segment);
+          if (segment.started)
+            await this.#emit({
+              type: "segment.completed",
+              segmentId: segment.id,
+              result: interpreted.terminal,
+            });
+          this.#segment = null;
         }
       }
       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
     } catch (error) {
-      const active = this.#active;
-      this.#closeInteractions("all", "cancelled");
-      this.#rejectPendingSteers();
-      this.#active = null;
-      active?.reject(error);
+      this.#closeInteractions(null, "cancelled");
+      this.#rejectPendingInputs();
+      this.#segment = null;
       if (!this.#closePromise) this.#onFault(error);
     }
   }
@@ -1354,6 +1279,31 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     });
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
+    });
+    const lines = createInterface({ input: child.stdout });
+    lines.on("line", (line) => {
+      if (!line.includes("codexhost-control-") || !line.includes("control_response")) return;
+      let value: unknown;
+      try {
+        value = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (!isRecord(value) || value.type !== "control_response" || !isRecord(value.response))
+        return;
+      const response = value.response;
+      if (typeof response.request_id !== "string") return;
+      const pending = this.#controls.get(response.request_id);
+      if (!pending) return;
+      if (response.subtype === "success") pending.resolve(response.response);
+      else
+        pending.reject(
+          new Error(
+            typeof response.error === "string"
+              ? response.error
+              : "Claude input cancellation failed",
+          ),
+        );
     });
     this.#children.push(child);
     return child;

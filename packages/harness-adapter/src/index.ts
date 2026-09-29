@@ -99,6 +99,7 @@ export type {
   RollbackLastTurnSessionInput,
   SessionFaultedEvent,
   SessionStateChangedEvent,
+  SessionActivityChangedEvent,
   SessionUsageChangedEvent,
   SubagentStateChangedEvent,
   UsageHistoryEvent,

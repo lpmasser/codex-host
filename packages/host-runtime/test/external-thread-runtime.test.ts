@@ -12,6 +12,7 @@ import {
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostThreadIdSchema,
+  hostTurnIdSchema,
   nativeSessionRefSchema,
 } from "@codexhost/shared-contracts";
 import {
@@ -803,7 +804,48 @@ describe("ExternalThreadRuntime unavailable Session recovery", () => {
     const listed = runtime.idleRelease.list().find((row) => row.threadId === hostThreadId);
     expect(listed?.reason).not.toBe("persistence");
     expect(listed?.state).not.toBe("blocked");
+    await adapter.close();
+  });
+});
 
+describe("External history refresh ownership", () => {
+  it.each(["read", "align"])("preserves live completion during asynchronous %s", async (phase) => {
+    const adapter = new FakeHarnessAdapter(harnessId);
+    const opened = await adapter.open({ kind: "create", cwd: "/synthetic" });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const gate = Promise.withResolvers<undefined>();
+    const read = opened.value.readSnapshot.bind(opened.value);
+    vi.spyOn(opened.value, "readSnapshot").mockImplementation(async () => {
+      if (phase === "read") await gate.promise;
+      return read();
+    });
+    const alignSnapshot = vi.fn(async () => {
+      if (phase === "align") await gate.promise;
+      return { record: record(), turns: [] };
+    });
+    const runtime = new ExternalThreadRuntime({
+      adapters: new Map([["pi", adapter]]),
+      repository: { alignSnapshot } as unknown as ExternalThreadRepository,
+      consumeOutputs: async () => undefined,
+      diagnose: () => undefined,
+    });
+    const thread = runtime.register({
+      record: record(),
+      session: opened.value,
+      sessionId: hostThreadId,
+      thread: { id: hostThreadId },
+      turns: [],
+    });
+    const refreshing = runtime.refresh(thread);
+    if (phase === "align") await vi.waitFor(() => expect(alignSnapshot).toHaveBeenCalledOnce());
+    thread.projectedTerminalTurnId = hostTurnIdSchema.parse("new-terminal");
+    thread.turns = [{ id: "new-terminal", items: [] }];
+    thread.historyHydrated = false;
+    gate.resolve(undefined);
+    expect(await refreshing).toMatchObject({ code: -32072 });
+    expect(thread.turns).toEqual([{ id: "new-terminal", items: [] }]);
+    expect(thread.historyHydrated).toBe(false);
+    if (phase === "read") expect(alignSnapshot).not.toHaveBeenCalled();
     await adapter.close();
   });
 });

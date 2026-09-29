@@ -5,6 +5,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 export class FakeQuery {
   readonly accountInfo = vi.fn(async () => ({ apiProvider: "firstParty" as const }));
   readonly initializationResult = vi.fn(async () => ({
+    session_state: "idle",
     models: [
       {
         value: "default",
@@ -56,6 +57,12 @@ export class FakeQuery {
   }
 
   push(message: SDKMessage): void {
+    if (
+      message.type === "system" &&
+      message.subtype === "init" &&
+      message.capabilities === undefined
+    )
+      message.capabilities = ["msg_lifecycle_v1"];
     const waiter = this.#waiters.shift();
     if (waiter) waiter({ done: false, value: message });
     else this.#messages.push(message);
