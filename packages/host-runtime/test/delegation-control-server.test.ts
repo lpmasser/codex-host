@@ -161,7 +161,7 @@ describe("delegation control server", () => {
         authorized({
           threadId: "thread-1",
           interactionId: "interaction-1",
-          answers: { decision: ["continue"] },
+          result: { answers: { decision: { answers: ["continue"] } } },
         }),
       );
       expect(send).toHaveBeenCalledWith({ threadId: "thread-1", message: "continue" });
@@ -169,7 +169,7 @@ describe("delegation control server", () => {
       expect(answer).toHaveBeenCalledWith({
         threadId: "thread-1",
         interactionId: "interaction-1",
-        answers: { decision: ["continue"] },
+        result: { answers: { decision: { answers: ["continue"] } } },
       });
       await expect(answered.json()).resolves.toMatchObject({
         interactionId: "interaction-1",
