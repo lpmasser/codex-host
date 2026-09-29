@@ -614,7 +614,12 @@ describe("delegation CLI", () => {
   it("answers a pending Question from an answers file", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "codexhost-cli-answers-"));
     const answersFile = path.join(directory, "answers.json");
-    await writeFile(answersFile, JSON.stringify({ decision: ["continue"], note: ["typed"] }));
+    await writeFile(
+      answersFile,
+      JSON.stringify({
+        answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } },
+      }),
+    );
     const fetchImpl = successfulFetch({
       threadId: "child",
       interactionId: "interaction-1",
@@ -651,7 +656,7 @@ describe("delegation CLI", () => {
       expect(JSON.parse(String(init?.body))).toEqual({
         threadId: "child",
         interactionId: "interaction-1",
-        answers: { decision: ["continue"], note: ["typed"] },
+        result: { answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } } },
       });
       expect(JSON.parse(outputText(output))).toEqual({
         thread: "codex://threads/child",
@@ -673,7 +678,7 @@ describe("delegation CLI", () => {
     };
     const fetchImpl = successfulFetch({});
     try {
-      for (const content of ["not json", "[]", JSON.stringify({ decision: "continue" })]) {
+      for (const content of ["not json"]) {
         const file = path.join(
           directory,
           `${Buffer.from(content).toString("hex").slice(0, 12)}.json`,
@@ -697,14 +702,16 @@ describe("delegation CLI", () => {
           }),
         ).toBe(1);
       }
-      // An optional answer may be empty and every Question may be skipped: the
-      // Host owns required answers, option membership, and cardinality.
-      for (const answers of [{ decision: [] }, {}]) {
+      // The CLI passes the existing reply result through, including native extensions.
+      for (const result of [
+        { answers: { decision: { answers: ["Continue"] } }, nativeExtension: true },
+        { answers: {} },
+      ]) {
         const file = path.join(
           directory,
-          `${Buffer.from(JSON.stringify(answers)).toString("hex")}.json`,
+          `${Buffer.from(JSON.stringify(result)).toString("hex")}.json`,
         );
-        await writeFile(file, JSON.stringify(answers));
+        await writeFile(file, JSON.stringify(result));
         expect(
           await runDelegationCli({
             arguments: [
@@ -723,7 +730,7 @@ describe("delegation CLI", () => {
           }),
         ).toBe(0);
         const [, init] = vi.mocked(fetchImpl).mock.calls.at(-1) ?? [];
-        expect(JSON.parse(String(init?.body))).toMatchObject({ answers });
+        expect(JSON.parse(String(init?.body))).toMatchObject({ result });
       }
       expect(
         await runDelegationCli({
@@ -748,7 +755,7 @@ describe("delegation CLI", () => {
       });
       const diagnosticOutput = new PassThrough();
       const file = path.join(directory, "valid.json");
-      await writeFile(file, JSON.stringify({ decision: ["continue"] }));
+      await writeFile(file, JSON.stringify({ answers: { decision: { answers: ["Continue"] } } }));
       expect(
         await runDelegationCli({
           arguments: [
