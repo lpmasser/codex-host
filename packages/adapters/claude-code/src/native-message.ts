@@ -599,7 +599,7 @@ export class ClaudeNativeTurnAccumulator {
    * background tasks as a level whose membership replaces the previous set.
    */
   #consumeSegmentLevel(message: Record<string, unknown>, events: ClaudeNativeEvent[]): void {
-    if (message.type !== "system") return;
+    if (message.type !== "system" || parentToolUseId(message) !== null) return;
     if (message.subtype === "init") {
       events.push({ type: "segment.started" });
       return;

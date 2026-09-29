@@ -3701,7 +3701,7 @@ export class AppServerHost {
     };
     const gate = turnProjectionGate();
     thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.pendingTurnId = turnId;
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
@@ -3723,8 +3723,10 @@ export class AppServerHost {
       return { turnId: result.value.turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.pendingTurnId = null;
+      thread.running =
+        thread.activeTurnId !== null ||
+        (thread.nativeActivity !== null && thread.nativeActivity !== "idle");
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       thread.ephemeralTurnIds.delete(turnId);
@@ -4618,7 +4620,7 @@ export class AppServerHost {
       }),
     };
     thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.pendingTurnId = turnId;
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, {
@@ -4631,8 +4633,10 @@ export class AppServerHost {
       input: [{ type: "text", text }],
     });
     if (!result.ok) {
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.pendingTurnId = null;
+      thread.running =
+        thread.activeTurnId !== null ||
+        (thread.nativeActivity !== null && thread.nativeActivity !== "idle");
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       this.#signalActiveWorkChanged();
@@ -4769,15 +4773,22 @@ export class AppServerHost {
       },
     ];
     const projectionDone = Promise.withResolvers<undefined>();
-    thread.pendingSteerProjections.add(projectionDone.promise);
+    thread.pendingSteerProjections.set(projectionDone.promise, input.turnId);
     try {
       const result = await thread.session.execute({
         type: "turn.steer",
         turnId: input.turnId,
         input: steered,
+        ...(input.clientUserMessageId ? { clientUserMessageId: input.clientUserMessageId } : {}),
       });
       if (!result.ok) throw new ExternalSteerError(-32074, result.error.message);
       thread.steeredTurnIds.add(input.turnId);
+      if (result.value.inputProjection === "adapter") {
+        return {
+          turnId: input.turnId,
+          gate: { promise: Promise.resolve(), resolve: () => undefined },
+        };
+      }
       const item = {
         type: "userMessage" as const,
         itemId: hostItemIdSchema.parse(randomUUID()),
@@ -4917,7 +4928,7 @@ export class AppServerHost {
     };
     const gate = turnProjectionGate();
     thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.pendingTurnId = turnId;
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
@@ -4936,8 +4947,10 @@ export class AppServerHost {
       return { turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.pendingTurnId = null;
+      thread.running =
+        thread.activeTurnId !== null ||
+        (thread.nativeActivity !== null && thread.nativeActivity !== "idle");
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       gate.resolve();
@@ -4988,14 +5001,14 @@ export class AppServerHost {
     if (
       typeof requestedTurnId !== "string" ||
       !thread.running ||
-      thread.activeTurnId !== requestedTurnId
+      (thread.activeTurnId !== requestedTurnId && thread.pendingTurnId !== requestedTurnId)
     ) {
       await this.#writer.json(
         rpcError(request, -32074, "External turn/interrupt must reference the active Turn"),
       );
       return;
     }
-    const turnId = thread.activeTurnId;
+    const turnId = hostTurnIdSchema.parse(requestedTurnId);
     const cancellationGate = turnProjectionGate();
     const gate: TurnProjectionGate = {
       promise: Promise.all([
@@ -5099,6 +5112,19 @@ export class AppServerHost {
         },
       };
     }
+    if (event.type === "session.activity.changed") {
+      thread.nativeActivity = event.activity;
+      thread.running =
+        event.activity !== "idle" || thread.activeTurnId !== null || thread.pendingTurnId !== null;
+      await this.#setThreadStatus(
+        thread,
+        thread.running || this.#hasRunningSubagents(thread.id)
+          ? { type: "active", activeFlags: [] }
+          : { type: "idle" },
+      );
+      this.#signalActiveWorkChanged();
+      return;
+    }
     if (event.type === "session.state.changed") {
       try {
         if (event.state.nativeRef) {
@@ -5193,6 +5219,15 @@ export class AppServerHost {
       return;
     }
     if (event.type === "session.faulted") {
+      thread.nativeActivity = null;
+      thread.running = thread.activeTurnId !== null || thread.pendingTurnId !== null;
+      if (!thread.running)
+        await this.#setThreadStatus(
+          thread,
+          this.#hasRunningSubagents(thread.id)
+            ? { type: "active", activeFlags: [] }
+            : { type: "idle" },
+        );
       this.#externalSteering.fault(thread.id, new Error(event.error.message));
       thread.stateObserver.fault(new Error(event.error.message));
       this.#externalRuntime.markSessionUnavailable(thread);
@@ -5212,7 +5247,7 @@ export class AppServerHost {
     }
 
     if (event.type === "turn.autonomous.started") {
-      if (thread.running || thread.activeTurnId) {
+      if (thread.activeTurnId) {
         throw new Error("External autonomous Turn started while another Turn is active");
       }
       const projection: ProjectedTurn = {
@@ -5241,7 +5276,20 @@ export class AppServerHost {
     }
 
     if (event.type === "turn.completed" && thread.pendingSteerProjections.size > 0) {
-      await Promise.allSettled([...thread.pendingSteerProjections]);
+      const completedTurnId = event.turnId;
+      await Promise.allSettled(
+        [...thread.pendingSteerProjections]
+          .filter(([, turnId]) => turnId === completedTurnId)
+          .map(([promise]) => promise),
+      );
+    }
+    if (event.type === "turn.started") {
+      if (thread.activeTurnId !== null && thread.activeTurnId !== event.turnId) {
+        throw new Error("External execution started while another Turn is active");
+      }
+      if (thread.pendingTurnId === event.turnId) thread.pendingTurnId = null;
+      thread.activeTurnId = event.turnId;
+      thread.running = true;
     }
     const projection = this.#projectedTurn(thread, event.turnId);
     await this.#waitForTurnResponse(thread, event.turnId);
@@ -5293,12 +5341,14 @@ export class AppServerHost {
         thread.thread.recencyAt = completedAt;
       }
       thread.historyHydrated = false;
-      thread.running = false;
-      thread.activeTurnId = null;
-      // Detached Items (native background commands) settle on this Turn later.
+      if (thread.activeTurnId === event.turnId) thread.activeTurnId = null;
+      if (thread.pendingTurnId === event.turnId) thread.pendingTurnId = null;
+      thread.running =
+        thread.activeTurnId !== null ||
+        thread.pendingTurnId !== null ||
+        (thread.nativeActivity !== null && thread.nativeActivity !== "idle");
       if (!projection.projector.hasOpenDetachedItems) thread.projectedTurns.delete(event.turnId);
       thread.responseGates.delete(event.turnId);
-      thread.pendingSteerProjections.clear();
       this.#signalActiveWorkChanged();
       const delegation = await this.#repository.getDelegationByChild(thread.record.hostThreadId);
       if (delegation) {
@@ -5335,7 +5385,7 @@ export class AppServerHost {
     if (event.type === "turn.completed") {
       await this.#setThreadStatus(
         thread,
-        this.#hasRunningSubagents(thread.id)
+        thread.running || this.#hasRunningSubagents(thread.id)
           ? { type: "active", activeFlags: [] }
           : { type: "idle" },
       );

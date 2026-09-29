@@ -38,18 +38,18 @@ Ultracode 下（以及提示中出现 "ultracode" 关键词时），Claude 会�
 - Workflow 运行前的权限请求显示 Claude Code 提供的 Workflow 描述，不显示脚本。
 - 一次 Workflow 运行显示为一张协作智能体卡片，说明为 Workflow 描述；每个智能体是卡片中的一个子智能体，显示标签、阶段、模型与状态（排队、运行、完成、失败），完成或失败时附带结果或错误摘要。
 - 智能体开始运行后即可点开为只读子线程，首条提示为该智能体收到的任务原文。智能体调用工具或状态变化时，已打开的子线程会刷新。
-- Workflow 在后台运行期间，当前回合保持进行中；Workflow 结束且 Claude 给出汇总后回合才完成。期间发送新消息会先取消当前回合（与下方的取消相同），再开始新回合。
-- 智能体需要权限时，审批标题前带智能体标签，例如 `count:a.txt: Bash`。即使 Claude 的主回复已经结束，这些审批仍可作答；回合结束时未作答的审批会被拒绝。
-- 取消会停止整个 Workflow，未完成的智能体标记为中断。取消时 codexhost 会等 Claude Code 确认停止再结束回合；得不到确认就关闭 Claude Code 进程，下一条消息自动恢复会话。后台运行的普通 Agent 子智能体同样会被停止，Claude 停止后自动开始的回复也会被中断。
+- Workflow 转入后台后与后台 Agent 子智能体相同：回合随主回复结束而完成，卡片同时完成，已报告的智能体保持各自状态；之后的状态变化和子线程刷新继续送达，Workflow 结束后 Claude 的汇总显示为新的自主回合。后台运行不占用输入，期间可以直接发送新消息。
+- 智能体需要权限时，审批标题前带智能体标签，例如 `count:a.txt: Bash`。审批归启动该 Workflow 的主回复所有，主回复进行中可以作答；主回复结束时未作答的审批，以及之后才发起的审批，没有回合可以显示，会被拒绝。
+- 主回复进行中取消回合时，codexhost 先停止本回合启动的 Workflow 与后台 Agent 子智能体，等 Claude Code 确认每个任务停止，再中断主回复；未完成的智能体标记为中断。得不到确认就关闭 Claude Code 进程，下一条消息自动恢复会话。回合结束后仍在运行的后台工作不属于可取消的回合；Claude 对停止通知自行开始的回复按原生事实显示为自主回合。
 
 ## 所有权与投影
 
 - `packages/adapters/claude-code/src/thinking-options.ts`：Ultracode 档位，以及按切换方向生成 `applyFlagSettings` 载荷。只有进入或离开 Ultracode 时才带 `ultracode` 键，离开时显式写 `ultracode: false`，因为关闭 Thinking 或保持 xhigh 都不会清除已请求的 Ultracode。
 - `packages/adapters/claude-code/src/ultracode.ts`：读回判定（只认 `applied.ultracode === true`，其余一律按未生效）、原因分类与错误映射。读回使用 SDK 已实现但未写入公开类型的 `Query.getSettings()`。
-- `packages/adapters/claude-code/src/sdk-transport.ts`：启动时在写入用户消息前确认 Ultracode；会话中切换与换模型时确认，失败时恢复并读回确认。提供 `stopTasks`（停止并等待确认）与 `abortContinuation`（中断主回合结果之后 Claude 自行开始的回复）。待处理审批是会话级的，区分主线程与智能体来源，智能体审批跨越主回合结果保留到回合真正结束。
+- `packages/adapters/claude-code/src/sdk-transport.ts`：启动时在写入用户消息前确认 Ultracode；会话中切换与换模型时确认，失败时恢复并读回确认。提供 `stopTasks`（停止并等待确认）。Workflow 进度帧作为会话级事实发送，不开启主段。智能体审批按智能体所属的 Workflow 调用归到启动它的主段，与嵌套工具审批相同：主段结束时结算，没有存活主段的请求被拒绝。
 - `packages/adapters/claude-code/src/native-message.ts`：识别 `Workflow` 工具、`local_workflow` 任务帧与 SDK 未公开的 `task_progress.workflow_progress`。主回合结束后的进度帧由新的累积器处理，带 `workflow_progress` 的帧自带身份，其余按调用 ID 交给 Adapter 匹配。
-- `packages/adapters/claude-code/src/workflow-lifecycle.ts`：一次运行对应一个子智能体委派项。智能体按序号维护，`subagentId` 为"调用 ID:序号"，拿到原生 `agentId` 后成为 `nativeSubagentId`，Host 据此注册子线程。后台运行时委派项保持打开，由 `task_notification` 结束。
-- `packages/adapters/claude-code/src/claude-code-adapter.ts`：错误映射；后台运行按现有后台子智能体规则挂起回合；取消时停止并确认本回合的后台子智能体与 Workflow，等待续写静默后结束回合，停止未确认时关闭进程；挂起时保留智能体审批。
+- `packages/adapters/claude-code/src/workflow-lifecycle.ts`：一次运行对应一个子智能体委派项。智能体按序号维护，`subagentId` 为"调用 ID:序号"，拿到原生 `agentId` 后成为 `nativeSubagentId`，Host 据此注册子线程。运行由 Session 持有并记住所属回合：回合结束时，已转入后台的运行随回合完成委派项，之后以 `subagent.state.changed` 报告智能体状态，由 `task_notification` 结束；会话关闭或进程被强制关闭时一并结束。
+- `packages/adapters/claude-code/src/claude-code-adapter.ts`：错误映射；取消回合时停止并确认本回合的后台子智能体与 Workflow，再中断主段，停止未确认时关闭进程。
 - `packages/renderer-extension/src/renderer-model-picker.ts`、`renderer-model-selection-notice.ts`：切换被 Host 拒绝时的失败标记与提示；`renderer-binding-probe.ts` 只在模型或档位切换被拒绝时给视图加 `selectionRejected` 与递增的 `selectionErrorId`。
 - `packages/adapters/claude-code/src/claude-history.ts`：子线程首条提示去掉 "[Workflow harness — computed task]" 外层包装与缩进；无法识别时原样显示。Ultracode 下任务前那条转述用户请求的 "[Workflow harness — user request]" 提示不显示。
 
@@ -61,9 +61,11 @@ Ultracode 下（以及提示中出现 "ultracode" 关键词时），Claude 会�
 - Codex 的协作智能体卡片只显示状态与摘要，不显示阶段分组、用量与运行日志；不支持单独停止或续跑某个智能体。
 - 冷读取历史（例如重启后重新打开会话）时，Workflow 与现有 Agent 子智能体一样显示为普通工具项；运行时已创建的子线程仍可打开。
 - 不提供独立于档位的 Ultracode 开关（例如 High + Ultracode）。
-- 后台智能体（Workflow 智能体或后台 Agent）在主回复结束、回合挂起期间发起的审批，作答后 codexhost 会把这条待审批作为已完成的过程保留展示：界面仍显示"待批准"，回合进行中还会显示"正在等待你的回答"，直到回合结束才显示为"请求已完成"。批准本身已经生效，命令会立即执行。
+- 回合按原生主段结束，不为后台工作挂起。主回复结束后才首次出现的 Workflow 智能体不会加入已完成的卡片，也没有可打开的子线程；后台智能体在主回复结束后发起的审批会被拒绝。
 
 ## 验证
+
+以下实机记录来自挂起回合的实现；随原生执行段生命周期合入后，后台运行期间的回合结束、审批与取消按上文行为，只有定向回归覆盖。
 
 已在 Linux x64 上用 Claude Code 2.1.287 实测：Workflows 关闭时发送消息被中止且未调用模型；`CLAUDE_CODE_WORKFLOWS=1` 时完整运行一次两个智能体的 Workflow（审批、卡片状态、主回复结束后作答智能体审批、汇总后完成、子线程首条任务）；会话中切换到 Ultracode、Ultracode 下换模型被拒并撤回。另用 Claude Code 2.1.153 确认旧版本提示升级。2.1.154–2.1.283 区间未实机验证。
 

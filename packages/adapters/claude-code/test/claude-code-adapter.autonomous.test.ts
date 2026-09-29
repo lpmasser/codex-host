@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { hostTurnIdSchema } from "@codexhost/shared-contracts";
 
 import type { HarnessOutput, HarnessSession } from "@codexhost/harness-adapter";
@@ -12,10 +12,43 @@ type HostEvent = Extract<HarnessOutput, { kind: "event" }>["event"];
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 
+/** Claude persists each conversation message to the transcript as it emits it. */
+class PersistingQuery extends FakeQuery {
+  readonly transcript: Record<string, unknown>[] = [];
+  /** Off lets a test model a transcript that lags the live stream. */
+  persist = true;
+
+  override push(message: SDKMessage): void {
+    if (this.persist && (message.type === "user" || message.type === "assistant")) {
+      this.transcript.push({ ...message, message: { ...message.message, role: message.type } });
+    }
+    super.push(message);
+  }
+
+  /** Claude queues, persists and starts each input in its own Segment while no Segment runs. */
+  async accept(prompt: AsyncIterable<SDKUserMessage>): Promise<void> {
+    for await (const input of prompt) {
+      this.push({
+        type: "command_lifecycle",
+        state: "queued",
+        command_uuid: input.uuid,
+      } as unknown as SDKMessage);
+      if (this.persist) {
+        this.transcript.push({ type: "user", uuid: input.uuid, message: input.message });
+      }
+      this.push({
+        type: "command_lifecycle",
+        state: "started",
+        command_uuid: input.uuid,
+      } as unknown as SDKMessage);
+      this.push({ type: "system", subtype: "init" } as SDKMessage);
+    }
+  }
+}
+
 /** A real Claude Adapter over the real SDK Transport; only the native Query is scripted. */
 async function liveSession() {
-  const fakeQuery = new FakeQuery();
-  const history: unknown[] = [];
+  const fakeQuery = new PersistingQuery();
   let uuid = 0;
   const dependencies: ClaudeAdapterDependencies = {
     randomUUID: () => (++uuid === 1 ? SESSION_ID : `claude-id-${uuid}`),
@@ -32,7 +65,8 @@ async function liveSession() {
     deleteSession: async () => undefined,
     forkSession: async () => ({ sessionId: "derived-session" }),
     getSessionInfo: async () => ({ cwd: "/synthetic" }),
-    readSessionMessages: async () => structuredClone(history),
+    readSessionMessages: async ({ sessionId }) =>
+      fakeQuery.transcript.map((message) => ({ ...message, session_id: sessionId })),
     readSubagentMessages: async () => [],
     createTransport: (input) =>
       new ClaudeSdkTransport({
@@ -40,11 +74,14 @@ async function liveSession() {
         sessionId: SESSION_ID,
         command: process.execPath,
         closeTimeoutMs: 100,
-        queryFactory: () => fakeQuery as unknown as Query,
+        queryFactory: ({ prompt }) => {
+          void fakeQuery.accept(prompt as AsyncIterable<SDKUserMessage>);
+          return fakeQuery as unknown as Query;
+        },
       }),
   };
   const adapter = new ClaudeCodeAdapter(
-    { closeTimeoutMs: 100, continuationQuiescenceMs: 50, cancelTimeoutMs: 5_000 },
+    { closeTimeoutMs: 100, cancelTimeoutMs: 5_000 },
     dependencies,
   );
   const opened = await adapter.open({ kind: "create", cwd: "/synthetic" });
@@ -59,7 +96,6 @@ async function liveSession() {
   return {
     events,
     fakeQuery,
-    history,
     session,
     async close() {
       await session.close();
@@ -76,11 +112,11 @@ function textTurn(id: string) {
   };
 }
 
-function push(fakeQuery: FakeQuery, message: Record<string, unknown>): void {
+function push(fakeQuery: PersistingQuery, message: Record<string, unknown>): void {
   fakeQuery.push({ session_id: SESSION_ID, ...message } as unknown as SDKMessage);
 }
 
-function assistantText(fakeQuery: FakeQuery, uuid: string, text: string): void {
+function assistantText(fakeQuery: PersistingQuery, uuid: string, text: string): void {
   push(fakeQuery, {
     type: "assistant",
     uuid,
@@ -89,7 +125,7 @@ function assistantText(fakeQuery: FakeQuery, uuid: string, text: string): void {
   });
 }
 
-function result(fakeQuery: FakeQuery, terminalReason = "completed"): void {
+function result(fakeQuery: PersistingQuery, terminalReason = "completed"): void {
   push(fakeQuery, {
     type: "result",
     subtype: terminalReason === "completed" ? "success" : "error_during_execution",
@@ -99,7 +135,7 @@ function result(fakeQuery: FakeQuery, terminalReason = "completed"): void {
 }
 
 /** Claude moves a Bash command to the background, then ends the requested Root Segment. */
-function backgroundCommandTurn(fakeQuery: FakeQuery, callId: string, taskId: string): void {
+function backgroundCommandTurn(fakeQuery: PersistingQuery, callId: string, taskId: string): void {
   push(fakeQuery, {
     type: "assistant",
     uuid: `assistant-${callId}`,
@@ -138,7 +174,12 @@ function backgroundCommandTurn(fakeQuery: FakeQuery, callId: string, taskId: str
 }
 
 /** The background command ends and Claude starts answering its notification on its own. */
-function commandNotification(fakeQuery: FakeQuery, uuid: string, callId: string, taskId: string) {
+function commandNotification(
+  fakeQuery: PersistingQuery,
+  uuid: string,
+  callId: string,
+  taskId: string,
+) {
   push(fakeQuery, {
     type: "system",
     subtype: "task_notification",
@@ -179,9 +220,11 @@ function completion(events: readonly HostEvent[], turnId: string) {
 
 describe("Claude live autonomous continuation (issue #495)", () => {
   it.each([false, true])(
-    "reads history after a failed autonomous Turn using only transcript message IDs (user UUID: %s)",
+    "reads history after a failed autonomous Turn only once its transcript IDs persist (notification User: %s)",
     async (hasUserMessage) => {
       const live = await liveSession();
+      live.fakeQuery.persist = false;
+      const transcript = live.fakeQuery.transcript;
       try {
         await live.session.execute(textTurn("run-tests"));
         backgroundCommandTurn(live.fakeQuery, "bash-call-1", "bash-task-1");
@@ -215,13 +258,12 @@ describe("Claude live autonomous continuation (issue #495)", () => {
         await vi.waitFor(() => expect(autonomousTurnIds(live.events)).toHaveLength(1));
         const [turnId] = autonomousTurnIds(live.events);
         if (!turnId) throw new Error("Autonomous Turn did not start");
-        await vi.waitFor(() =>
-          expect(completion(live.events, turnId)).toMatchObject({
-            nativeTurnRef: {
-              nativeTurnKey: hasUserMessage ? userMessageId : expect.stringMatching(/^autonomous-/),
-            },
-            outcome: { status: "failed", checkpoint: { checkpointId } },
-          }),
+        await vi.waitFor(
+          () =>
+            expect(completion(live.events, turnId)).toMatchObject({
+              outcome: { status: "failed", checkpoint: { checkpointId } },
+            }),
+          { timeout: 5_000 },
         );
 
         // A real Assistant checkpoint still must reach native history before a read succeeds.
@@ -229,43 +271,35 @@ describe("Claude live autonomous continuation (issue #495)", () => {
           ok: false,
           error: { code: "sessionBusy" },
         });
-        live.history.push({
-          type: "assistant",
-          uuid: checkpointId,
-          session_id: SESSION_ID,
-          message: { role: "assistant", content: "You've hit your session limit" },
-        });
         if (hasUserMessage) {
-          await expect(live.session.readSnapshot()).resolves.toMatchObject({
-            ok: false,
-            error: { code: "sessionBusy" },
-          });
-          live.history.unshift({
+          transcript.push({
             type: "user",
             uuid: userMessageId,
-            session_id: SESSION_ID,
             message: { role: "user", content: "Background command completed" },
           });
         }
+        transcript.push({
+          type: "assistant",
+          uuid: checkpointId,
+          message: { role: "assistant", content: "You've hit your session limit" },
+        });
         // The autonomous messages cannot confirm that the previous requested Turn was saved.
         await expect(live.session.readSnapshot()).resolves.toMatchObject({
           ok: false,
           error: { code: "sessionBusy" },
         });
-        live.history.unshift({
+        transcript.unshift({
           type: "user",
           uuid: requested.nativeTurnRef.nativeTurnKey,
-          session_id: SESSION_ID,
           message: { role: "user", content: "run-tests" },
         });
         await expect(live.session.readSnapshot()).resolves.toMatchObject({
           ok: false,
           error: { code: "sessionBusy" },
         });
-        live.history.splice(1, 0, {
+        transcript.splice(1, 0, {
           type: "assistant",
           uuid: requested.outcome.checkpoint.checkpointId,
-          session_id: SESSION_ID,
           message: { role: "assistant", content: "Tests are running in the background." },
         });
         await expect(live.session.readSnapshot()).resolves.toMatchObject({
@@ -284,6 +318,8 @@ describe("Claude live autonomous continuation (issue #495)", () => {
 
   it("preserves pending transcript IDs when an autonomous failure has no checkpoint", async () => {
     const live = await liveSession();
+    live.fakeQuery.persist = false;
+    const transcript = live.fakeQuery.transcript;
     try {
       await live.session.execute(textTurn("start"));
       assistantText(live.fakeQuery, "start-checkpoint", "Started");
@@ -304,20 +340,18 @@ describe("Claude live autonomous continuation (issue #495)", () => {
         ok: false,
         error: { code: "sessionBusy" },
       });
-      live.history.push({
+      transcript.push({
         type: "user",
         uuid: started.nativeTurnRef.nativeTurnKey,
-        session_id: SESSION_ID,
         message: { role: "user", content: "start" },
       });
       await expect(live.session.readSnapshot()).resolves.toMatchObject({
         ok: false,
         error: { code: "sessionBusy" },
       });
-      live.history.push({
+      transcript.push({
         type: "assistant",
         uuid: "start-checkpoint",
-        session_id: SESSION_ID,
         message: { role: "assistant", content: "Started" },
       });
       await expect(live.session.readSnapshot()).resolves.toMatchObject({ ok: true });

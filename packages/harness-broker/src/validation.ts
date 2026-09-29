@@ -97,6 +97,7 @@ const turnSteerSchema = z
     type: z.literal("turn.steer"),
     turnId: hostTurnIdSchema,
     input: z.array(textInputSchema),
+    clientUserMessageId: z.string().optional(),
   })
   .strict();
 const turnCancelSchema = z
@@ -224,6 +225,7 @@ export const harnessSessionStateSchema = z.custom<HarnessSessionState>((value) =
 
 const eventKeys = new Map<string, ReadonlySet<string>>([
   ["session.state.changed", new Set(["type", "state"])],
+  ["session.activity.changed", new Set(["type", "activity"])],
   ["session.usage.changed", new Set(["type", "usage", "observedForTurnId"])],
   ["usage.request", new Set(["type", "request"])],
   ["usage.history", new Set(["type", "complete"])],
@@ -281,6 +283,12 @@ export const harnessOutputSchema = z.custom<HarnessOutput>((value) => {
     if (!strictKeys(event, eventKeys.get(String(event?.type)))) return false;
     if (event.type === "session.state.changed")
       return harnessSessionStateSchema.safeParse(event.state).success;
+    if (event.type === "session.activity.changed")
+      return (
+        event.activity === "idle" ||
+        event.activity === "running" ||
+        event.activity === "requires_action"
+      );
     if (event.type === "session.faulted") return harnessErrorSchema.safeParse(event.error).success;
     if (event.type === "usage.history") return typeof event.complete === "boolean";
     return true;
