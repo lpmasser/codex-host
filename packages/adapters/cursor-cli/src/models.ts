@@ -64,7 +64,7 @@ export function cursorCatalog(info: CursorSessionInfo): HarnessModelCatalog {
   const native = cursorModels(info);
   const thinking = new Map<
     string,
-    { id: ReturnType<typeof cursorThinking>[number]["id"]; label: string }
+    { id: ReturnType<typeof cursorThinking>[number]["id"]; label: string; nativeId?: string }
   >();
   const models = native.models.map((model) => {
     const config =
@@ -72,10 +72,11 @@ export function cursorCatalog(info: CursorSessionInfo): HarnessModelCatalog {
         ? info.configOptions
         : info.nativeModels?.find((entry) => entry.value === model.value)?.configOptions;
     const options = cursorThinking(config);
-    for (const { id, label } of options) thinking.set(id, { id, label });
+    for (const { id, label, nativeId } of options) thinking.set(id, { id, label, nativeId });
     return {
       ref: cursorConfiguredModelRef(model.value, config),
       label: model.name,
+      nativeId: model.value,
       supportedThinkingOptionIds: options.map(({ id }) => id),
     };
   });

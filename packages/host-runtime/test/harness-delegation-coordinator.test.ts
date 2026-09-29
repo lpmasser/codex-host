@@ -303,8 +303,8 @@ describe("HarnessDelegationCoordinator", () => {
         task: "review auth",
         cwd: "/synthetic",
         parentThreadId: "parent-thread",
-        model,
-        thinkingOptionId,
+        model: model.id,
+        thinking: thinkingOptionId,
       });
       expect(adapter.openInputs[0]).toMatchObject({ model, thinkingOptionId });
       expect(result.configuration?.requested).toEqual({ model, thinkingOptionId });
@@ -337,8 +337,8 @@ describe("HarnessDelegationCoordinator", () => {
         task: "fixture task",
         cwd: "/synthetic",
         parentThreadId: "parent-thread",
-        model,
-        thinkingOptionId,
+        model: model.id,
+        thinking: thinkingOptionId,
       });
       expect(result.configuration).toMatchObject({
         requested: { model, thinkingOptionId },

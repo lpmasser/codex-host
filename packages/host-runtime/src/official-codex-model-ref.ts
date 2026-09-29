@@ -32,12 +32,3 @@ export function decodeOfficialCodexModelRef(ref: HarnessModelRef): string {
   }
   return nativeModelId;
 }
-
-export function canonicalizeOfficialCodexModelRef(ref: HarnessModelRef): HarnessModelRef {
-  const parsed = harnessModelRefSchema.parse(ref);
-  try {
-    return encodeOfficialCodexModelRef(decodeOfficialCodexModelRef(parsed));
-  } catch {
-    return encodeOfficialCodexModelRef(parsed.id);
-  }
-}

@@ -273,10 +273,8 @@ export async function runDelegationCli(input: {
             harnessId,
             task,
             ...(value(parsed, "--cwd") ? { cwd: value(parsed, "--cwd") } : {}),
-            ...(value(parsed, "--model") ? { model: { id: value(parsed, "--model") } } : {}),
-            ...(value(parsed, "--thinking")
-              ? { thinkingOptionId: value(parsed, "--thinking") }
-              : {}),
+            ...(value(parsed, "--model") ? { model: value(parsed, "--model") } : {}),
+            ...(value(parsed, "--thinking") ? { thinking: value(parsed, "--thinking") } : {}),
             ...(parentThread ? { parentThreadId: normalizeThreadId(parentThread) } : {}),
             ...(value(parsed, "--request-id") ? { requestId: value(parsed, "--request-id") } : {}),
             ...(watch === "true"
