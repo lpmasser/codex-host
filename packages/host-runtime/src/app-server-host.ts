@@ -830,6 +830,7 @@ export class AppServerHost {
       officialThreadCwd: (threadId) => this.#readOfficialThreadCwd(threadId),
       activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
+      externalTurnBusy: (thread) => this.#externalTurnBusy(thread),
     });
     const maintenanceOperation = <T>(run: () => Promise<T>): Promise<T> =>
       options.runtimeMaintenance ? options.runtimeMaintenance.operation(run) : run();
@@ -3611,7 +3612,7 @@ export class AppServerHost {
     thread: ExternalThread,
     params: ReturnType<typeof threadCommandExecuteParamsSchema.parse>,
   ): Promise<void> {
-    if (this.#externalThreadBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
+    if (this.#externalTurnBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
       await this.#writer.json(
         rpcError(request, -32072, "External Thread already has an active operation"),
       );
@@ -3687,7 +3688,7 @@ export class AppServerHost {
     }
     // Admission belongs to the caller. A steering replacement retains its
     // reservation until this command starts, after the old Turn has stopped.
-    if (thread.running || thread.activeTurnId) {
+    if (thread.activeTurnId !== null || thread.pendingTurnId !== null) {
       throw new ExternalCommandError(-32072, "External Thread already has an active operation");
     }
     const turnId = requestedTurnId ?? hostTurnIdSchema.parse(randomUUID());
@@ -4601,12 +4602,20 @@ export class AppServerHost {
     return thread.running || this.#externalSteering.hasPending(thread.id);
   }
 
+  #externalTurnBusy(thread: ExternalThread): boolean {
+    return (
+      thread.activeTurnId !== null ||
+      thread.pendingTurnId !== null ||
+      this.#externalSteering.hasPending(thread.id)
+    );
+  }
+
   async #startDelegatedExternalTurn(
     thread: ExternalThread,
     text: string,
     requestedTurnId: string,
   ): Promise<void> {
-    if (this.#externalThreadBusy(thread)) {
+    if (this.#externalTurnBusy(thread)) {
       throw new Error("External Thread already has an active Turn");
     }
     const turnId = hostTurnIdSchema.parse(requestedTurnId);
@@ -4645,7 +4654,7 @@ export class AppServerHost {
   }
 
   async #startExternalTurn(request: JsonRpcRequest, thread: ExternalThread): Promise<void> {
-    if (this.#externalThreadBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
+    if (this.#externalTurnBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
       await this.#writer.json(
         rpcError(request, -32072, "External Thread already has an active Turn"),
       );
@@ -4904,8 +4913,8 @@ export class AppServerHost {
       throw new ExternalSteerError(-32073, "External Thread is no longer available");
     }
     if (
-      thread.running ||
-      thread.activeTurnId ||
+      thread.pendingTurnId !== null ||
+      thread.activeTurnId !== null ||
       this.#pendingExternalCommandRequests.has(thread.id)
     ) {
       throw new ExternalSteerError(-32072, "External Thread already has an active Turn");

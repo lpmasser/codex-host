@@ -24,6 +24,46 @@ function steeredUserMessage(message: JsonObject, turnId: string): JsonObject | n
 }
 
 describe("Native steering", () => {
+  it.each([true, false])(
+    "accepts delegated input between Turns while native background work continues (steer=%s)",
+    async (steer) => {
+      let api: DelegationControlApi | undefined;
+      const fixture = createFixture({
+        onDelegationApi: (value) => {
+          api = value;
+        },
+      });
+      try {
+        const threadId = await startPiThread(fixture);
+        const firstTurn = await startPiTurn(fixture, threadId);
+        const session = fixture.adapter.sessions[0];
+        if (!api || !session) throw new Error("Delegation fixture missing");
+        const connectedApi = api;
+        session.publishActivity("running");
+        session.succeedTurn();
+        await fixture.collector.waitFor((message) =>
+          turnEvent(message, "turn/completed", firstTurn),
+        );
+        expect((await api.read({ threadId, view: "result" })).status).toBe("running");
+        const execute = vi.spyOn(session, "execute");
+        const result = await api.send({ threadId, message: "next input", steer });
+        expect(result.turnId).not.toBe(firstTurn);
+        expect(execute.mock.calls.map(([command]) => command.type)).toEqual(["turn.start"]);
+        session.succeedTurn();
+        await fixture.collector.waitFor((message) =>
+          turnEvent(message, "turn/completed", result.turnId),
+        );
+        expect((await api.read({ threadId, view: "result" })).status).toBe("running");
+        session.publishActivity("idle");
+        await vi.waitFor(async () =>
+          expect((await connectedApi.read({ threadId, view: "result" })).status).toBe("completed"),
+        );
+      } finally {
+        await stopFixture(fixture);
+      }
+    },
+  );
+
   it.each([true, false])("delegated steer reuses the Desktop path (native=%s)", async (native) => {
     let api: DelegationControlApi | undefined;
     const fixture = createFixture({

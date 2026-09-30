@@ -16,7 +16,7 @@ steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifec
 
 开启 `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` 后，原生 `session_state_changed` 提供 running、requires_action、idle。Adapter 要求初始化提供 Session 活动状态，并在 init 上检查 `msg_lifecycle_v1` 能力；不再用 held 或静默计时器判断续跑结束。Host 分别维护待开始的请求、当前执行和原生活动状态。
 
-后台 Agent/Bash 和 Workflow 运行的任务寿命独立于主段。原生 idle 不意味着后台 Bash 已停止；后台事件和进程保活继续由任务事实驱动。Workflow 进度是会话级事实，已转入后台的运行在其回合结束后继续报告智能体状态。取消活动回合时，中断主段之外还显式停止本回合启动的后台 Agent 与 Workflow，并等原生确认任务结束；未确认时关闭进程。原生 Tool 调用 ID 同时用于实时和历史 Tool Item 身份，避免自主段尚未取得持久输入 ID 时生成不一致的工具标识。
+后台 Agent/Bash 和 Workflow 运行的任务寿命独立于主段。后台 Agent 仍运行时，原生 Session 可在主段结束后继续报告 running；这用于活动状态和保活，不占用新输入入口。没有活动主段或待开始输入时，Desktop 和委派入口都可以接纳下一条输入。原生 idle 不意味着后台 Bash 已停止；后台事件和进程保活继续由任务事实驱动。Workflow 进度是会话级事实，已转入后台的运行在其回合结束后继续报告智能体状态。取消活动回合时，中断主段之外还显式停止本回合启动的后台 Agent 与 Workflow，并等原生确认任务结束；未确认时关闭进程。原生 Tool 调用 ID 同时用于实时和历史 Tool Item 身份，避免自主段尚未取得持久输入 ID 时生成不一致的工具标识。
 
 权限控制回调可能先于消息迭代器消费 ToolUse。Transport 将已有待响应请求按 `toolUseID` 与本段工具关联；嵌套请求依据父调用关联，Workflow 智能体的请求依据其所属 Workflow 调用关联。没有存活父执行的嵌套请求明确拒绝。AbortSignal、段结束和 Session 关闭负责结算请求，不另设权限等待计时器。
 

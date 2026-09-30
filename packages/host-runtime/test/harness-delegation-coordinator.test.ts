@@ -76,6 +76,7 @@ async function fixture(
     officialThreadCwd,
     activeOfficialParents: () => [],
     externalThreadBusy,
+    externalTurnBusy: (thread) => thread.activeTurnId !== null || thread.pendingTurnId !== null,
   });
   return {
     adapter,

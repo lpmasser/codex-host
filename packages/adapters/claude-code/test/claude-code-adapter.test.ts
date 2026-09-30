@@ -2691,9 +2691,13 @@ describe("Claude Code HarnessAdapter", () => {
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.completed" });
     transport.running = true;
     await expect(session.execute(textTurn("follow-up"))).resolves.toMatchObject({
-      ok: false,
-      error: { code: "sessionBusy" },
+      ok: true,
     });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "turn.started" });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.started" });
+    transport.finish({ status: "succeeded" });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.completed" });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "turn.completed" });
     transport.autonomousTurnHandler?.({
       nativeTurnKey: "task-notification-1",
       events: [

@@ -132,6 +132,7 @@ export class HarnessDelegationCoordinator {
   readonly #listOfficial: (input: ThreadListInput) => Promise<DelegationThreadListResult>;
   readonly #officialThreadCwd: (threadId: string) => Promise<string | undefined>;
   readonly #activeOfficialParents: () => string[];
+  readonly #externalTurnBusy: (thread: ExternalThread) => boolean;
   readonly #externalThreadBusy: (thread: ExternalThread) => boolean;
 
   constructor(input: {
@@ -163,6 +164,7 @@ export class HarnessDelegationCoordinator {
     officialThreadCwd(threadId: string): Promise<string | undefined>;
     activeOfficialParents(): string[];
     externalThreadBusy(thread: ExternalThread): boolean;
+    externalTurnBusy(thread: ExternalThread): boolean;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment;
@@ -181,6 +183,7 @@ export class HarnessDelegationCoordinator {
     this.#officialThreadCwd = input.officialThreadCwd;
     this.#activeOfficialParents = input.activeOfficialParents;
     this.#externalThreadBusy = input.externalThreadBusy;
+    this.#externalTurnBusy = input.externalTurnBusy;
   }
 
   async listHarnesses(): Promise<HarnessListResult> {
@@ -432,7 +435,7 @@ export class HarnessDelegationCoordinator {
         readOnly: true,
       });
     }
-    if (this.#externalThreadBusy(thread) || thread.activeTurnId) {
+    if (this.#externalTurnBusy(thread)) {
       if (!input.steer) {
         throw new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
       }
