@@ -121,6 +121,7 @@ describe("AppServerHost hermetic Claude projection", () => {
     let deferredInput: string | undefined;
     let steeredInput: string | undefined;
     let deferInput = false;
+    let nativeRunning = false;
     const laterHistory: unknown[] = [];
     const dependencies: ClaudeAdapterDependencies = {
       randomUUID: () => `claude-hermetic-${++uuid}`,
@@ -169,8 +170,11 @@ describe("AppServerHost hermetic Claude projection", () => {
         return {
           sessionId: input.sessionId,
           setEventHandler: (next) => {
-            handler = next;
-            nativeHandler = next;
+            handler = (event) => {
+              if (event.type === "activity.changed") nativeRunning = event.activity !== "idle";
+              return next(event);
+            };
+            nativeHandler = handler;
           },
           cancelInput: async (messageId) => {
             await handler({ type: "input.cancelled", messageId });
@@ -178,7 +182,7 @@ describe("AppServerHost hermetic Claude projection", () => {
           },
           hasBackgroundTasks: () => false,
           stopBackgroundTask: async () => undefined,
-          isRunning: () => false,
+          isRunning: () => nativeRunning,
           stopTasks: async () => undefined,
           start: async () => undefined,
           getContextUsage: async () => ({
@@ -313,6 +317,14 @@ describe("AppServerHost hermetic Claude projection", () => {
         },
       });
 
+      // A background Agent keeps the Session running after its parent Turn completes.
+      // That activity must not reserve the next foreground input slot.
+      await nativeHandler({ type: "activity.changed", activity: "running" });
+      await collector.waitFor(
+        (m) =>
+          method(m, "thread/status/changed") &&
+          ((m.params as JsonObject).status as JsonObject).type === "active",
+      );
       // B is accepted while an earlier native continuation has not yet reached the Host.
       deferInput = true;
       writeRequest(desktopInput, {
@@ -321,6 +333,7 @@ describe("AppServerHost hermetic Claude projection", () => {
         params: { threadId, input: [{ type: "text", text: "input B" }] },
       });
       const pending = await collector.waitFor((message) => requestId(message, 4));
+      expect(pending.error).toBeUndefined();
       const pendingId = ((pending.result as JsonObject).turn as JsonObject).id;
       expect(deferredInput).toBeDefined();
       expect(

@@ -898,7 +898,7 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Claude Code Session closed during startup") };
     }
-    if (this.#pendingTurn || this.#active || transport.isRunning()) {
+    if (this.#pendingTurn || this.#execution) {
       return {
         ok: false,
         error: {
@@ -1010,7 +1010,7 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#phase !== "open") {
       return { ok: false, error: invalidState("Claude Code Session closed during startup") };
     }
-    if (this.#pendingTurn || this.#active || transport.isRunning()) {
+    if (this.#pendingTurn || this.#execution) {
       return {
         ok: false,
         error: {
