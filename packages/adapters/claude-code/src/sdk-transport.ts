@@ -56,8 +56,7 @@ import type {
   ClaudeTurnEvent,
   ClaudeTurnTransport,
 } from "./transport.js";
-import { ClaudeSteerMissedTurnError
-} from "./transport.js";
+import { ClaudeSteerMissedTurnError } from "./transport.js";
 
 const CLIENT_APP = "codexhost-claude-code-adapter/0.0.0";
 // Claude Code hides generic SDK entrypoints from its native Session picker. Keep persisted

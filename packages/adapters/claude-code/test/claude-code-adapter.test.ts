@@ -36,8 +36,7 @@ import type {
   ClaudeTurnEvent,
   ClaudeTurnTransport,
 } from "../src/transport.js";
-import { ClaudeSteerMissedTurnError
-} from "../src/transport.js";
+import { ClaudeSteerMissedTurnError } from "../src/transport.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof FsPromises>();
