@@ -99,8 +99,8 @@ class PushableInput<T> implements AsyncIterable<T> {
 
 interface PendingInteraction {
   segment: NativeSegment | null;
-  /** The Workflow call whose agent raised the request; it owns the request like a parent call. */
-  workflowCallId?: string;
+  /** The native agent that raised the request; a Workflow agent's run owns it like a parent call. */
+  agentId?: string;
   controlRequestId: string;
   input: Record<string, unknown>;
   onAbort(): void;
@@ -834,7 +834,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
    */
   #interactionOwner(pending: PendingInteraction, segment: NativeSegment): string | undefined {
     if (segment.tools.has(pending.toolUseId)) return pending.toolUseId;
-    return pending.workflowCallId;
+    return pending.agentId ? this.#workflowAgents.get(pending.agentId)?.callId : undefined;
   }
 
   #routeInteraction(pending: PendingInteraction, segment: NativeSegment, owner: string): void {
@@ -875,9 +875,9 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       );
     }
 
-    const workflowAgent =
+    const agentId =
       typeof options.agentID === "string" && options.agentID.length > 0
-        ? this.#workflowAgents.get(options.agentID)
+        ? options.agentID
         : undefined;
     this.#interactionOrdinal += 1;
     const requestId = `claude-${toolName === "AskUserQuestion" ? "question" : "approval"}-${this.#interactionOrdinal}`;
@@ -892,7 +892,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         plan: typeof input.plan === "string" && input.plan.trim().length > 0 ? input.plan : null,
       };
     } else {
-      request = parseApprovalRequest(requestId, toolName, options, workflowAgent?.label);
+      request = parseApprovalRequest(
+        requestId,
+        toolName,
+        options,
+        agentId ? this.#workflowAgents.get(agentId)?.label : undefined,
+      );
     }
     if (!request) {
       return Promise.resolve(
@@ -903,7 +908,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     return new Promise<PermissionResult>((resolve) => {
       const pending: PendingInteraction = {
         segment: null,
-        ...(workflowAgent ? { workflowCallId: workflowAgent.callId } : {}),
+        ...(agentId ? { agentId } : {}),
         controlRequestId: options.requestId,
         input,
         request,
