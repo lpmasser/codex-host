@@ -3102,6 +3102,41 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
     await value.transport.close();
   });
 
+  it("routes an agent approval raised before the run first reports that agent", async () => {
+    const value = fixture();
+    await value.transport.start();
+    const canUseTool = options(value).canUseTool;
+    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000012", (event) =>
+      events.push(event),
+    );
+    pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
+    await vi.waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.started" })),
+    );
+    const permission = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
+    expect(events.some(({ type }) => type === "interaction.requested")).toBe(false);
+
+    value.fakeQuery.push(workflowProgress);
+    await vi.waitFor(() =>
+      expect(events.at(-1)).toMatchObject({
+        type: "interaction.requested",
+        request: { requestId: "claude-approval-1" },
+      }),
+    );
+    await value.transport.respondToInteraction({
+      type: "approval",
+      requestId: "claude-approval-1",
+      decision: "deny",
+    });
+    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+    launchWorkflow(value.fakeQuery);
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    await value.transport.close();
+  });
+
   it("denies agent approvals once the Root Segment that runs the Workflow ends", async () => {
     const value = fixture();
     await value.transport.start();
