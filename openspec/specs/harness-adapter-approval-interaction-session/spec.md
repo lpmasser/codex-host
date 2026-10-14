@@ -20,7 +20,7 @@ A `HarnessSession` SHALL expose a native permission decision as a typed `HostApp
 
 #### Scenario: Native action requires one-shot approval
 
-- **WHEN** an active native Turn requests an explicit user permission decision
+- **WHEN** an active native Turn or live background task requests an explicit user permission decision
 - **THEN** the Session SHALL emit an Approval with a Host Interaction ID, owning Host Turn ID, bounded title, optional bounded description, exactly one `allowOnce` action, exactly one `deny` action, and only declared optional broader actions
 - **AND** the Approval SHALL remain distinct from Question and ordinary Tool output
 
@@ -32,7 +32,7 @@ A `HarnessSession` SHALL expose a native permission decision as a typed `HostApp
 
 ### Requirement: Approval responses are exact and declared
 
-The Session SHALL accept an Approval response only for a pending Approval owned by that Session and active Turn. It SHALL validate the response type and declared action ID before writing one native decision, and one accepted response SHALL NOT itself complete the Turn.
+The Session SHALL accept an Approval response only for a pending Approval owned by that Session and an active Turn or live native task Item. It SHALL validate the response type and declared action ID before writing one native decision, and one accepted response SHALL NOT itself complete the Turn.
 
 #### Scenario: User allows one native action
 
@@ -58,9 +58,9 @@ The Session SHALL accept an Approval response only for a pending Approval owned 
 - **THEN** the Session SHALL return `invalidRequest` or `invalidState`
 - **AND** it SHALL NOT write a native response or alter another pending Interaction
 
-### Requirement: Approval lifecycle converges before the Turn terminal
+### Requirement: Approval lifecycle follows its native owner
 
-Every exposed Approval SHALL belong to one active Turn, SHALL appear after `turn.started`, and SHALL close exactly once before that Turn's unique terminal event. Turn cancel, Session close, transport fault, native abort, and terminal processing SHALL leave no Approval pending.
+Every exposed Approval SHALL reference its originating Turn and MAY carry an `ownerItemId` for a live native task. Root-scoped Approvals SHALL close before the Turn terminal. Task-owned Approvals SHALL follow the native request and task lifetime, including after Root completion. Session close, transport fault, native abort, and actual task terminal SHALL close the relevant Approvals exactly once before completing their owner Items.
 
 #### Scenario: Approval is requested before ordinary Assistant output
 
@@ -103,7 +103,7 @@ Protocol Core and Host Runtime SHALL project a pending Host Approval through one
 
 #### Scenario: Host resolves a pending Approval externally
 
-- **WHEN** Turn cancel, Interaction close, fault, Thread deletion, or Host shutdown retires a Host-owned Approval before Desktop responds
+- **WHEN** Native owner cancellation, Interaction close, fault, Thread deletion, or Host shutdown retires a Host-owned Approval before Desktop responds
 - **THEN** Host Runtime SHALL remove all authoritative pending state and send `serverRequest/resolved` before the owning terminal sequence completes
 - **AND** it SHALL consume every duplicate or late response in the reserved Host Approval Request-ID namespace without executing a Tool, forwarding the frame, or affecting another Interaction
 
@@ -119,6 +119,13 @@ Approval display text and decisions SHALL remain in the live Interaction path, w
 
 #### Scenario: Approval closes
 
-- **WHEN** an Approval responds, cancels, faults, or reaches Turn terminal cleanup
+- **WHEN** an Approval responds, cancels, faults, or reaches its native owner terminal cleanup
 - **THEN** Host and Adapter in-memory correlation SHALL be removed
 - **AND** no normalized Approval transcript or native permission update SHALL be persisted by codexhost
+
+#### Scenario: Background Approval outlives its Root Turn
+
+- **WHEN** a live detached Item owns an Approval and its Root Turn completes
+- **THEN** the Approval SHALL remain answerable and SHALL NOT occupy another foreground Turn
+- **AND** the native MCP elicitation SHALL use session correlation with `turnId: null`
+- **AND** old task cancellation SHALL NOT interrupt a different active Root Turn

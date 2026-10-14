@@ -550,8 +550,8 @@ export class FakeHarnessSession implements HarnessSession {
   detachItem(itemId: HostItemId): void {
     const active = this.#requireActive();
     const item = active.items.get(itemId);
-    if (item?.type !== "commandExecution") {
-      throw new Error("Fake Harness Item is not a Command Execution");
+    if (item?.type !== "commandExecution" && item?.type !== "subagentDelegation") {
+      throw new Error("Fake Harness Item is not native background work");
     }
     active.items.delete(itemId);
     active.completedItems.push({ item, outcome: { status: "succeeded" } });
@@ -561,6 +561,10 @@ export class FakeHarnessSession implements HarnessSession {
   /** Emits an event outside the scripted Turn, e.g. a detached Item's later output. */
   emitEvent(event: HostEvent): void {
     this.#event(event);
+  }
+
+  emitInteraction(interaction: HostInteraction): void {
+    this.#channel.emit({ kind: "interaction", interaction });
   }
 
   appendCommandOutput(itemId: HostItemId, text: string): void {
