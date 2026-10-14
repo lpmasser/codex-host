@@ -146,12 +146,7 @@ export class ClaudeToolLifecycle {
       throw new Error("Claude Code Tool completion references an unknown Tool");
     }
     this.#tools.delete(event.callId);
-    if (
-      tool.item.type === "commandExecution" &&
-      event.backgroundTaskId &&
-      !event.isError &&
-      !cancellationRequested
-    ) {
+    if (tool.item.type === "commandExecution" && event.backgroundTaskId && !event.isError) {
       this.#emit({ type: "item.detached", turnId, itemId: tool.item.itemId });
       this.#onDetached({
         turnId,

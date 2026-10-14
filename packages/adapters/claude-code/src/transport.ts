@@ -98,6 +98,7 @@ export type ClaudeTurnEvent =
   | { type: "text.delta"; messageId: string; delta: string }
   | { type: "reasoning.delta"; messageId: string; delta: string }
   | { type: "reasoning.completed"; messageId: string }
+  | { type: "narration.completed"; messageId: string; text: string }
   | {
       type: "message.completed";
       messageId: string;
@@ -184,7 +185,12 @@ export type ClaudeTurnEvent =
       taskId?: string;
       resultSummary?: string;
     }
-  | { type: "interaction.requested"; request: ClaudeInteractionRequest }
+  /**
+   * A Root request arrives as a Segment event. An agent's request names the Root Agent or
+   * Workflow call that launched the agent and arrives, with its close, as a Session event: the
+   * agent's task keeps running past the Root execution that started it.
+   */
+  | { type: "interaction.requested"; request: ClaudeInteractionRequest; ownerCallId?: string }
   | {
       type: "interaction.closed";
       requestId: string;

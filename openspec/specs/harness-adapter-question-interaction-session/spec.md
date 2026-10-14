@@ -5,7 +5,7 @@ TBD - created by archiving change implement-pi-question-interaction-slice. Updat
 ## Requirements
 ### Requirement: Harness Session exposes UI-independent Question interactions
 
-A `HarnessSession` SHALL expose blocking Questions through its single ordered output stream and SHALL accept typed `interaction.respond` commands without exposing Pi RPC records, native callback IDs, Codex app-server payloads, or another Harness protocol.
+A `HarnessSession` SHALL expose typed Questions through its single ordered output stream and SHALL accept typed `interaction.respond` commands without exposing Pi RPC records, native callback IDs, Codex app-server payloads, or another Harness protocol.
 
 #### Scenario: Adapter emits a choice Question
 
@@ -21,7 +21,7 @@ A `HarnessSession` SHALL expose blocking Questions through its single ordered ou
 
 ### Requirement: Question output and closure obey the Turn lifecycle
 
-Every exposed Question SHALL belong to one active Turn, SHALL appear after that Turn's `turn.started`, and SHALL close exactly once before the Turn's unique terminal event. The Session SHALL reject a new foreground Turn while any Question from the current Turn remains pending.
+Every exposed Question SHALL reference its originating Turn and MAY carry an `ownerItemId` for a live native task. Root-scoped Questions SHALL close before their Turn terminal and block their own foreground execution. Task-owned Questions SHALL remain answerable across Root completion, follow the native request/task lifetime, and SHALL NOT occupy a new foreground Turn.
 
 #### Scenario: Question is answered
 
@@ -38,12 +38,12 @@ Every exposed Question SHALL belong to one active Turn, SHALL appear after that 
 #### Scenario: Turn reaches terminal processing
 
 - **WHEN** native execution settles while one or more Questions are still pending
-- **THEN** the Adapter SHALL close every pending Question with an evidence-based terminal reason before `turn.completed`
+- **THEN** the Adapter SHALL close pending Root-scoped Questions with an evidence-based terminal reason before `turn.completed`
 - **AND** the Turn SHALL still have exactly one terminal event
 
 ### Requirement: Question responses are exact, validated, and idempotent
 
-The Session SHALL accept responses only for a pending Interaction owned by that Session and active Turn. It SHALL validate Question IDs, answer cardinality, option values, required fields, response type, and cancellation before writing a native response.
+The Session SHALL accept responses only for a pending Interaction owned by that Session and an active Turn or live native task Item. It SHALL validate Question IDs, answer cardinality, option values, required fields, response type, and cancellation before writing a native response.
 
 #### Scenario: Choice answer is accepted
 
@@ -65,7 +65,7 @@ The Session SHALL accept responses only for a pending Interaction owned by that 
 
 ### Requirement: Cancel, fault, and close converge pending Questions
 
-Turn cancellation, Session close, native timeout, and transport fault SHALL leave no exposed Question pending. Cancel acceptance alone SHALL NOT fabricate a Turn terminal; the Adapter SHALL wait for native settlement or apply its existing bounded failure rules.
+Native owner cancellation, actual task terminal, Session close, native timeout, and transport fault SHALL retire the corresponding Questions. Cancel acceptance alone SHALL NOT fabricate a Turn terminal; the Adapter SHALL wait for native settlement or apply its existing bounded failure rules.
 
 #### Scenario: Turn is cancelled while Question is pending
 
@@ -123,6 +123,13 @@ Question prompts and answers SHALL remain in the live Interaction path and nativ
 
 #### Scenario: Interaction is not persisted
 
-- **WHEN** a Question closes or its Turn completes
+- **WHEN** a Question closes or its native owner reaches terminal cleanup
 - **THEN** Host in-memory Interaction correlation SHALL be removed
 - **AND** no normalized Interaction Transcript SHALL be written
+
+#### Scenario: Background task asks after its Root completed
+
+- **WHEN** a live detached Item owns a Question before or after its Root Turn completed
+- **THEN** the existing native user-input request SHALL use `isBlocking: false`
+- **AND** a synthetic Question Item SHALL be detached until that Question closes
+- **AND** a valid response SHALL settle only the native request and leave another Root execution intact

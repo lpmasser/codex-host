@@ -5009,8 +5009,9 @@ export class AppServerHost {
       this.#externalSteering.interrupt(thread.id, requestedTurnId);
     if (
       typeof requestedTurnId !== "string" ||
-      !thread.running ||
-      (thread.activeTurnId !== requestedTurnId && thread.pendingTurnId !== requestedTurnId)
+      (thread.activeTurnId !== requestedTurnId &&
+        thread.pendingTurnId !== requestedTurnId &&
+        !thread.projectedTurns.get(requestedTurnId as HostTurnId)?.projector.hasOpenDetachedItems)
     ) {
       await this.#writer.json(
         rpcError(request, -32074, "External turn/interrupt must reference the active Turn"),
@@ -5026,7 +5027,8 @@ export class AppServerHost {
       ]).then(() => undefined),
       resolve: cancellationGate.resolve,
     };
-    thread.responseGates.set(turnId, gate);
+    if (thread.activeTurnId === turnId || thread.pendingTurnId === turnId)
+      thread.responseGates.set(turnId, gate);
     const result = await thread.session.execute({ type: "turn.cancel", turnId });
     if (!result.ok) {
       try {
@@ -5384,7 +5386,7 @@ export class AppServerHost {
       });
     }
     if (
-      event.type === "item.completed" &&
+      (event.type === "item.completed" || event.type === "interaction.closed") &&
       projection.projector.completed &&
       !projection.projector.hasOpenDetachedItems
     ) {

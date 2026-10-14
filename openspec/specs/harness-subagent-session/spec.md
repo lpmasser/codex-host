@@ -30,7 +30,7 @@ A Subagent Delegation Item SHALL represent the delegation and aggregate state on
 - **AND** no nested Assistant text SHALL be compared with, appended to, or used to close the Root Agent Message
 
 ### Requirement: Subagent delegation Items have complete ordered Turn lifecycles
-Every started Subagent Delegation Item SHALL start after its owning Turn, accept only correlated normalized state replacements, complete exactly once, and complete before the Root Turn terminal event. Completion of the delegation Tool SHALL remain distinct from the delegated Agent's background lifetime.
+Every started Subagent Delegation Item SHALL start after its owning Turn, accept only correlated normalized state replacements, complete exactly once, and complete before the Root Turn terminal event unless explicitly detached for native background work. Completion of the delegation Tool SHALL remain distinct from the delegated Agent's background lifetime.
 
 #### Scenario: Foreground delegation completes
 - **WHEN** the native delegation result returns during the Root Turn
@@ -39,12 +39,12 @@ Every started Subagent Delegation Item SHALL start after its owning Turn, accept
 
 #### Scenario: Background delegation is launched
 - **WHEN** the native Harness reports that a Subagent was launched in the background and returns control to the Root Agent
-- **THEN** the Adapter SHALL complete the delegation Item when the launch operation completes
-- **AND** it SHALL keep the Host Turn open until no Root Segment, background Subagent, or continuation caused by those Subagents is executing
-- **AND** Desktop SHALL NOT receive `turn/completed` for that Turn while the user task remains busy
+- **THEN** the Adapter MAY detach the delegation Item until the native task actually ends
+- **AND** a detached Item SHALL accept correlated updates and completion after its owning Turn completed
+- **AND** background task activity SHALL NOT itself prevent a new foreground Turn
 
 #### Scenario: Root Turn fails with active delegation
-- **WHEN** cancellation, failure, Session close, or Session fault terminates a Root Turn while a Subagent Delegation Item is active
+- **WHEN** cancellation, failure, Session close, or Session fault terminates a Root Turn while a foreground Subagent Delegation Item is active
 - **THEN** the Adapter SHALL complete the Item with the corresponding terminal outcome before the Turn terminal
 
 ### Requirement: Subagents expose stable read-only Child Host Threads
@@ -65,9 +65,9 @@ When a supporting Harness provides a stable native Subagent identity and transcr
 - **THEN** the delegation SHALL immediately report that Subagent as running rather than waiting for stable Child identity or native completion
 - **AND** Host Runtime SHALL publish a materialized Child Host Thread as active
 - **AND** subsequent Subagent state replacements SHALL be projected to the native collaboration Item while it remains active
-- **AND** while one or more background Subagents remain running, the Adapter SHALL keep the Host Turn open and Host Runtime SHALL keep the Parent Host Thread active
+- **AND** native Session activity and running background Subagents SHALL remain distinct from foreground Turn occupancy
 - **AND** when the Harness reports that a native Subagent completed, failed, or was interrupted, Host Runtime SHALL refresh its terminal Child transcript and publish the Child Host Thread as idle
-- **AND** after the last running background Subagent settles, no Root continuation is executing, and no Root Turn is active, Host Runtime SHALL publish the Parent Host Thread as idle
+- **AND** Host Runtime SHALL derive Parent activity from native Session activity and live execution without using activity alone to reject foreground input
 
 #### Scenario: Host restarts before Child detail is opened
 
@@ -77,14 +77,6 @@ When a supporting Harness provides a stable native Subagent identity and transcr
 
 ### Requirement: Harness-generated autonomous continuations have Host Turn lifecycles
 A supporting Harness SHALL emit an autonomous Turn start when native work resumes and produces Root output without a new desktop Turn request. Host Runtime SHALL create and persist one normal Host Turn projection for that continuation.
-
-#### Scenario: Background task completion resumes Root Agent
-
-- **WHEN** a background Subagent completion notification causes the native Root Agent to generate a follow-up answer while the requested Host Turn is still held
-- **THEN** the Adapter SHALL emit the correlated Session-scoped Subagent completion on that same Host Turn
-- **AND** the follow-up answer SHALL appear in the Parent Thread instead of being dropped
-- **AND** the correlated Child Host Thread SHALL no longer remain in a loading or active state
-- **AND** the Adapter SHALL emit `turn.completed` only after no Root Segment, background Subagent, or continuation is executing
 
 #### Scenario: Background task completion resumes Root Agent after the requested Turn completed
 
@@ -101,11 +93,6 @@ A supporting Harness SHALL emit an autonomous Turn start when native work resume
 
 - **WHEN** a desktop Turn request arrives after the native Harness reported an autonomous continuation and before that continuation completes
 - **THEN** the Session SHALL reject the request rather than start a requested Turn that absorbs the continuation's output
-
-#### Scenario: Autonomous continuation continues a held user Turn
-
-- **WHEN** the native Harness reports an autonomous continuation while the requested Host Turn is held for running background Subagents
-- **THEN** the Adapter SHALL continue that same Host Turn instead of starting a second Turn
 
 ### Requirement: Protocol Core projects Subagent delegation through Codex native collaboration Items
 Protocol Core SHALL project Host Subagent Delegation Items into the current Codex app-server `collabAgentToolCall` Item lifecycle. Harness Adapter contracts SHALL remain independent of Codex field names and status enums.

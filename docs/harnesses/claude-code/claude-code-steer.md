@@ -18,7 +18,11 @@ steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifec
 
 后台 Agent/Bash 和 Workflow 运行的任务寿命独立于主段。后台 Agent 仍运行时，原生 Session 可在主段结束后继续报告 running；这用于活动状态和保活，不占用新输入入口。没有活动主段或待开始输入时，Desktop 和委派入口都可以接纳下一条输入。原生 idle 不意味着后台 Bash 已停止；后台事件和进程保活继续由任务事实驱动。Workflow 进度是会话级事实，已转入后台的运行在其回合结束后继续报告智能体状态。取消活动回合时，中断主段之外还显式停止本回合启动的后台 Agent 与 Workflow，并等原生确认任务结束；未确认时关闭进程。原生 Tool 调用 ID 同时用于实时和历史 Tool Item 身份，避免自主段尚未取得持久输入 ID 时生成不一致的工具标识。
 
-权限控制回调可能先于消息迭代器消费 ToolUse。Transport 将已有待响应请求按 `toolUseID` 与本段工具关联；嵌套请求依据父调用关联，Workflow 智能体的请求依据其所属 Workflow 调用关联。没有存活父执行的嵌套请求明确拒绝。AbortSignal、段结束和 Session 关闭负责结算请求，不另设权限等待计时器。
+后台 Agent 与 Workflow 委派 Item 在启动返回时发出 `item.detached`，主段完成后仍接收进度和新增智能体；原生任务终态才完成 Item。新出现的原生智能体继续通过已有 Item 更新注册子线程。SendMessage 的送达回执不代表目标智能体完成；只有原生仍存活的任务才继续作为后台工作追踪。
+
+权限控制回调可能先于消息迭代器消费 ToolUse。Transport 根据原生 agent/task 身份或嵌套父调用确认请求归属，身份尚未到达时保留原生回调。智能体审批和问题归所属任务 Item，主段 Result 不撤销这些请求；可在原回合完成后作答，也可与新回合同时存在。AbortSignal、实际任务结束和 Session 关闭/故障负责结算任务请求，关闭请求先于完成其 Item。普通主段请求仍随所属主段结算，不另设权限等待计时器。
+
+Host 公共 Interaction 的 `ownerItemId` 表达任务归属；协议层保留旧回合投影直到任务和请求均结束。审批使用原生会话级 MCP elicitation（`turnId: null`）；问题沿用 `item/tool/requestUserInput`，任务问题为 `isBlocking: false`，其问题 Item 与任务一同脱离主回合。该映射已核对安装版 Codex 协议 schema，Desktop 实际展示仍需单独验收。
 
 ## 取消与关闭
 
@@ -27,6 +31,8 @@ steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifec
 SDK 公开 Query 缺少逐输入撤回和带清队列参数的中断。Transport 通过自己拥有的 spawn hook 管道集中发送这两种原生控制请求，用独立请求 ID 关联回执，不访问 SDK 私有方法。Session 关闭时，在原生声明支持的情况下中断并清队列，然后停止后台任务、关闭 Query 并确认进程退出；单个 Turn 取消不通过关闭整个 Session 来撤回另一条输入。
 
 接纳后的输入也可能在真正开始前取消或失败；Host 可完成该待执行请求，不伪造执行开始事件。执行段取消与 Session 故障分别处理。
+
+已完成回合仍有后台任务时，现有 `turn/interrupt` / `turn.cancel` 可停止该回合已取得原生任务 ID 的任务；另一个活动主段继续运行。没有主段时，委派 `thread cancel` 停止这些后台任务。取消期间才启动且已有原生 ID 的任务仍保持 Item 存活，并立即请求原生停止；收到任务终态才结算。原生身份缺失时不能虚构停止目标，该任务的停止不在当前保证范围内。Desktop 的“停止全部后台终端”仍只处理 Bash。
 
 ## 原生身份与历史
 
@@ -37,3 +43,5 @@ SDK 公开 Query 缺少逐输入撤回和带清队列参数的中断。Transport
 ## 验证范围
 
 原生时序实测版本为 Claude Code 2.1.283、Agent SDK 0.3.220、macOS。现有 Transport、Adapter、历史和 Host 测试覆盖归属、审批、取消、空段及重读；Broker 测试核对跨进程事件和消息 ID。隔离 CLI 验证使用本地固定响应服务，覆盖先行自主段、steer 和排队撤回，不调用云端模型或重启日常 Desktop。
+
+Claude Code 2.1.293 / SDK 0.3.273 的隔离固定响应验证确认：后台 Agent 仍存活时，普通输入可开始并完成。后台请求跨主段、迟到 Workflow 智能体、SendMessage 恢复、任务终态顺序与取消竞态由 SDK/Adapter/协议/Host 定向测试覆盖；没有重启日常 Desktop，也没有把这些契约测试当作 Workflow GUI 实测。

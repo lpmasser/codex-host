@@ -98,8 +98,9 @@ function withResolvedDuration(item: HostItem, durationMs: number): HostItem {
   return { ...item, durationMs };
 }
 
-type ProjectedInteraction =
-  { type: "approval" } | { type: "question"; itemId: HostItemId; syntheticItem: boolean };
+type ProjectedInteraction = (
+  { type: "approval" } | { type: "question"; itemId: HostItemId; syntheticItem: boolean }
+) & { ownerItemId?: HostItemId };
 
 function itemStatus(outcome: HostItemOutcome | null): "inProgress" | "completed" | "failed" {
   if (!outcome) return "inProgress";
@@ -788,7 +789,10 @@ export class CodexTurnProjector {
 
   /** A completed Turn still owns detached Items that have not settled. */
   get hasOpenDetachedItems(): boolean {
-    return [...this.#detached].some((itemId) => this.#items.get(itemId)?.outcome === null);
+    return (
+      [...this.#detached].some((itemId) => this.#items.get(itemId)?.outcome === null) ||
+      [...this.#interactions.values()].some((interaction) => interaction.ownerItemId !== undefined)
+    );
   }
 
   /**
@@ -875,15 +879,21 @@ export class CodexTurnProjector {
       this.#completed &&
       !(
         (event.type === "item.updated" && this.#detached.has(event.itemId)) ||
-        (event.type === "item.completed" && this.#detached.has(event.snapshot.item.itemId))
+        (event.type === "item.completed" && this.#detached.has(event.snapshot.item.itemId)) ||
+        (event.type === "interaction.closed" &&
+          this.#interactions.get(event.interactionId)?.ownerItemId !== undefined)
       )
     ) {
       throw new Error("Host output follows the Turn terminal event");
     }
     switch (event.type) {
       case "item.detached":
-        if (this.#activeItem(event.itemId).item.type !== "commandExecution") {
-          throw new Error("Only a command Item can outlive its Turn");
+        if (
+          !["commandExecution", "subagentDelegation"].includes(
+            this.#activeItem(event.itemId).item.type,
+          )
+        ) {
+          throw new Error("Only a native background command or Subagent Item can outlive its Turn");
         }
         this.#detached.add(event.itemId);
         return { messages: [] };
@@ -910,7 +920,7 @@ export class CodexTurnProjector {
       throw new Error("Host Interaction references another Turn");
     }
     this.#requireStarted();
-    if (this.#completed) throw new Error("Host Interaction follows the Turn terminal event");
+    this.#requireInteractionOwner(interaction.ownerItemId);
     if (this.#interactions.has(interaction.interactionId)) {
       throw new Error("Host Interaction opened more than once");
     }
@@ -919,7 +929,10 @@ export class CodexTurnProjector {
       interaction,
       serverName,
     });
-    this.#interactions.set(interaction.interactionId, { type: "approval" });
+    this.#interactions.set(interaction.interactionId, {
+      type: "approval",
+      ...(interaction.ownerItemId ? { ownerItemId: interaction.ownerItemId } : {}),
+    });
     return { messages: [], approvalRequest };
   }
 
@@ -932,7 +945,7 @@ export class CodexTurnProjector {
       throw new Error("Host Interaction references another Turn");
     }
     this.#requireStarted();
-    if (this.#completed) throw new Error("Host Interaction follows the Turn terminal event");
+    this.#requireInteractionOwner(interaction.ownerItemId);
     if (this.#interactions.has(interaction.interactionId)) {
       throw new Error("Host Interaction opened more than once");
     }
@@ -964,11 +977,13 @@ export class CodexTurnProjector {
         ...this.#startItem({ type: "item.started", turnId: this.#turnId, item }, emittedAtMs)
           .messages,
       );
+      if (interaction.ownerItemId) this.#detached.add(itemId);
     }
     this.#interactions.set(interaction.interactionId, {
       type: "question",
       itemId,
       syntheticItem,
+      ...(interaction.ownerItemId ? { ownerItemId: interaction.ownerItemId } : {}),
     });
     return { messages, itemId, questionRequest };
   }
@@ -1238,7 +1253,12 @@ export class CodexTurnProjector {
   #completeTurn(event: TurnCompletedEvent, completedAtMs: number): CodexTurnProjection {
     // An accepted input may be withdrawn or fail before native execution starts.
     if (event.outcome.status === "succeeded") this.#requireStarted();
-    if (this.#interactions.size > 0) {
+    if (
+      [...this.#interactions.values()].some(
+        (interaction) =>
+          interaction.ownerItemId === undefined || !this.#detached.has(interaction.ownerItemId),
+      )
+    ) {
       throw new Error("Host Turn completed with pending Interactions");
     }
     const active = [...this.#items.values()].filter(
@@ -1519,5 +1539,17 @@ export class CodexTurnProjector {
 
   #requireStarted(): void {
     if (!this.#started) throw new Error("Host Item or terminal output precedes turn.started");
+  }
+
+  #requireInteractionOwner(ownerItemId: HostItemId | undefined): void {
+    if (ownerItemId !== undefined) {
+      const owner = this.#activeItem(ownerItemId).item;
+      if (owner.type !== "commandExecution" && owner.type !== "subagentDelegation") {
+        throw new Error("Host Interaction owner must be a native background Item");
+      }
+    }
+    if (this.#completed && (ownerItemId === undefined || !this.#detached.has(ownerItemId))) {
+      throw new Error("Host Interaction follows the Turn terminal event");
+    }
   }
 }

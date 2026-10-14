@@ -137,7 +137,8 @@ export function projectCodexApprovalRequest(input: {
       params: {
         serverName,
         threadId: input.threadId,
-        turnId: interaction.turnId,
+        // Background requests belong to the native Session, not a finished Root execution.
+        turnId: interaction.ownerItemId ? null : interaction.turnId,
         mode: "form",
         message: title,
         requestedSchema: { type: "object", properties: {} },
@@ -205,7 +206,7 @@ function projectApprovalChoices(input: {
       params: {
         serverName: boundedText(input.serverName, "server name", SERVER_NAME_MAX_LENGTH),
         threadId: input.threadId,
-        turnId: interaction.turnId,
+        turnId: interaction.ownerItemId ? null : interaction.turnId,
         mode: "form",
         message: [
           clampedText(interaction.title, "title", TITLE_MAX_LENGTH),

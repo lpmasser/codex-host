@@ -194,6 +194,8 @@ export interface HostQuestionInteraction {
   interactionId: HostInteractionId;
   turnId: HostTurnId;
   itemId?: HostItemId;
+  /** A live native task Item owns this request; it may outlive its Root Turn. */
+  ownerItemId?: HostItemId;
   title?: string;
   questions: HostQuestion[];
   expiresAt?: string;
@@ -211,6 +213,8 @@ export interface HostApprovalInteraction {
   type: "approval";
   interactionId: HostInteractionId;
   turnId: HostTurnId;
+  /** A live native task Item owns this request; it may outlive its Root Turn. */
+  ownerItemId?: HostItemId;
   title: string;
   description?: string;
   subject: { type: "nativeAction" };
@@ -539,7 +543,7 @@ export interface ItemCompletedEvent {
 }
 
 /**
- * The Item keeps running after its Turn completes (a native background command).
+ * The native command or Subagent delegation keeps running after its Turn completes.
  * It settles later with `item.updated` / `item.completed` on the same Turn.
  */
 export interface ItemDetachedEvent {

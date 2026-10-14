@@ -36,7 +36,7 @@ Opening a create-mode Pi Session SHALL NOT start a Pi process. The Session SHALL
 
 ### Requirement: Accepted text Turns have an ordered complete lifecycle
 
-A Session SHALL expose one single-consumer ordered output stream. Every accepted text Turn SHALL produce exactly one `turn.started` and one `turn.completed`, SHALL retain the established Agent Message lifecycle, MAY expose zero or more Reasoning Item lifecycles only for explicit visible native reasoning, and SHALL complete every started Item before the Turn terminal event.
+A Session SHALL expose one single-consumer ordered output stream. Every accepted text Turn SHALL produce exactly one `turn.started` and one `turn.completed`, SHALL retain the established Agent Message lifecycle, MAY expose zero or more Reasoning Item lifecycles only for explicit visible native reasoning, and SHALL complete every foreground Item before the Turn terminal event. An explicitly detached native background Command or Subagent Item MAY update and complete after that event.
 
 #### Scenario: Successful text Turn with Reasoning
 

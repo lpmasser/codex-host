@@ -117,6 +117,7 @@ describe("Claude Workflow lifecycle", () => {
     ).toEqual({ callId: "workflow-call", taskId: "workflow-task" });
     expect(events).toMatchObject([
       { type: "item.started", item: { prompt: "review", subagents: [] } },
+      { type: "item.detached", turnId, itemId: "workflow-item-1" },
     ]);
     expect(workflows.pendingCount).toBe(0);
     expect(workflows.taskIds(turnId)).toEqual(["workflow-task"]);
@@ -185,6 +186,13 @@ describe("Claude Workflow lifecycle", () => {
       { type: "workflow.launched", callId: "cancelled", isError: false, background: true },
       true,
     );
+    expect(events.at(-1)).toMatchObject({ type: "item.detached" });
+    workflows.settle({
+      type: "subagent.settled",
+      callId: "cancelled",
+      nativeSubagentId: "cancelled-task",
+      status: "interrupted",
+    });
     expect(events.at(-1)).toMatchObject({
       snapshot: { outcome: { status: "cancelled" } },
     });
@@ -238,20 +246,12 @@ describe("Claude Workflow lifecycle", () => {
     );
 
     workflows.finalize(otherTurnId, { status: "succeeded" });
-    expect(events.map(({ type }) => type)).toEqual(["item.started"]);
+    expect(events.map(({ type }) => type)).toEqual(["item.started", "item.detached"]);
     workflows.finalize(turnId, { status: "succeeded" });
     expect(events.at(-1)).toMatchObject({
-      type: "item.completed",
+      type: "item.detached",
       turnId,
-      snapshot: {
-        outcome: { status: "succeeded" },
-        item: {
-          subagents: [
-            { nativeSubagentId: "agent-a", status: "running" },
-            { subagentId: "workflow-call:2", status: "pending" },
-          ],
-        },
-      },
+      itemId: "workflow-item-1",
     });
     expect(workflows.taskIds(turnId)).toEqual(["workflow-task"]);
     expect(workflows.taskIds(otherTurnId)).toEqual([]);
@@ -267,14 +267,18 @@ describe("Claude Workflow lifecycle", () => {
         ],
       }),
     ).toEqual(["agent-a", "agent-b"]);
-    expect(events.slice(emitted)).toEqual([
+    expect(events.slice(emitted)).toMatchObject([
       {
-        type: "subagent.state.changed",
-        nativeSubagentId: "agent-a",
-        status: "completed",
-        resultSummary: "ok",
+        type: "item.updated",
+        turnId,
+        update: {
+          type: "subagents.replace",
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "agent-a", status: "completed" }),
+            expect.objectContaining({ nativeSubagentId: "agent-b", status: "running" }),
+          ],
+        },
       },
-      { type: "subagent.state.changed", nativeSubagentId: "agent-b", status: "running" },
     ]);
 
     expect(
@@ -284,10 +288,18 @@ describe("Claude Workflow lifecycle", () => {
         status: "interrupted",
       }),
     ).toMatchObject({ callId: "workflow-call" });
-    expect(events.at(-1)).toEqual({
-      type: "subagent.state.changed",
-      nativeSubagentId: "agent-b",
-      status: "interrupted",
+    expect(events.at(-1)).toMatchObject({
+      type: "item.completed",
+      turnId,
+      snapshot: {
+        item: {
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "agent-a", status: "completed" }),
+            expect.objectContaining({ nativeSubagentId: "agent-b", status: "interrupted" }),
+          ],
+        },
+        outcome: { status: "cancelled" },
+      },
     });
     expect(events.filter(({ type }) => type === "item.completed")).toHaveLength(1);
   });

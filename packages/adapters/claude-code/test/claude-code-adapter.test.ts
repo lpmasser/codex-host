@@ -165,7 +165,25 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   }): void => {
     void this.emitAutonomousTurn(turn);
   };
+  readonly backgroundRequests = new Set<string>();
+  readonly rootRequests = new Map<string, number>();
   event(event: ClaudeTurnEvent): void {
+    if (event.type === "interaction.requested" && event.ownerCallId) {
+      this.backgroundRequests.add(event.request.requestId);
+      this.threadEvent(event);
+      return;
+    }
+    if (event.type === "interaction.closed" && this.backgroundRequests.delete(event.requestId)) {
+      this.threadEvent(event);
+      return;
+    }
+    if (event.type === "interaction.closed") {
+      const segmentId = this.rootRequests.get(event.requestId);
+      this.rootRequests.delete(event.requestId);
+      if (segmentId !== undefined) void this.handler({ type: "segment.event", segmentId, event });
+      else this.threadEvent(event);
+      return;
+    }
     if (
       event.type === "subagent.settled" ||
       event.type === "subagents.live" ||
@@ -181,13 +199,14 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
       return;
     }
     const id = this.activeSegment ?? this.begin();
+    if (event.type === "interaction.requested") this.rootRequests.set(event.request.requestId, id);
     void this.handler({ type: "segment.event", segmentId: id, event });
   }
   threadEvent(event: ClaudeTurnEvent): void {
     void this.handler({ type: "thread.event", event });
   }
-  approval(request: ClaudeApprovalRequest): void {
-    this.event({ type: "interaction.requested", request });
+  approval(request: ClaudeApprovalRequest, ownerCallId?: string): void {
+    this.event({ type: "interaction.requested", request, ...(ownerCallId ? { ownerCallId } : {}) });
   }
   question(request: ClaudeQuestionRequest): void {
     this.event({ type: "interaction.requested", request });
@@ -2319,6 +2338,40 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
+  it("publishes signed narration as separate commentary before the final answer", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("narration"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({
+      type: "narration.completed",
+      messageId: "narration-block",
+      text: "Choose a rule.",
+    });
+    transport.delta("Final answer", "final-response");
+    transport.finish({ status: "succeeded" });
+    const messages = [];
+    for (;;) {
+      const event = await nextEvent(iterator);
+      if (event.type === "item.completed" && event.snapshot.item.type === "agentMessage") {
+        messages.push(event.snapshot.item);
+      }
+      if (event.type === "turn.completed") break;
+    }
+    expect(messages).toEqual([
+      expect.objectContaining({ text: "Choose a rule.", phase: "commentary" }),
+      expect.objectContaining({ text: "Final answer" }),
+    ]);
+    expect(messages[0]?.itemId).not.toBe(messages[1]?.itemId);
+    expect(messages[1]?.phase).toBeUndefined();
+    await session.close();
+  });
+
   it("projects distinct visible Reasoning lifecycles before final text", async () => {
     const { adapter, transports } = fixture();
     const session = await openSession(adapter);
@@ -2676,13 +2729,7 @@ describe("Claude Code HarnessAdapter", () => {
         ],
       },
     });
-    expect(await nextEvent(iterator)).toMatchObject({
-      type: "item.completed",
-      snapshot: {
-        item: { type: "subagentDelegation", subagents: [{ status: "running" }] },
-        outcome: { status: "succeeded" },
-      },
-    });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.detached" });
     transport.finish({ status: "succeeded" });
     expect(await nextEvent(iterator)).toMatchObject({
       type: "item.completed",
@@ -2721,10 +2768,22 @@ describe("Claude Code HarnessAdapter", () => {
       result: { status: "succeeded" },
     });
     expect(await nextEvent(iterator)).toMatchObject({
-      type: "subagent.state.changed",
+      type: "item.completed",
+      snapshot: {
+        item: {
+          subagents: [
+            expect.objectContaining({
+              nativeSubagentId: "native-agent-1",
+              status: "completed",
+              resultSummary: "Inspection complete",
+            }),
+          ],
+        },
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "subagent.transcript.changed",
       nativeSubagentId: "native-agent-1",
-      status: "completed",
-      resultSummary: "Inspection complete",
     });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.autonomous.started" });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.started" });
@@ -2775,6 +2834,7 @@ describe("Claude Code HarnessAdapter", () => {
       type: "subagent.completed",
       callId: "send-1",
       isError: false,
+      continuesInBackground: true,
       resultSummary: "Message sent successfully",
     });
     expect(await nextEvent(iterator)).toMatchObject({
@@ -2782,11 +2842,7 @@ describe("Claude Code HarnessAdapter", () => {
       update: { type: "subagents.replace", subagents: [{ status: "running" }] },
     });
     expect(await nextEvent(iterator)).toMatchObject({
-      type: "item.completed",
-      snapshot: {
-        item: { type: "subagentDelegation", subagents: [{ status: "running" }] },
-        outcome: { status: "succeeded" },
-      },
+      type: "item.detached",
     });
     transport.finish({ status: "succeeded" });
     expect(await nextEvent(iterator)).toMatchObject({
@@ -2814,10 +2870,10 @@ describe("Claude Code HarnessAdapter", () => {
       result: { status: "succeeded" },
     });
     expect(await nextEvent(iterator)).toMatchObject({
-      type: "subagent.state.changed",
-      nativeSubagentId: "native-agent-1",
-      status: "completed",
+      type: "item.completed",
+      snapshot: { item: { type: "subagentDelegation" }, outcome: { status: "succeeded" } },
     });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "subagent.transcript.changed" });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.autonomous.started" });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.started" });
     expect(await nextEvent(iterator)).toMatchObject({
@@ -2958,9 +3014,14 @@ describe("Claude Code HarnessAdapter", () => {
       status: "interrupted",
     });
     expect(await nextEvent(iterator)).toMatchObject({
-      type: "subagent.state.changed",
-      nativeSubagentId: "native-agent-1",
-      status: "interrupted",
+      type: "item.completed",
+      snapshot: {
+        item: {
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "native-agent-1", status: "interrupted" }),
+          ],
+        },
+      },
     });
     transport.finish({ status: "cancelled", reason: "Cancelled by user" });
     const outputs = eventOutputs(
@@ -3138,21 +3199,26 @@ describe("Claude Code HarnessAdapter", () => {
         await vi.waitFor(() =>
           expect(events.some((event) => event.type === "turn.completed")).toBe(true),
         );
-        expect(events.filter((event) => event.type === "subagent.state.changed")).toEqual([
-          {
-            type: "subagent.state.changed",
-            nativeSubagentId: "fast-child",
-            status,
-            resultSummary: "Child finished",
-          },
-        ]);
-        const creation = events.findIndex(
+        const settled = events.find(
           (event) =>
             event.type === "item.completed" && event.snapshot.item.type === "subagentDelegation",
         );
-        const settlement = events.findIndex((event) => event.type === "subagent.state.changed");
-        expect(creation).toBeGreaterThanOrEqual(0);
-        expect(settlement).toBeGreaterThan(creation);
+        expect(settled).toMatchObject({
+          snapshot: {
+            item: {
+              subagents: [
+                expect.objectContaining({
+                  nativeSubagentId: "fast-child",
+                  status,
+                  resultSummary: "Child finished",
+                }),
+              ],
+            },
+          },
+        });
+        expect(events.findIndex((event) => event.type === "item.detached")).toBeLessThan(
+          events.findIndex((event) => event === settled),
+        );
         expect(await session.execute(textTurn("next-user-turn"))).toMatchObject({ ok: true });
         transport.finish({ status: "succeeded" });
       } finally {
@@ -5646,6 +5712,181 @@ describe("Claude Code Ultracode selection", () => {
 });
 
 describe("Claude Code Workflow runs", () => {
+  it.each(["Agent", "Workflow", "Bash"])(
+    "stops a %s task launched during interrupt",
+    async (kind) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const outputs: HarnessOutput[] = [];
+      const drain = (async () => {
+        for await (const output of session.outputs) outputs.push(output);
+      })();
+      try {
+        await session.execute(textTurn("launch-race"));
+        const transport = transports[0];
+        if (!transport) throw new Error("Fake Claude transport was not created");
+        if (kind === "Agent")
+          transport.event({
+            type: "subagent.started",
+            callId: "race-call",
+            operation: "spawn",
+            description: "race",
+            background: true,
+          });
+        else if (kind === "Workflow")
+          transport.event({ type: "workflow.started", callId: "race-call" });
+        else
+          transport.event({
+            type: "tool.started",
+            callId: "race-call",
+            toolName: "Bash",
+            arguments: { command: "sleep 1" },
+          });
+        transport.abort.mockImplementation(async () => {
+          transport.backgroundTaskIds.add("race-task");
+          if (kind === "Agent")
+            transport.event({
+              type: "subagent.completed",
+              callId: "race-call",
+              isError: false,
+              continuesInBackground: true,
+              nativeSubagentId: "race-task",
+            });
+          else if (kind === "Workflow")
+            transport.event({
+              type: "workflow.launched",
+              callId: "race-call",
+              isError: false,
+              background: true,
+              taskId: "race-task",
+            });
+          else
+            transport.event({
+              type: "tool.completed",
+              callId: "race-call",
+              toolName: "Bash",
+              isError: false,
+              backgroundTaskId: "race-task",
+            });
+          return { stillQueued: [] };
+        });
+        expect(
+          await session.execute({
+            type: "turn.cancel",
+            turnId: hostTurnIdSchema.parse("launch-race"),
+          }),
+        ).toMatchObject({ ok: true });
+        expect(transport.stopTasks).toHaveBeenCalledWith(["race-task"]);
+        transport.finish({ status: "cancelled", reason: "interrupted" });
+        if (kind !== "Bash") {
+          transport.approval(
+            { type: "approval", requestId: "race-approval", title: "Still stopping" },
+            "race-call",
+          );
+          await vi.waitFor(() =>
+            expect(
+              outputs.some(
+                (output) => output.kind === "interaction" && output.interaction.ownerItemId,
+              ),
+            ).toBe(true),
+          );
+          transport.event({
+            type: "interaction.closed",
+            requestId: "race-approval",
+            reason: "cancelled",
+          });
+        }
+        transport.threadEvent({
+          type: "subagent.settled",
+          callId: "race-call",
+          nativeSubagentId: "race-task",
+          status: "interrupted",
+        });
+        await vi.waitFor(() =>
+          expect(
+            outputs.some(
+              (output) =>
+                output.kind === "event" &&
+                output.event.type === "item.completed" &&
+                output.event.snapshot.item.type !== "agentMessage" &&
+                output.event.snapshot.outcome.status === "cancelled",
+            ),
+          ).toBe(true),
+        );
+        expect(
+          outputs.some(
+            (output) => output.kind === "event" && output.event.type === "session.faulted",
+          ),
+        ).toBe(false);
+        expect(await session.execute(textTurn("after-race"))).toMatchObject({ ok: true });
+        transport.finish({ status: "succeeded" });
+      } finally {
+        await session.close();
+        await drain;
+      }
+    },
+  );
+
+  it("closes foreground Agent interactions before a failed Root completes", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    try {
+      await session.execute(textTurn("foreground-failure"));
+      const transport = transports[0];
+      if (!transport) throw new Error("Fake Claude transport was not created");
+      transport.event({
+        type: "subagent.started",
+        callId: "foreground-call",
+        operation: "spawn",
+        description: "foreground",
+        background: false,
+      });
+      transport.approval(
+        { type: "approval", requestId: "foreground-request", title: "Allow?" },
+        "foreground-call",
+      );
+      const requested = await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "interaction",
+      );
+      const interactionOutput = requested.at(-1);
+      if (!interactionOutput) throw new Error("Expected interaction output");
+      if (interactionOutput.kind !== "interaction") throw new Error("Expected interaction");
+      const interaction = interactionOutput.interaction;
+      transport.finish({ status: "failed", kind: "protocol" });
+      const outputs = await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      );
+      const events = eventOutputs(outputs);
+      const close = events.findIndex(
+        (event) =>
+          event.type === "interaction.closed" && event.interactionId === interaction.interactionId,
+      );
+      const completion = events.findIndex(
+        (event) =>
+          event.type === "item.completed" && event.snapshot.item.type === "subagentDelegation",
+      );
+      expect(close).toBeGreaterThanOrEqual(0);
+      expect(completion).toBeGreaterThan(close);
+      expect(transport.respondToInteraction).toHaveBeenCalledWith({
+        type: "approval",
+        requestId: "foreground-request",
+        decision: "deny",
+      });
+      transport.event({
+        type: "interaction.closed",
+        requestId: "foreground-request",
+        reason: "cancelled",
+      });
+      expect(await session.execute(textTurn("after-failure"))).toMatchObject({ ok: true });
+      transport.finish({ status: "succeeded" });
+    } finally {
+      await session.close();
+    }
+  });
+
   async function launchWorkflow(options: ClaudeCodeAdapterOptions = {}) {
     const { adapter, transports } = fixture(options);
     const session = await openSession(adapter);
@@ -5688,6 +5929,7 @@ describe("Claude Code Workflow runs", () => {
       background: true,
       taskId: "workflow-task",
     });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.detached" });
     transport.event({
       type: "workflow.updated",
       callId: "workflow-call",
@@ -5722,6 +5964,178 @@ describe("Claude Code Workflow runs", () => {
     });
     return { iterator, session, transport };
   }
+
+  it("closes background requests before faulting their Items", async () => {
+    const { iterator, session, transport } = await launchWorkflow();
+    try {
+      transport.approval(
+        { type: "approval", requestId: "fault-approval", title: "Allow?" },
+        "workflow-call",
+      );
+      const approval = await nextInteraction(iterator);
+      transport.finish({ status: "succeeded" });
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      );
+      transport.onFault(new Error("native process failed"));
+      const outputs = await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "session.faulted",
+      );
+      const events = eventOutputs(outputs);
+      expect(events[0]).toMatchObject({
+        type: "interaction.closed",
+        interactionId: approval.interactionId,
+      });
+      expect(events[1]).toMatchObject({
+        type: "item.completed",
+        snapshot: { item: { type: "subagentDelegation" }, outcome: { status: "failed" } },
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it("denies a request whose native task ended without faulting the Session", async () => {
+    const { iterator, session, transport } = await launchWorkflow();
+    try {
+      transport.finish({ status: "succeeded" });
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      );
+      transport.threadEvent({
+        type: "subagent.settled",
+        callId: "workflow-call",
+        nativeSubagentId: "workflow-task",
+        status: "completed",
+      });
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "item.completed",
+      );
+      transport.approval(
+        { type: "approval", requestId: "ended-request", title: "Too late" },
+        "workflow-call",
+      );
+      await vi.waitFor(() =>
+        expect(transport.respondToInteraction).toHaveBeenCalledWith({
+          type: "approval",
+          requestId: "ended-request",
+          decision: "deny",
+        }),
+      );
+      transport.respondToInteraction.mockRejectedValueOnce(
+        new Error("Claude SDK Interaction is not pending"),
+      );
+      transport.approval(
+        { type: "approval", requestId: "already-aborted-request", title: "Already cancelled" },
+        "workflow-call",
+      );
+      await vi.waitFor(() =>
+        expect(transport.respondToInteraction).toHaveBeenCalledWith({
+          type: "approval",
+          requestId: "already-aborted-request",
+          decision: "deny",
+        }),
+      );
+      expect(await session.execute(textTurn("after-task"))).toMatchObject({ ok: true });
+      transport.finish({ status: "succeeded" });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it("answers a Workflow approval after Root completion while a new Root runs", async () => {
+    const { iterator, session, transport } = await launchWorkflow();
+    transport.approval(
+      { type: "approval", requestId: "background-approval", title: "Agent: Bash" },
+      "workflow-call",
+    );
+    const approval = await nextInteraction(iterator);
+    expect(approval).toHaveProperty("ownerItemId");
+    transport.delta("Launched", "root-done");
+    transport.event({ type: "message.completed", messageId: "root-done" });
+    transport.finish({ status: "succeeded" });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.some((event) => event.type === "interaction.closed")).toBe(false);
+    await expect(session.execute(textTurn("new foreground"))).resolves.toMatchObject({ ok: true });
+    await expect(
+      session.execute({
+        type: "interaction.respond",
+        interactionId: approval.interactionId,
+        response: { type: "approval", actionId: "allowOnce" },
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(transport.respondToInteraction).toHaveBeenLastCalledWith({
+      type: "approval",
+      requestId: "background-approval",
+      decision: "allowOnce",
+    });
+    expect(
+      eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "interaction.closed",
+        ),
+      ).at(-1),
+    ).toMatchObject({ turnId: hostTurnIdSchema.parse("run a workflow"), reason: "responded" });
+    transport.event({
+      type: "workflow.updated",
+      callId: "workflow-call",
+      agents: [{ index: 2, label: "Late agent", state: "running", agentId: "late-agent" }],
+    });
+    expect(
+      eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "item.updated",
+        ),
+      ).at(-1),
+    ).toMatchObject({
+      turnId: hostTurnIdSchema.parse("run a workflow"),
+      update: {
+        type: "subagents.replace",
+        subagents: expect.arrayContaining([
+          expect.objectContaining({ nativeSubagentId: "late-agent" }),
+        ]),
+      },
+    });
+    transport.stopTasks.mockImplementation(async () => {
+      transport.threadEvent({
+        type: "subagent.settled",
+        callId: "workflow-call",
+        nativeSubagentId: "workflow-task",
+        status: "interrupted",
+      });
+    });
+    await expect(
+      session.execute({ type: "turn.cancel", turnId: hostTurnIdSchema.parse("run a workflow") }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(transport.stopTasks).toHaveBeenCalledWith(["workflow-task"]);
+    expect(transport.abort).not.toHaveBeenCalled();
+    transport.delta("Foreground still works", "foreground-done");
+    transport.event({ type: "message.completed", messageId: "foreground-done" });
+    transport.finish({ status: "succeeded" });
+    expect(
+      eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      ).at(-1),
+    ).toMatchObject({
+      turnId: hostTurnIdSchema.parse("new foreground"),
+      outcome: { status: "succeeded" },
+    });
+    await session.close();
+  });
 
   it("keeps a launched run working after its Turn and settles it at Session level", async () => {
     const { iterator, session, transport } = await launchWorkflow();
@@ -5760,21 +6174,12 @@ describe("Claude Code Workflow runs", () => {
         (output) => output.kind === "event" && output.event.type === "turn.completed",
       ),
     );
-    // Like a background Subagent, the launch completes with the Turn while its agents run on.
-    expect(rootOutputs).toContainEqual(
-      expect.objectContaining({
-        type: "item.completed",
-        snapshot: expect.objectContaining({
-          outcome: { status: "succeeded" },
-          item: expect.objectContaining({
-            type: "subagentDelegation",
-            subagents: [
-              expect.objectContaining({ nativeSubagentId: "agent-a", status: "running" }),
-            ],
-          }),
-        }),
-      }),
-    );
+    expect(
+      rootOutputs.some(
+        (event) =>
+          event.type === "item.completed" && event.snapshot.item.type === "subagentDelegation",
+      ),
+    ).toBe(false);
     expect(rootOutputs.at(-1)).toMatchObject({
       type: "turn.completed",
       outcome: { status: "succeeded" },
@@ -5800,10 +6205,17 @@ describe("Claude Code Workflow runs", () => {
       status: "completed",
       resultSummary: "Count lines",
     });
-    expect(await nextEvent(iterator)).toEqual({
-      type: "subagent.state.changed",
-      nativeSubagentId: "agent-a",
-      status: "completed",
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      turnId: hostTurnIdSchema.parse("run a workflow"),
+      snapshot: {
+        item: {
+          type: "subagentDelegation",
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "agent-a", status: "completed" }),
+          ],
+        },
+      },
     });
     expect(await nextEvent(iterator)).toEqual({
       type: "subagent.transcript.changed",

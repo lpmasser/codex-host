@@ -24,10 +24,7 @@ interface WorkflowRun {
   agents: Map<number, HostSubagentState>;
   /** The Workflow tool returned and the run keeps working in the background. */
   launched: boolean;
-  /**
-   * Its Turn ended while the run kept working. Like a background Subagent, the delegation Item
-   * completed with its agents still running, and their later states are Session-level.
-   */
+  /** The delegation Item stays open independently of its Root Turn. */
   detached: boolean;
 }
 
@@ -119,10 +116,21 @@ export class ClaudeWorkflowLifecycle {
   }
 
   /** Native task IDs of the Turn's launched runs still open. */
-  taskIds(turnId: HostTurnId): string[] {
+  taskIds(turnId?: HostTurnId): string[] {
     return [...this.#runs.values()].flatMap((run) =>
-      run.turnId === turnId && run.launched && run.taskId ? [run.taskId] : [],
+      (turnId === undefined || run.turnId === turnId) && run.launched && run.taskId
+        ? [run.taskId]
+        : [],
     );
+  }
+
+  owner(callId: string): { turnId: HostTurnId; itemId: HostItemId } | undefined {
+    const run = this.#runs.get(callId);
+    return run?.item ? { turnId: run.turnId, itemId: run.item.itemId } : undefined;
+  }
+
+  isDetached(itemId: HostItemId): boolean {
+    return [...this.#runs.values()].some((run) => run.item?.itemId === itemId && run.detached);
   }
 
   start(turnId: HostTurnId, event: WorkflowEvent<"workflow.started">): void {
@@ -154,9 +162,7 @@ export class ClaudeWorkflowLifecycle {
       run.agents.set(agent.index, next);
       changed.push(next);
     }
-    if (run.detached) {
-      this.#publishStates(changed);
-    } else if (!run.item) {
+    if (!run.item) {
       this.#open(run);
     } else if (changed.length > 0) {
       this.#replaceSubagents(run);
@@ -181,9 +187,11 @@ export class ClaudeWorkflowLifecycle {
     const run = this.#runs.get(event.callId);
     if (!run) return null;
     if (event.taskId) run.taskId = event.taskId;
-    if (!run.item) this.#open(run);
-    if (event.background && !cancellationRequested) {
+    const item = run.item ?? this.#open(run);
+    if (event.background && !event.isError) {
       run.launched = true;
+      run.detached = true;
+      this.#emit({ type: "item.detached", turnId: run.turnId, itemId: item.itemId });
       return { callId: run.callId, ...(run.taskId ? { taskId: run.taskId } : {}) };
     }
     this.#complete(
@@ -221,28 +229,11 @@ export class ClaudeWorkflowLifecycle {
     };
   }
 
-  /**
-   * Ends the Turn's runs with the Turn outcome. A launched run keeps working natively, so its
-   * Item completes with the launch while its agents keep their reported state.
-   */
+  /** Root completion only settles foreground calls; detached runs follow native task events. */
   finalize(turnId: HostTurnId, outcome: HostItemOutcome): void {
     for (const run of [...this.#runs.values()]) {
       if (run.turnId !== turnId || run.detached) continue;
-      if (!run.item) {
-        // The tool never reached Claude Code's Workflow runtime, so there is no run to show.
-        this.#runs.delete(run.callId);
-        continue;
-      }
-      if (!run.launched) {
-        this.#complete(run, outcome);
-        continue;
-      }
-      run.detached = true;
-      this.#emit({
-        type: "item.completed",
-        turnId: run.turnId,
-        snapshot: { item: run.item, outcome: { status: "succeeded" } },
-      });
+      this.#complete(run, outcome);
     }
   }
 
@@ -251,7 +242,7 @@ export class ClaudeWorkflowLifecycle {
     for (const run of [...this.#runs.values()]) this.#complete(run, outcome);
   }
 
-  #open(run: WorkflowRun): void {
+  #open(run: WorkflowRun): HostSubagentDelegationItem {
     const prompt = run.description ?? run.name;
     const item: HostSubagentDelegationItem = {
       type: "subagentDelegation",
@@ -262,6 +253,7 @@ export class ClaudeWorkflowLifecycle {
     };
     run.item = item;
     this.#emit({ type: "item.started", turnId: run.turnId, item });
+    return item;
   }
 
   #replaceSubagents(run: WorkflowRun): void {
@@ -295,29 +287,11 @@ export class ClaudeWorkflowLifecycle {
           ? { ...agent, status: "interrupted" as const }
           : agent,
     );
-    if (run.detached) {
-      const previous = this.#orderedAgents(run);
-      this.#publishStates(subagents.filter((agent, index) => !sameAgent(previous[index], agent)));
-      return;
-    }
     this.#emit({
       type: "item.completed",
       turnId: run.turnId,
       snapshot: { item: { ...item, subagents }, outcome },
     });
-  }
-
-  /** Agent states of a detached run; agents first reported after its Turn have no Item. */
-  #publishStates(agents: readonly HostSubagentState[]): void {
-    for (const agent of agents) {
-      if (!agent.nativeSubagentId) continue;
-      this.#emit({
-        type: "subagent.state.changed",
-        nativeSubagentId: agent.nativeSubagentId,
-        status: agent.status,
-        ...(agent.resultSummary ? { resultSummary: agent.resultSummary } : {}),
-      });
-    }
   }
 
   #orderedAgents(run: WorkflowRun): HostSubagentState[] {

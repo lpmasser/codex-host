@@ -1409,6 +1409,81 @@ describe("ClaudeSdkTransport abort", () => {
 });
 
 describe("ClaudeSdkTransport Question callbacks", () => {
+  it("still reports the original fault and rejects pending input when the summary consumer fails", async () => {
+    const value = fixture();
+    const original = new Error("Consumer failed");
+    value.transport.setEventHandler((frame) => {
+      if (frame.type === "segment.event") throw original;
+    });
+    await value.transport.start();
+    const input = value.transport.submitInput("prompt", "pending-input", "later");
+    const rejected = expect(input).rejects.toThrow("closed before input acceptance was confirmed");
+    value.fakeQuery.push({
+      type: "stream_event",
+      uuid: "unfinished",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "Retained summary" },
+      },
+    } as unknown as SDKMessage);
+    value.fakeQuery.push({
+      type: "stream_event",
+      uuid: "text",
+      event: {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "text_delta", text: "Trigger handler" },
+      },
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(value.onFault).toHaveBeenCalledExactlyOnceWith(original));
+    await rejected;
+    await value.transport.close();
+  });
+
+  it.each(["EOF", "error", "close"] as const)(
+    "retains unclassified thinking when the SDK exits through %s without Result",
+    async (exit) => {
+      const value = fixture();
+      const events: ClaudeTurnEvent[] = [];
+      const partial = {
+        type: "stream_event",
+        uuid: "unfinished",
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "thinking_delta", thinking: "Retained summary" },
+        },
+      } as unknown as SDKMessage;
+      if (exit === "error") {
+        let yielded = false;
+        vi.spyOn(value.fakeQuery, Symbol.asyncIterator).mockImplementation(() => ({
+          next: async () => {
+            if (!yielded) {
+              yielded = true;
+              return { done: false, value: partial };
+            }
+            throw new Error("Native process failed");
+          },
+        }));
+      }
+      value.transport.setEventHandler((frame) => {
+        if (frame.type === "segment.event") events.push(frame.event);
+      });
+      await value.transport.start();
+      if (exit !== "error") value.fakeQuery.push(partial);
+      if (exit === "close") await value.transport.close();
+      else {
+        if (exit === "EOF") value.fakeQuery.close();
+        await vi.waitFor(() => expect(value.onFault).toHaveBeenCalledOnce());
+        await value.transport.close();
+      }
+      expect(events).toEqual([
+        { type: "reasoning.delta", messageId: "unfinished:thinking:0", delta: "Retained summary" },
+      ]);
+    },
+  );
+
   it("uses caller identity for create and the same Native Session for resume", async () => {
     const created = fixture();
     await created.transport.start();
@@ -1458,8 +1533,8 @@ describe("ClaudeSdkTransport Question callbacks", () => {
 
     await expect(turn).resolves.toEqual({ status: "succeeded" });
     expect(events).toEqual([
-      { type: "reasoning.delta", messageId: assistantId, delta: "visible" },
-      { type: "reasoning.completed", messageId: assistantId },
+      { type: "reasoning.delta", messageId: `${assistantId}:thinking:0`, delta: "visible" },
+      { type: "reasoning.completed", messageId: `${assistantId}:thinking:0` },
       { type: "text.delta", messageId: assistantId, delta: "answer" },
       { type: "message.completed", messageId: assistantId, checkpointId: assistantId },
     ]);
@@ -3039,12 +3114,13 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
     canUseTool: NonNullable<ReturnType<typeof options>["canUseTool"]>,
     toolUseID: string,
     requestId: string,
+    signal = new AbortController().signal,
   ) {
     return canUseTool(
       "Bash",
       { command: "wc -l a.txt" },
       {
-        signal: new AbortController().signal,
+        signal,
         toolUseID,
         requestId,
         displayName: "Bash",
@@ -3054,7 +3130,19 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
     );
   }
 
-  it("names the agent and routes its approval to the Root Segment that runs the Workflow", async () => {
+  function settleWorkflow(fakeQuery: FakeQuery): void {
+    fakeQuery.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "workflow-task",
+      tool_use_id: "workflow-call",
+      status: "completed",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+  }
+
+  /** Starts a Root that calls the Workflow tool, with Session events collected. */
+  async function workflowRoot() {
     const value = fixture();
     const threadEvents: ClaudeTurnEvent[] = [];
     value.observeThreadEvents((event) => threadEvents.push(event));
@@ -3066,15 +3154,29 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
       events.push(event),
     );
     pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
+    await vi.waitFor(() =>
+      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.started" })),
+    );
+    return { value, threadEvents, canUseTool, events, turn };
+  }
+
+  function interactionEvents(events: ClaudeTurnEvent[]) {
+    return events.filter(
+      ({ type }) => type === "interaction.requested" || type === "interaction.closed",
+    );
+  }
+
+  it("names the agent and routes its approval to the Workflow call that launched it", async () => {
+    const { value, threadEvents, canUseTool, events, turn } = await workflowRoot();
     value.fakeQuery.push(workflowProgress);
-    // Run progress is a Session fact: a launched run keeps reporting after its Root Segment.
     await vi.waitFor(() =>
       expect(threadEvents).toContainEqual(expect.objectContaining({ type: "workflow.updated" })),
     );
 
     const permission = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
-    expect(events.at(-1)).toEqual({
+    expect(threadEvents.at(-1)).toEqual({
       type: "interaction.requested",
+      ownerCallId: "workflow-call",
       request: {
         type: "approval",
         requestId: "claude-approval-1",
@@ -3091,7 +3193,7 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
       behavior: "allow",
       toolUseID: "agent-bash-tool",
     });
-    expect(events.at(-1)).toEqual({
+    expect(threadEvents.at(-1)).toEqual({
       type: "interaction.closed",
       requestId: "claude-approval-1",
       reason: "responded",
@@ -3099,79 +3201,468 @@ describe("ClaudeSdkTransport Workflow agent Interactions", () => {
     launchWorkflow(value.fakeQuery);
     completeTurn(value.fakeQuery);
     await expect(turn).resolves.toEqual({ status: "succeeded" });
+    // An agent request never belongs to the Root execution that happened to be live.
+    expect(interactionEvents(events)).toEqual([]);
     await value.transport.close();
   });
 
-  it("routes an agent approval raised before the run first reports that agent", async () => {
-    const value = fixture();
-    await value.transport.start();
-    const canUseTool = options(value).canUseTool;
-    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
-    const events: ClaudeTurnEvent[] = [];
-    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000012", (event) =>
-      events.push(event),
-    );
-    pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
-    await vi.waitFor(() =>
-      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.started" })),
-    );
+  it("waits for the run to report a late agent before routing its approval", async () => {
+    const { value, threadEvents, canUseTool, turn } = await workflowRoot();
     const permission = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
-    expect(events.some(({ type }) => type === "interaction.requested")).toBe(false);
+    value.fakeQuery.push({
+      type: "assistant",
+      parent_tool_use_id: "internal-workflow-parent",
+      uuid: "early-agent-output",
+      message: {
+        id: "early-agent-message",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "agent-bash-tool", name: "Bash", input: {} }],
+      },
+    } as unknown as SDKMessage);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(interactionEvents(threadEvents)).toEqual([]);
+    launchWorkflow(value.fakeQuery);
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    expect(interactionEvents(threadEvents)).toEqual([]);
 
     value.fakeQuery.push(workflowProgress);
     await vi.waitFor(() =>
-      expect(events.at(-1)).toMatchObject({
+      expect(threadEvents.at(-1)).toMatchObject({
         type: "interaction.requested",
+        ownerCallId: "workflow-call",
         request: { requestId: "claude-approval-1" },
       }),
     );
+    // The label the run reports later names the agent once, as it would have at request time.
+    expect(threadEvents.at(-1)).toMatchObject({ request: { title: "count:a.txt: Bash" } });
     await value.transport.respondToInteraction({
       type: "approval",
       requestId: "claude-approval-1",
       decision: "deny",
     });
     await expect(permission).resolves.toMatchObject({ behavior: "deny" });
-    launchWorkflow(value.fakeQuery);
-    completeTurn(value.fakeQuery);
-    await expect(turn).resolves.toEqual({ status: "succeeded" });
     await value.transport.close();
   });
 
-  it("denies agent approvals once the Root Segment that runs the Workflow ends", async () => {
+  it("keeps agent approvals past the Root result until the run settles", async () => {
+    const { value, threadEvents, canUseTool, turn } = await workflowRoot();
+    value.fakeQuery.push(workflowProgress);
+    let settled = false;
+    const pending = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control").then(
+      (result) => {
+        settled = true;
+        return result;
+      },
+    );
+    launchWorkflow(value.fakeQuery);
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+
+    // A later agent request routes and answers without a Root execution.
+    const late = agentPermission(canUseTool, "agent-bash-tool-2", "agent-bash-control-2");
+    expect(threadEvents.at(-1)).toMatchObject({
+      type: "interaction.requested",
+      ownerCallId: "workflow-call",
+      request: { requestId: "claude-approval-2" },
+    });
+    await value.transport.respondToInteraction({
+      type: "approval",
+      requestId: "claude-approval-2",
+      decision: "allowOnce",
+    });
+    await expect(late).resolves.toMatchObject({ behavior: "allow" });
+
+    settleWorkflow(value.fakeQuery);
+    await expect(pending).resolves.toMatchObject({ behavior: "deny" });
+    await vi.waitFor(() =>
+      expect(threadEvents).toContainEqual(expect.objectContaining({ type: "subagent.settled" })),
+    );
+    const closed = threadEvents.findIndex(
+      (event) => event.type === "interaction.closed" && event.requestId === "claude-approval-1",
+    );
+    expect(threadEvents[closed]).toMatchObject({ reason: "cancelled" });
+    expect(closed).toBeLessThan(threadEvents.findIndex(({ type }) => type === "subagent.settled"));
+    // The settled run no longer owns its agents.
+    const orphan = agentPermission(canUseTool, "agent-bash-tool-3", "agent-bash-control-3");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(threadEvents.filter(({ type }) => type === "interaction.requested")).toHaveLength(2);
+    await value.transport.close();
+    await expect(orphan).resolves.toMatchObject({ behavior: "deny" });
+  });
+
+  it("settles an agent approval on its native AbortSignal and on Session close", async () => {
+    const { value, threadEvents, canUseTool, turn } = await workflowRoot();
+    value.fakeQuery.push(workflowProgress);
+    launchWorkflow(value.fakeQuery);
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    const controller = new AbortController();
+    const aborted = agentPermission(
+      canUseTool,
+      "agent-bash-tool",
+      "agent-bash-control",
+      controller.signal,
+    );
+    const closing = agentPermission(canUseTool, "agent-bash-tool-2", "agent-bash-control-2");
+
+    controller.abort();
+    await expect(aborted).resolves.toMatchObject({ behavior: "deny" });
+    await value.transport.close();
+    await expect(closing).resolves.toMatchObject({ behavior: "deny" });
+    expect(threadEvents.filter(({ type }) => type === "interaction.closed")).toEqual([
+      { type: "interaction.closed", requestId: "claude-approval-1", reason: "cancelled" },
+      { type: "interaction.closed", requestId: "claude-approval-2", reason: "cancelled" },
+    ]);
+  });
+});
+
+describe("ClaudeSdkTransport background Agent Interactions", () => {
+  /** A Root that launches a background Agent and ends while the agent keeps running. */
+  async function launchedAgent() {
     const value = fixture();
+    const threadEvents: ClaudeTurnEvent[] = [];
+    value.observeThreadEvents((event) => threadEvents.push(event));
     await value.transport.start();
     const canUseTool = options(value).canUseTool;
     if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
     const events: ClaudeTurnEvent[] = [];
-    const turn = value.startTurn("synthetic", "00000000-0000-4000-8000-000000000011", (event) =>
+    const turn = value.startTurn("delegate", "00000000-0000-4000-8000-000000000013", (event) =>
       events.push(event),
     );
-    pushToolUse(value.fakeQuery, "workflow-call", "Workflow", { name: "count" });
-    value.fakeQuery.push(workflowProgress);
-    await vi.waitFor(() =>
-      expect(events).toContainEqual(expect.objectContaining({ type: "workflow.started" })),
-    );
-    const pending = agentPermission(canUseTool, "agent-bash-tool", "agent-bash-control");
-    await vi.waitFor(() =>
-      expect(events).toContainEqual(expect.objectContaining({ type: "interaction.requested" })),
-    );
-
-    launchWorkflow(value.fakeQuery);
+    pushToolUse(value.fakeQuery, "agent-call", "Agent", {
+      description: "Inspect",
+      prompt: "inspect",
+      run_in_background: true,
+    });
+    value.fakeQuery.push({
+      type: "user",
+      session_id: "00000000-0000-4000-8000-000000000001",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "agent-call", content: "Launched" }],
+      },
+      tool_use_result: { status: "async_launched", agentId: "agent-b" },
+    } as unknown as SDKMessage);
     completeTurn(value.fakeQuery);
     await expect(turn).resolves.toEqual({ status: "succeeded" });
-    await expect(pending).resolves.toMatchObject({ behavior: "deny" });
-    expect(events.at(-1)).toEqual({
-      type: "interaction.closed",
-      requestId: "claude-approval-1",
-      reason: "superseded",
-    });
+    return { value, threadEvents, canUseTool, events };
+  }
 
-    // No Turn can show a later request; the next native frame proves its owner is not live.
-    const late = agentPermission(canUseTool, "agent-bash-tool-2", "agent-bash-control-2");
-    value.fakeQuery.push(workflowProgress);
-    await expect(late).resolves.toMatchObject({ behavior: "deny" });
+  function question(
+    canUseTool: NonNullable<ReturnType<typeof options>["canUseTool"]>,
+    toolUseID: string,
+    agentID: string,
+  ) {
+    return canUseTool("AskUserQuestion", questionInput(), {
+      signal: new AbortController().signal,
+      toolUseID,
+      requestId: `${toolUseID}-control`,
+      agentID,
+    });
+  }
+
+  it("routes a background Agent's Question after the Root result and settles it with the task", async () => {
+    const { value, threadEvents, canUseTool, events } = await launchedAgent();
+    const answered = question(canUseTool, "ask-1", "agent-b");
+    expect(threadEvents.at(-1)).toMatchObject({
+      type: "interaction.requested",
+      ownerCallId: "agent-call",
+      request: { type: "question", requestId: "claude-question-1" },
+    });
+    await value.transport.respondToInteraction({
+      type: "question",
+      requestId: "claude-question-1",
+      answers: { "Which path?": "Alpha" },
+    });
+    await expect(answered).resolves.toMatchObject({ behavior: "allow" });
+
+    const pending = question(canUseTool, "ask-2", "agent-b");
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-b",
+      tool_use_id: "agent-call",
+      status: "completed",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await expect(pending).resolves.toMatchObject({ behavior: "deny" });
+    await vi.waitFor(() =>
+      expect(threadEvents.at(-1)).toMatchObject({ type: "subagent.settled", callId: "agent-call" }),
+    );
+    expect(interactionEvents(threadEvents).at(-1)).toEqual({
+      type: "interaction.closed",
+      requestId: "claude-question-2",
+      reason: "cancelled",
+    });
+    expect(interactionEvents(events)).toEqual([]);
     await value.transport.close();
   });
+
+  it("closes a foreground agent's open request before its Agent result completes", async () => {
+    const value = fixture();
+    const log: Array<{ scope: "thread" | "segment"; event: ClaudeTurnEvent }> = [];
+    value.observeThreadEvents((event) => log.push({ scope: "thread", event }));
+    await value.transport.start();
+    const canUseTool = options(value).canUseTool;
+    if (!canUseTool) throw new Error("SDK canUseTool callback was not configured");
+    const turn = value.startTurn("delegate", "00000000-0000-4000-8000-000000000014", (event) =>
+      log.push({ scope: "segment", event }),
+    );
+    pushToolUse(value.fakeQuery, "agent-call", "Agent", { description: "Inspect", prompt: "go" });
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-f",
+      tool_use_id: "agent-call",
+      task_type: "local_agent",
+      description: "Inspect",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await vi.waitFor(() =>
+      expect(log).toContainEqual(
+        expect.objectContaining({ event: expect.objectContaining({ type: "subagent.updated" }) }),
+      ),
+    );
+    const permission = question(canUseTool, "ask-1", "agent-f");
+    expect(log.at(-1)).toEqual({
+      scope: "thread",
+      event: expect.objectContaining({ type: "interaction.requested", ownerCallId: "agent-call" }),
+    });
+
+    completeTool(value.fakeQuery, "agent-call", "Inspected");
+    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+    await vi.waitFor(() =>
+      expect(log.map(({ event }) => event.type)).toContain("subagent.completed"),
+    );
+    const types = log.map(({ scope, event }) => `${scope}:${event.type}`);
+    expect(types.indexOf("thread:interaction.closed")).toBeGreaterThan(-1);
+    expect(types.indexOf("thread:interaction.closed")).toBeLessThan(
+      types.indexOf("segment:subagent.completed"),
+    );
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    await value.transport.close();
+  });
+
+  // SDK-normalized contract case built from the stable frame shapes; not a recorded native run.
+  it.each(["agent-b", "named-agent"])(
+    "keeps a resumed agent addressed as %s owned until its task ends",
+    async (target) => {
+      const { value, threadEvents, canUseTool } = await launchedAgent();
+      const agentNotification = {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "agent-b",
+        tool_use_id: "agent-call",
+        status: "completed",
+        session_id: "00000000-0000-4000-8000-000000000001",
+      } as unknown as SDKMessage;
+      value.fakeQuery.push(agentNotification);
+      await vi.waitFor(() =>
+        expect(threadEvents.at(-1)).toMatchObject({ type: "subagent.settled" }),
+      );
+
+      const events: ClaudeTurnEvent[] = [];
+      const turn = value.startTurn("resume", "00000000-0000-4000-8000-000000000015", (event) =>
+        events.push(event),
+      );
+      pushToolUse(value.fakeQuery, "send-call", "SendMessage", {
+        to: target,
+        message: "continue",
+      });
+      // Claude Code registers the resumed agent as a new background task before the send returns.
+      value.fakeQuery.push({
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-b",
+        tool_use_id: "send-call",
+        description: "Inspect",
+        task_type: "local_agent",
+        is_backgrounded: true,
+        uuid: "00000000-0000-4000-8000-000000000016",
+        session_id: "00000000-0000-4000-8000-000000000001",
+      } as unknown as SDKMessage);
+      sendAck(value.fakeQuery);
+      completeTurn(value.fakeQuery);
+      await expect(turn).resolves.toEqual({ status: "succeeded" });
+      expect(events).toContainEqual({
+        type: "subagent.completed",
+        callId: "send-call",
+        isError: false,
+        continuesInBackground: true,
+        nativeSubagentId: "agent-b",
+        resultSummary: "Message sent",
+      });
+
+      // The live resumed task keeps running: its late request belongs to the send call.
+      let settled = false;
+      const permission = canUseTool(
+        "Bash",
+        { command: "true" },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "resumed-tool",
+          requestId: "resumed-control",
+          displayName: "Bash",
+          agentID: "agent-b",
+        },
+      ).then((result) => {
+        settled = true;
+        return result;
+      });
+      expect(threadEvents.at(-1)).toMatchObject({
+        type: "interaction.requested",
+        ownerCallId: "send-call",
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+
+      // The agent's task terminal names its original launch; it still ends the resumed request.
+      value.fakeQuery.push(agentNotification);
+      await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+      await vi.waitFor(() =>
+        expect(threadEvents.filter(({ type }) => type === "subagent.settled")).toHaveLength(2),
+      );
+      const types = threadEvents.map(({ type }) => type);
+      expect(types.lastIndexOf("interaction.closed")).toBeLessThan(
+        types.lastIndexOf("subagent.settled"),
+      );
+      await value.transport.close();
+    },
+  );
+
+  // SDK-normalized contract case built from the stable frame shapes; not a recorded native run.
+  it("ends a synchronous SendMessage's requests with its result when its task stays in the foreground", async () => {
+    const { value, threadEvents, canUseTool } = await launchedAgent();
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-b",
+      tool_use_id: "agent-call",
+      status: "completed",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(threadEvents.at(-1)).toMatchObject({ type: "subagent.settled" }));
+
+    const log: Array<{ scope: "thread" | "segment"; event: ClaudeTurnEvent }> = [];
+    value.observeThreadEvents((event) => log.push({ scope: "thread", event }));
+    const turn = value.startTurn("resume", "00000000-0000-4000-8000-000000000017", (event) =>
+      log.push({ scope: "segment", event }),
+    );
+    pushToolUse(value.fakeQuery, "send-call", "SendMessage", {
+      to: "agent-b",
+      message: "continue",
+    });
+    // The send blocks on a task registered in the foreground and never moved to the background.
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-b",
+      tool_use_id: "send-call",
+      description: "Inspect",
+      task_type: "local_agent",
+      is_backgrounded: false,
+      uuid: "00000000-0000-4000-8000-000000000018",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await vi.waitFor(() =>
+      expect(log).toContainEqual(
+        expect.objectContaining({ event: expect.objectContaining({ type: "subagent.updated" }) }),
+      ),
+    );
+    expect(value.transport.hasBackgroundTasks()).toBe(false);
+    const permission = canUseTool(
+      "Bash",
+      { command: "true" },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "sync-tool",
+        requestId: "sync-control",
+        displayName: "Bash",
+        agentID: "agent-b",
+      },
+    );
+    expect(log.at(-1)).toEqual({
+      scope: "thread",
+      event: expect.objectContaining({ type: "interaction.requested", ownerCallId: "send-call" }),
+    });
+
+    sendAck(value.fakeQuery);
+    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+    await vi.waitFor(() =>
+      expect(log.map(({ event }) => event.type)).toContain("subagent.completed"),
+    );
+    const completed = log.find(({ event }) => event.type === "subagent.completed")?.event;
+    expect(completed).not.toHaveProperty("continuesInBackground");
+    const types = log.map(({ scope, event }) => `${scope}:${event.type}`);
+    expect(types.indexOf("thread:interaction.closed")).toBeGreaterThan(-1);
+    expect(types.indexOf("thread:interaction.closed")).toBeLessThan(
+      types.indexOf("segment:subagent.completed"),
+    );
+    completeTurn(value.fakeQuery);
+    await expect(turn).resolves.toEqual({ status: "succeeded" });
+    await value.transport.close();
+  });
+
+  it("routes a nested agent's approval by its native parent call once the call is reported", async () => {
+    const { value, threadEvents, canUseTool } = await launchedAgent();
+    const permission = canUseTool(
+      "Bash",
+      { command: "true" },
+      {
+        signal: new AbortController().signal,
+        toolUseID: "nested-tool",
+        requestId: "nested-control",
+        agentID: "nested-agent",
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(interactionEvents(threadEvents)).toEqual([]);
+    // The agent spawned by the background Agent reports its tool call under that Agent's call.
+    value.fakeQuery.push({
+      type: "assistant",
+      parent_tool_use_id: "agent-call",
+      uuid: "nested-assistant",
+      message: {
+        id: "nested-message",
+        role: "assistant",
+        content: [{ type: "tool_use", id: "nested-tool", name: "Bash", input: {} }],
+      },
+    } as unknown as SDKMessage);
+    await vi.waitFor(() =>
+      expect(threadEvents.at(-1)).toMatchObject({
+        type: "interaction.requested",
+        ownerCallId: "agent-call",
+      }),
+    );
+    expect(value.transport.isRunning()).toBe(false);
+    await value.transport.close();
+    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
+  });
+
+  function interactionEvents(events: ClaudeTurnEvent[]) {
+    return events.filter(
+      ({ type }) => type === "interaction.requested" || type === "interaction.closed",
+    );
+  }
+
+  /** A plain SendMessage delivery result, without any background launch status. */
+  function sendAck(fakeQuery: FakeQuery): void {
+    fakeQuery.push({
+      type: "user",
+      session_id: "00000000-0000-4000-8000-000000000001",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "send-call", content: "Message sent" }],
+      },
+      tool_use_result: { success: true },
+    } as unknown as SDKMessage);
+  }
 });
 
 describe("ClaudeSdkTransport steer", () => {
@@ -3362,42 +3853,6 @@ describe("ClaudeSdkTransport regressions", () => {
     await value.transport.close();
   });
 
-  it("denies a background child's permission when its native parent no longer has a live output owner", async () => {
-    const value = fixture();
-    await value.transport.start();
-    const canUseTool = options(value).canUseTool;
-    if (!canUseTool) throw new Error("Tool approval callback missing");
-    const permission = canUseTool(
-      "Bash",
-      { command: "true" },
-      {
-        signal: new AbortController().signal,
-        toolUseID: "background-child-tool",
-        requestId: "child-request",
-        agentID: "background-agent",
-      },
-    );
-    value.fakeQuery.push({
-      type: "assistant",
-      parent_tool_use_id: "finished-parent",
-      uuid: "child-assistant",
-      message: {
-        id: "child-message",
-        role: "assistant",
-        content: [
-          {
-            type: "tool_use",
-            id: "background-child-tool",
-            name: "Bash",
-            input: { command: "true" },
-          },
-        ],
-      },
-    } as unknown as SDKMessage);
-    await expect(permission).resolves.toMatchObject({ behavior: "deny" });
-    expect(value.transport.isRunning()).toBe(false);
-    await value.transport.close();
-  });
   it("completes a foreground segment after a steer changes the result user_message_uuid", async () => {
     const value = fixture();
     await value.transport.start();

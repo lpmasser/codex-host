@@ -6,6 +6,7 @@ import {
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostInteractionIdSchema,
+  hostItemIdSchema,
   hostTurnIdSchema,
   jsonObjectSchema,
   nativeCheckpointRefSchema,
@@ -244,7 +245,16 @@ const eventKeys = new Map<string, ReadonlySet<string>>([
 const interactionKeys = new Map<string, ReadonlySet<string>>([
   [
     "question",
-    new Set(["type", "interactionId", "turnId", "itemId", "title", "questions", "expiresAt"]),
+    new Set([
+      "type",
+      "interactionId",
+      "turnId",
+      "itemId",
+      "ownerItemId",
+      "title",
+      "questions",
+      "expiresAt",
+    ]),
   ],
   [
     "approval",
@@ -252,6 +262,7 @@ const interactionKeys = new Map<string, ReadonlySet<string>>([
       "type",
       "interactionId",
       "turnId",
+      "ownerItemId",
       "title",
       "description",
       "subject",
@@ -296,7 +307,11 @@ export const harnessOutputSchema = z.custom<HarnessOutput>((value) => {
   if (output.kind === "interaction") {
     if (Object.keys(output).some((key) => key !== "kind" && key !== "interaction")) return false;
     const interaction = output.interaction as Record<string, unknown> | undefined;
-    return strictKeys(interaction, interactionKeys.get(String(interaction?.type)));
+    return (
+      strictKeys(interaction, interactionKeys.get(String(interaction?.type))) &&
+      (interaction.ownerItemId === undefined ||
+        hostItemIdSchema.safeParse(interaction.ownerItemId).success)
+    );
   }
   return false;
 });

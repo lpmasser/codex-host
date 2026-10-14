@@ -53,6 +53,7 @@ import {
   type ClaudePlanLimitEvent,
   type ClaudeQuestion,
   type ClaudeTransportContextUsage,
+  type ClaudeTurnEvent,
   type ClaudeTurnTransport,
 } from "./transport.js";
 
@@ -63,8 +64,8 @@ const SESSION_ENTRYPOINT = "codexhost-sdk";
 const APPROVAL_TITLE_MAX_LENGTH = 120;
 const APPROVAL_DESCRIPTION_MAX_LENGTH = 500;
 const DEFAULT_ABORT_TIMEOUT_MS = 2_000;
-/** Bounds the Workflow agents kept to name and own agent approvals. */
-const WORKFLOW_AGENT_LIMIT = 1_000;
+/** Bounds the native agents kept to name and own agent requests. */
+const AGENT_OWNER_LIMIT = 1_000;
 const INTERRUPT_TIMEOUT_MESSAGE = "Claude SDK interrupt timed out";
 
 class PushableInput<T> implements AsyncIterable<T> {
@@ -98,8 +99,11 @@ class PushableInput<T> implements AsyncIterable<T> {
 }
 
 interface PendingInteraction {
+  /** The Root execution showing a Root request. */
   segment: NativeSegment | null;
-  /** The native agent that raised the request; a Workflow agent's run owns it like a parent call. */
+  /** The Root Agent or Workflow call whose agent raised the request; set once it is routed. */
+  ownerCallId?: string;
+  /** The native agent that raised the request. */
   agentId?: string;
   controlRequestId: string;
   input: Record<string, unknown>;
@@ -111,11 +115,15 @@ interface PendingInteraction {
   toolUseId: string;
 }
 
+/** What a Root call runs: a plain Tool, a Workflow run, or an Agent spawn or message send. */
+type ToolOwnerKind = "tool" | "workflow" | "spawn" | "send";
+
 interface NativeSegment {
   id: number;
   accumulator: ClaudeNativeTurnAccumulator;
   inputIds: string[];
-  tools: Map<string, boolean>;
+  /** Root calls this Segment runs, with the agent a SendMessage call targets. */
+  tools: Map<string, { kind: ToolOwnerKind; target?: string }>;
   started: boolean;
 }
 
@@ -325,16 +333,11 @@ function parseApprovalRequest(
   requestId: string,
   toolName: string,
   options: Parameters<CanUseTool>[2],
-  agentLabel?: string,
 ): ClaudeApprovalRequest | null {
-  const toolTitle = [options.title, options.displayName, options.description, toolName]
+  const title = [options.title, options.displayName, options.description, toolName]
     .map((value) => boundedDisplayText(value, APPROVAL_TITLE_MAX_LENGTH))
     .find((value): value is string => value !== null);
-  if (!toolTitle) return null;
-  // Name the Workflow agent asking, since several agents may ask for the same tool at once.
-  const title = agentLabel
-    ? `${agentLabel}: ${toolTitle}`.slice(0, APPROVAL_TITLE_MAX_LENGTH)
-    : toolTitle;
+  if (!title) return null;
   const description = boundedDisplayText(options.description, APPROVAL_DESCRIPTION_MAX_LENGTH);
   const suggestedScope = permissionSuggestionScope(options.suggestions);
   return {
@@ -353,6 +356,15 @@ function denied(toolUseId: string, message: string): PermissionResult {
     toolUseID: toolUseId,
     decisionClassification: "user_reject",
   };
+}
+
+function noLongerPending(pending: PendingInteraction): PermissionResult {
+  return denied(
+    pending.toolUseId,
+    pending.request.type === "question"
+      ? "Claude Question is no longer pending"
+      : "Claude Tool approval is no longer pending",
+  );
 }
 
 function allowed(
@@ -401,7 +413,10 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   >();
   readonly #interactions = new Map<string, PendingInteraction>();
   readonly #controlRequestIds = new Set<string>();
-  readonly #workflowAgents = new Map<string, { label: string; callId: string }>();
+  /** Native agents by ID, with the Root call that launched them; Workflow agents carry labels. */
+  readonly #agentOwners = new Map<string, { label?: string; callId: string }>();
+  /** Agent tool calls by ID, with the Root call whose agent made them. */
+  readonly #nestedOwners = new Map<string, string>();
   #closePromise: Promise<void> | null = null;
   #consumeTask: Promise<void> | null = null;
   #stderrTail = "";
@@ -727,7 +742,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
 
   respondToInteraction(response: ClaudeInteractionResponse): Promise<void> {
     const pending = this.#interactions.get(response.requestId);
-    if (!pending?.segment) {
+    if (!pending?.segment && !pending?.ownerCallId) {
       return Promise.reject(new Error("Claude SDK Interaction is not pending"));
     }
     if (response.type === "approval") {
@@ -758,14 +773,14 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         }
         result = allowed(pending.toolUseId, pending.input, pending.suggestions);
       }
-      this.#settleInteraction(pending, result, "responded");
+      void this.#settleInteraction(pending, result, "responded");
       return Promise.resolve();
     }
     if (pending.request.type !== "question") {
       return Promise.reject(new Error("Claude SDK Interaction response type does not match"));
     }
     if ("cancelled" in response) {
-      this.#settleInteraction(
+      void this.#settleInteraction(
         pending,
         denied(pending.toolUseId, "User cancelled the Question"),
         "cancelled",
@@ -782,7 +797,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     ) {
       return Promise.reject(new Error("Claude SDK Question answers do not match the request"));
     }
-    this.#settleInteraction(
+    void this.#settleInteraction(
       pending,
       {
         behavior: "allow",
@@ -828,30 +843,50 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     return this.#closePromise;
   }
 
-  /**
-   * The call that owns a request: its own Tool call when this Segment saw it, else the Workflow
-   * call of the agent asking. Undefined while this Segment has not seen the owner yet.
-   */
-  #interactionOwner(pending: PendingInteraction, segment: NativeSegment): string | undefined {
-    if (segment.tools.has(pending.toolUseId)) return pending.toolUseId;
-    return pending.agentId ? this.#workflowAgents.get(pending.agentId)?.callId : undefined;
+  /** The Root call whose agent raised a request; undefined for a Root request. */
+  #ownerCallId(pending: PendingInteraction): string | undefined {
+    const agentOwner = pending.agentId ? this.#agentOwners.get(pending.agentId)?.callId : undefined;
+    if (agentOwner) return agentOwner;
+    const parent = this.#nestedOwners.get(pending.toolUseId);
+    // A nested parent can be an internal call not yet associated with a Root delegation.
+    // Wait for native identity rather than routing it as an unknown Host owner.
+    return parent &&
+      (this.#segment?.tools.has(parent) ||
+        [...this.#agentOwners.values()].some((owner) => owner.callId === parent))
+      ? parent
+      : undefined;
   }
 
-  #routeInteraction(pending: PendingInteraction, segment: NativeSegment, owner: string): void {
-    if (segment.tools.get(owner)) {
-      pending.segment = segment;
+  /**
+   * Shows a request once native frames name its owner: an agent's request belongs to the Root
+   * call that launched the agent, a Root request to the Segment running its Tool call.
+   */
+  #routeInteraction(pending: PendingInteraction): void {
+    if (pending.segment || pending.ownerCallId) return;
+    const ownerCallId = this.#ownerCallId(pending);
+    if (ownerCallId) {
+      pending.ownerCallId = ownerCallId;
+      // Name the Workflow agent asking, since several agents may ask for the same tool at once.
+      const label = pending.agentId ? this.#agentOwners.get(pending.agentId)?.label : undefined;
+      if (label && pending.request.type === "approval")
+        pending.request = {
+          ...pending.request,
+          title: `${label}: ${pending.request.title}`.slice(0, APPROVAL_TITLE_MAX_LENGTH),
+        };
       void this.#emit({
-        type: "segment.event",
-        segmentId: segment.id,
-        event: { type: "interaction.requested", request: pending.request },
+        type: "thread.event",
+        event: { type: "interaction.requested", request: pending.request, ownerCallId },
       }).catch(this.#onFault);
-    } else {
-      this.#settleInteraction(
-        pending,
-        denied(pending.toolUseId, "Claude Tool has no live parent execution"),
-        "cancelled",
-      );
+      return;
     }
+    const segment = this.#segment;
+    if (pending.agentId || !segment?.tools.has(pending.toolUseId)) return;
+    pending.segment = segment;
+    void this.#emit({
+      type: "segment.event",
+      segmentId: segment.id,
+      event: { type: "interaction.requested", request: pending.request },
+    }).catch(this.#onFault);
   }
 
   #canUseTool(
@@ -892,12 +927,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         plan: typeof input.plan === "string" && input.plan.trim().length > 0 ? input.plan : null,
       };
     } else {
-      request = parseApprovalRequest(
-        requestId,
-        toolName,
-        options,
-        agentId ? this.#workflowAgents.get(agentId)?.label : undefined,
-      );
+      request = parseApprovalRequest(requestId, toolName, options);
     }
     if (!request) {
       return Promise.resolve(
@@ -919,7 +949,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           : {}),
         toolUseId: options.toolUseID,
         onAbort: () => {
-          this.#settleInteraction(
+          void this.#settleInteraction(
             pending,
             denied(
               pending.toolUseId,
@@ -934,9 +964,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       this.#interactions.set(request.requestId, pending);
       this.#controlRequestIds.add(options.requestId);
       options.signal.addEventListener("abort", pending.onAbort, { once: true });
-      const segment = this.#segment;
-      const owner = segment ? this.#interactionOwner(pending, segment) : undefined;
-      if (segment && owner !== undefined) this.#routeInteraction(pending, segment, owner);
+      this.#routeInteraction(pending);
     });
   }
 
@@ -944,32 +972,40 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     pending: PendingInteraction,
     result: PermissionResult,
     reason: "responded" | "cancelled" | "superseded",
-  ): void {
-    if (!this.#interactions.delete(pending.request.requestId)) return;
+  ): Promise<void> {
+    if (!this.#interactions.delete(pending.request.requestId)) return Promise.resolve();
     this.#controlRequestIds.delete(pending.controlRequestId);
     pending.signal.removeEventListener("abort", pending.onAbort);
-    if (pending.segment)
-      void this.#emit({
-        type: "segment.event",
-        segmentId: pending.segment.id,
-        event: { type: "interaction.closed", requestId: pending.request.requestId, reason },
-      }).catch(this.#onFault);
+    const event = {
+      type: "interaction.closed" as const,
+      requestId: pending.request.requestId,
+      reason,
+    };
+    const closed = pending.segment
+      ? this.#emit({ type: "segment.event", segmentId: pending.segment.id, event })
+      : pending.ownerCallId
+        ? this.#emit({ type: "thread.event", event })
+        : Promise.resolve();
     pending.resolve(result);
+    return closed.catch(this.#onFault);
+  }
+
+  /** Settles the requests of agents a Root call launched once that call's work has ended. */
+  async #ownerEnded(callId: string): Promise<void> {
+    const closed = [...this.#interactions.values()]
+      .filter((pending) => pending.ownerCallId === callId)
+      .map((pending) => this.#settleInteraction(pending, noLongerPending(pending), "cancelled"));
+    for (const [agentId, owner] of this.#agentOwners)
+      if (owner.callId === callId) this.#agentOwners.delete(agentId);
+    for (const [toolUseId, owner] of this.#nestedOwners)
+      if (owner === callId) this.#nestedOwners.delete(toolUseId);
+    await Promise.all(closed);
   }
 
   #closeInteractions(segment: NativeSegment | null, reason: "cancelled" | "superseded"): void {
     for (const pending of [...this.#interactions.values()]) {
       if (segment && pending.segment !== segment) continue;
-      this.#settleInteraction(
-        pending,
-        denied(
-          pending.toolUseId,
-          pending.request.type === "question"
-            ? "Claude Question is no longer pending"
-            : "Claude Tool approval is no longer pending",
-        ),
-        reason,
-      );
+      void this.#settleInteraction(pending, noLongerPending(pending), reason);
     }
   }
 
@@ -977,6 +1013,8 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     this.#rejectPendingInputs();
     const failures: unknown[] = [];
     this.#closeInteractions(null, "cancelled");
+    this.#agentOwners.clear();
+    this.#nestedOwners.clear();
     if (
       this.#canClearQueued &&
       this.#query &&
@@ -1137,8 +1175,22 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           isRecord(task) && typeof task.task_id === "string" ? [task.task_id] : [],
         ),
       );
-    } else if (message.subtype === "task_started" && typeof message.task_id === "string") {
+    } else if (
+      message.subtype === "task_started" &&
+      typeof message.task_id === "string" &&
+      message.is_backgrounded !== false
+    ) {
+      // A task registered in the foreground blocks its spawning call; it is background work only
+      // once a later update moves it there.
       this.#backgroundTasks.add(message.task_id);
+    } else if (
+      message.subtype === "task_updated" &&
+      typeof message.task_id === "string" &&
+      isRecord(message.patch) &&
+      typeof message.patch.is_backgrounded === "boolean"
+    ) {
+      if (message.patch.is_backgrounded) this.#backgroundTasks.add(message.task_id);
+      else this.#backgroundTasks.delete(message.task_id);
     } else if (
       message.subtype === "task_notification" &&
       typeof message.task_id === "string" &&
@@ -1148,37 +1200,70 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     }
   }
 
-  /** Remembers Workflow agents so their approvals name the agent and reach the run's owner. */
-  #observeWorkflowAgents(message: unknown): void {
+  /**
+   * Remembers which Root call launched each native agent from its task frames: an agent task is
+   * registered under its agent ID, a Workflow run lists its agents with labels.
+   */
+  #observeAgentOwners(message: unknown): void {
     if (
       !isRecord(message) ||
       message.type !== "system" ||
-      message.subtype !== "task_progress" ||
+      (message.subtype !== "task_started" && message.subtype !== "task_progress") ||
       typeof message.tool_use_id !== "string"
     ) {
       return;
     }
-    for (const agent of parseClaudeWorkflowAgents(message.workflow_progress) ?? []) {
-      if (!agent.agentId) continue;
-      if (
-        !this.#workflowAgents.has(agent.agentId) &&
-        this.#workflowAgents.size >= WORKFLOW_AGENT_LIMIT
-      ) {
-        const oldest = this.#workflowAgents.keys().next();
-        if (!oldest.done) this.#workflowAgents.delete(oldest.value);
-      }
-      this.#workflowAgents.set(agent.agentId, {
-        label: agent.label,
-        callId: message.tool_use_id,
-      });
+    const callId = this.#nestedOwners.get(message.tool_use_id) ?? message.tool_use_id;
+    if (
+      message.subtype === "task_started" &&
+      message.task_type !== "local_bash" &&
+      typeof message.task_id === "string"
+    )
+      this.#rememberAgent(message.task_id, callId);
+    for (const agent of parseClaudeWorkflowAgents(message.workflow_progress) ?? [])
+      if (agent.agentId) this.#rememberAgent(agent.agentId, callId, agent.label);
+  }
+
+  /**
+   * A delivered SendMessage leaves its target running in the background only when Claude Code
+   * still reports the target's task live; a synchronous send has finished with its result.
+   */
+  #sendOutcome(
+    segment: NativeSegment,
+    event: Extract<ClaudeTurnEvent, { type: "subagent.completed" }>,
+  ): Extract<ClaudeTurnEvent, { type: "subagent.completed" }> {
+    const tool = segment.tools.get(event.callId);
+    if (event.continuesInBackground || event.isError || tool?.kind !== "send") return event;
+    // `to` can be a name. A resumed task frame supplies the actual ID under this send call.
+    const nativeSubagentId = [
+      event.nativeSubagentId,
+      tool.target,
+      ...[...this.#agentOwners].flatMap(([id, owner]) =>
+        owner.callId === event.callId ? [id] : [],
+      ),
+    ].find((id) => id !== undefined && this.#backgroundTasks.has(id));
+    return nativeSubagentId ? { ...event, continuesInBackground: true, nativeSubagentId } : event;
+  }
+
+  #rememberAgent(agentId: string, callId: string, label?: string): void {
+    if (!this.#agentOwners.has(agentId) && this.#agentOwners.size >= AGENT_OWNER_LIMIT) {
+      const oldest = this.#agentOwners.keys().next();
+      if (!oldest.done) this.#agentOwners.delete(oldest.value);
     }
+    // The first frame naming an agent names its launch; a later SendMessage only resumes it.
+    const known = this.#agentOwners.get(agentId);
+    label ??= known?.label;
+    this.#agentOwners.set(agentId, {
+      callId: known?.callId ?? callId,
+      ...(label ? { label } : {}),
+    });
   }
 
   async #consume(activeQuery: Query): Promise<void> {
     try {
       for await (const message of activeQuery) {
         this.#observeBackgroundTasks(message);
-        this.#observeWorkflowAgents(message);
+        this.#observeAgentOwners(message);
         this.#observeSlashCommands(message);
         const permissionMode = permissionModeFromMessage(message);
         if (permissionMode && permissionMode !== this.#permissionMode) {
@@ -1204,13 +1289,18 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         await this.#observeInputLifecycle(message);
         const segment = this.#nativeSegment();
         if (message.type === "assistant" && typeof message.parent_tool_use_id === "string") {
-          const parent = segment.tools.get(message.parent_tool_use_id) === true;
+          const owner =
+            this.#nestedOwners.get(message.parent_tool_use_id) ?? message.parent_tool_use_id;
           for (const block of message.message.content) {
-            if (block.type === "tool_use") segment.tools.set(block.id, parent);
+            if (block.type === "tool_use") this.#nestedOwners.set(block.id, owner);
           }
         }
         const interpreted = segment.accumulator.consume(message);
-        for (const event of interpreted.events) {
+        for (const nativeEvent of interpreted.events) {
+          const event =
+            nativeEvent.type === "subagent.completed"
+              ? this.#sendOutcome(segment, nativeEvent)
+              : nativeEvent;
           // Task levels, settlements, Workflow run progress and model request usage belong to
           // the Session, not a Segment: a launched run keeps reporting after its Root Segment.
           if (
@@ -1220,6 +1310,15 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
             event.type === "workflow.activity" ||
             event.type === "usage.request"
           ) {
+            // A settled task's requests close before its settlement completes the owning Item:
+            // those of the call it names and of the call a SendMessage resumed its agent under.
+            if (event.type === "subagent.settled") {
+              const owners = new Set([
+                event.callId,
+                this.#agentOwners.get(event.nativeSubagentId)?.callId,
+              ]);
+              for (const owner of owners) if (owner) await this.#ownerEnded(owner);
+            }
             await this.#emit({ type: "thread.event", event });
             continue;
           }
@@ -1228,27 +1327,50 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
             continue;
           }
           if (event.type !== "usage.result") await this.#startSegment(segment);
-          if (
-            event.type === "tool.started" ||
-            event.type === "subagent.started" ||
-            event.type === "workflow.started"
+          if (event.type === "tool.started") segment.tools.set(event.callId, { kind: "tool" });
+          if (event.type === "workflow.started")
+            segment.tools.set(event.callId, { kind: "workflow" });
+          if (event.type === "subagent.started") {
+            segment.tools.set(event.callId, {
+              kind: event.operation,
+              ...(event.nativeSubagentId ? { target: event.nativeSubagentId } : {}),
+            });
+          }
+          // A background result names its agent. Any other result ends the call's agent work,
+          // whose requests close before its Item completes; an agent another call launched keeps
+          // that first owner.
+          if (event.type === "subagent.completed" && event.continuesInBackground) {
+            if (event.nativeSubagentId) this.#rememberAgent(event.nativeSubagentId, event.callId);
+          } else if (
+            event.type === "subagent.completed" ||
+            (event.type === "workflow.launched" && !event.background)
           )
-            segment.tools.set(event.callId, true);
-          if (segment.started)
-            await this.#emit({ type: "segment.event", segmentId: segment.id, event });
+            await this.#ownerEnded(event.callId);
+          if (segment.started) {
+            let projected = event;
+            if (
+              event.type === "subagent.started" &&
+              event.operation === "send" &&
+              event.nativeSubagentId &&
+              !this.#agentOwners.has(event.nativeSubagentId)
+            ) {
+              // An unconfirmed SendMessage target may be a name, not a native agent identity.
+              const { nativeSubagentId: _target, ...started } = event;
+              void _target;
+              projected = started;
+            }
+            await this.#emit({ type: "segment.event", segmentId: segment.id, event: projected });
+          }
           if (event.type === "tool.completed") segment.tools.delete(event.callId);
         }
-        for (const pending of this.#interactions.values()) {
-          const owner = pending.segment ? undefined : this.#interactionOwner(pending, segment);
-          if (owner !== undefined) this.#routeInteraction(pending, segment, owner);
-        }
+        for (const pending of this.#interactions.values()) this.#routeInteraction(pending);
         if (
           message.type === "user" &&
           message.parent_tool_use_id &&
           Array.isArray(message.message.content)
         ) {
           for (const block of message.message.content)
-            if (block.type === "tool_result") segment.tools.delete(block.tool_use_id);
+            if (block.type === "tool_result") this.#nestedOwners.delete(block.tool_use_id);
         }
         if (interpreted.terminal) {
           this.#closeInteractions(segment, "superseded");
@@ -1264,12 +1386,29 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           this.#segment = null;
         }
       }
+      await this.#flushPendingThinking();
       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
     } catch (error) {
+      try {
+        await this.#flushPendingThinking();
+      } catch {
+        // A failed consumer cannot accept the summary; the original fault still
+        // owns cleanup of requests, pending inputs and the Segment below.
+      }
       this.#closeInteractions(null, "cancelled");
       this.#rejectPendingInputs();
       this.#segment = null;
       if (!this.#closePromise) this.#onFault(error);
+    }
+  }
+
+  async #flushPendingThinking(): Promise<void> {
+    const segment = this.#segment;
+    if (!segment) return;
+    const events = segment.accumulator.flushPendingThinking();
+    if (events.length > 0) await this.#startSegment(segment);
+    for (const event of events) {
+      await this.#emit({ type: "segment.event", segmentId: segment.id, event });
     }
   }
 

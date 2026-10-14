@@ -476,7 +476,22 @@ export class HarnessDelegationCoordinator {
     }
     const turnId = thread.activeTurnId;
     if (!thread.running || !turnId) {
-      return { threadId: thread.id, turnId: null, harnessId: thread.harnessId, cancelled: false };
+      let cancelled = false;
+      const backgroundTurnIds = [...thread.projectedTurns]
+        .filter(([, projection]) => projection.projector.hasOpenDetachedItems)
+        .map(([id]) => id);
+      for (const backgroundTurnId of backgroundTurnIds) {
+        const result = await thread.session.execute({
+          type: "turn.cancel",
+          turnId: backgroundTurnId,
+        });
+        if (!result.ok) {
+          if (result.error.code === "invalidState") continue; // Native task settled before cancellation.
+          throw new DelegationControlError("DELEGATION_FAILED", result.error.message);
+        }
+        cancelled ||= result.value.cancellationRequested;
+      }
+      return { threadId: thread.id, turnId: null, harnessId: thread.harnessId, cancelled };
     }
     const result = await thread.session.execute({ type: "turn.cancel", turnId });
     if (!result.ok) {
