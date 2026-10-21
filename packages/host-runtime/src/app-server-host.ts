@@ -869,7 +869,6 @@ export class AppServerHost {
       activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
       pendingQuestions: (threadId) => this.#questions.read(threadId),
-      answerQuestion: (input) => this.#questions.answer(input),
     });
     const maintenanceOperation = <T>(run: () => Promise<T>): Promise<T> =>
       options.runtimeMaintenance ? options.runtimeMaintenance.operation(run) : run();
@@ -899,8 +898,7 @@ export class AppServerHost {
         this.#waitForPlugins().then(() => this.#delegationCoordinator.cancel(input)),
       read: (input) => this.#waitForPlugins().then(() => this.#delegationCoordinator.read(input)),
       wait: (input) => this.#waitForPlugins().then(() => this.#delegationCoordinator.wait(input)),
-      answer: (input) =>
-        this.#waitForPlugins().then(() => this.#delegationCoordinator.answer(input)),
+      answer: (input) => this.#waitForPlugins().then(() => this.#questions.answer(input)),
       list: (input) => this.#waitForPlugins().then(() => this.#delegationCoordinator.list(input)),
       canHandleStart: (input) => this.#canHandleDelegationStart(input),
       ownsThread: (threadId) => this.#ownsDelegationThread(threadId),

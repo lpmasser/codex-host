@@ -33,6 +33,26 @@ function fixture(options: { expiresAt?: string; gate?: Promise<void> } = {}) {
 afterEach(() => vi.useRealTimers());
 
 describe("Pending Question ownership", () => {
+  it.each(["", " \t", undefined, null, 42])(
+    "rejects an invalid Thread ID (%j) without consuming the request",
+    async (threadId) => {
+      const f = fixture();
+      await expect(
+        f.questions.answer({
+          threadId: threadId as string,
+          interactionId: f.interactionId,
+          result: f.result,
+        }),
+      ).rejects.toMatchObject({
+        code: "INVALID_ARGUMENT",
+        message: "Thread identifier is required",
+      });
+      expect(f.respond).not.toHaveBeenCalled();
+      await f.answer();
+      expect(f.respond).toHaveBeenCalledOnce();
+    },
+  );
+
   it("preserves request/reply data and rejects identities from a previous Host", async () => {
     const old = fixture();
     await old.questions.close(-1);

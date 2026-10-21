@@ -59,5 +59,5 @@ codexhost thread answer <thread> --interaction <id> --answers-file <file>
 | `packages/host-runtime/src/question-interactions.ts` | 请求登记、读取、一次性领取和失效 |
 | `packages/host-runtime/src/app-server-host.ts` | 接通原有外部及原生请求、回复和关闭事件 |
 | `packages/protocol-core/src/codex-question.ts` | 已有外部 Question 的 Desktop 投影及答复解析，未为委派改写 |
-| `packages/host-runtime/src/harness-delegation-coordinator.ts` | read/wait/answer 入口 |
+| `packages/host-runtime/src/harness-delegation-coordinator.ts` | read/wait 入口 |
 | `packages/host-runtime/src/delegation-watch.ts` | 一次性 needsInput/终态通知 |

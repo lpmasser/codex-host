@@ -241,7 +241,7 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 系统 SHALL 提供 `codexhost thread watch <thread> [--notify <thread>] [--timeout-ms <n>]` 与 `codexhost thread watches`。watch 在被观察 Thread 停下、出现待回答的问题或到期时，SHALL 通过与 `thread send` 相同的路径在被通知 Thread 中启动一个新 Turn，且只通知一次。被观察 Thread 与被通知 Thread 可以是任意两个不同的 Thread，不要求委派血缘。通知 SHALL 只报告执行状态与 Thread 链接，MUST NOT 携带或摘要会话内容，也 MUST NOT 被表述为工作已验收。watch SHALL 只保存在 Host Runtime 内存中，不提供取消操作。
 
 #### Scenario: 注册后立即返回
-- **WHEN** 调用方对一个运行中的 Thread 执行 `thread watch`
+- **WHEN** 调用方对一个运行中且没有待回答问题的 Thread 执行 `thread watch`
 - **THEN** 命令 SHALL 立即返回 `state: "watching"`
 - **AND** 调用方 SHALL 可以结束自己的 Turn，无需等待或轮询
 
@@ -265,7 +265,7 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 #### Scenario: 通知结果
 - **WHEN** 被观察 Thread 停下、等待回答、到期、持续无法读取或不再存在
 - **THEN** 通知结果 SHALL 分别为 `completed`、`failed`、`interrupted`、`needsInput`、`timedOut`、`unreadable` 或 `notFound`
-- **AND** 终态结果 SHALL 注明其来源 Turn，`needsInput` SHALL 注明问题请求标识与 Turn
+- **AND** 终态结果 SHALL 在快照提供 Turn 身份时注明其来源 Turn，`needsInput` SHALL 注明问题请求标识与 Turn
 - **AND** 读取失败 SHALL 在持续 60 秒后才报告 `unreadable`，仅在确认 Thread 不存在时报告 `notFound`
 
 #### Scenario: 等待回答期间的通知只发一次
@@ -276,19 +276,31 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 
 #### Scenario: 调整方向不视为停下
 - **WHEN** 被观察 Thread 的旧 Turn 因“调整方向”被停止并由新 Turn 接续
-- **THEN** watch MUST NOT 通知
-- **AND** SHALL 在 Thread 真正停下时通知一次
+- **THEN** watch MUST NOT 仅因旧 Turn 的终态通知
+- **AND** SHALL 继续观察 Thread，直到真正停下、出现待回答的问题或达到观察期限
+
+#### Scenario: 重复注册与下一次就绪
+- **WHEN** 同一对 Thread 再次注册 watch，且被观察 Thread 正在运行、没有待回答的问题
+- **THEN** 仍处于观察中的注册 SHALL 去重并保留原观察期限
+- **AND** 旧通知已待投递时，SHALL 为下一次停下、待回答问题或到期建立新观察
+- **AND** 旧通知（包括 `needsInput`）MUST NOT 被新注册替换或丢弃
 
 #### Scenario: 被通知 Thread 正忙
 - **WHEN** 通知到期时被通知 Thread 有活跃 Turn
 - **THEN** 通知 SHALL 保持待送达并在最长 6 小时内重试
 - **AND** `THREAD_BUSY` MUST NOT 被视为已送达
 - **AND** `thread send` 自身 MUST NOT 因此改为排队
+- **AND** 每次投递 SHALL 合并该接收方当前所有待投递通知，包括此前轮询积累的终态或 `needsInput` 通知
+
+#### Scenario: 已确认未启动的投递失败
+- **WHEN** 投递失败且调用链确认未启动 Turn，例如 resume 校验失败或原生明确拒绝启动
+- **THEN** Host SHALL 在投递期限内保留通知并重试
+- **AND** 接收方已不存在或只读时 SHALL 直接标记 `undeliverable`
 
 #### Scenario: 投递结果未知
 - **WHEN** 投递失败且调用链不能证明未启动 Turn，例如 Harness 启动确认超时
 - **THEN** Host MUST NOT 重试该投递
-- **AND** SHALL 将 watch 标记为 `undeliverable` 并保留原因
+- **AND** SHALL 将 watch 标记为 `undeliverable` 并保留结果未知的原因
 
 #### Scenario: 无法投递
 - **WHEN** 被通知 Thread 不存在、只读，或超过 6 小时仍无法送达

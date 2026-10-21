@@ -23,6 +23,48 @@ function successfulFetch(body: unknown): typeof fetch {
   ) as unknown as typeof fetch;
 }
 
+async function answersFixture() {
+  const directory = await mkdtemp(path.join(tmpdir(), "codexhost-cli-answers-"));
+  return {
+    directory,
+    async write(content: string) {
+      const file = path.join(directory, "answers.json");
+      await writeFile(file, content);
+      return file;
+    },
+    close: () => rm(directory, { recursive: true, force: true }),
+  };
+}
+
+function answerCli(file: string, fetchImpl: typeof fetch) {
+  const output = new PassThrough();
+  const diagnosticOutput = new PassThrough();
+  return {
+    output,
+    diagnosticOutput,
+    run: (extraArguments: string[] = []) =>
+      runDelegationCli({
+        arguments: [
+          "thread",
+          "answer",
+          "codex://threads/child",
+          "--interaction",
+          "interaction-1",
+          "--answers-file",
+          file,
+          ...extraArguments,
+        ],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output,
+        diagnosticOutput,
+        fetchImpl,
+      }),
+  };
+}
+
 describe("delegation CLI", () => {
   it.each([
     ["harness", "list", "--help"],
@@ -705,14 +747,7 @@ describe("delegation CLI", () => {
   });
 
   it("answers a pending Question from an answers file", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "codexhost-cli-answers-"));
-    const answersFile = path.join(directory, "answers.json");
-    await writeFile(
-      answersFile,
-      JSON.stringify({
-        answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } },
-      }),
-    );
+    const files = await answersFixture();
     const fetchImpl = successfulFetch({
       threadId: "child",
       interactionId: "interaction-1",
@@ -721,29 +756,14 @@ describe("delegation CLI", () => {
       status: "running",
       next: { read: "read", wait: "wait" },
     });
-    const output = new PassThrough();
     try {
-      expect(
-        await runDelegationCli({
-          arguments: [
-            "thread",
-            "answer",
-            "codex://threads/child",
-            "--interaction",
-            "interaction-1",
-            "--answers-file",
-            answersFile,
-            "--format",
-            "compact",
-          ],
-          environment: {
-            [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
-            [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
-          },
-          output,
-          fetchImpl,
+      const file = await files.write(
+        JSON.stringify({
+          answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } },
         }),
-      ).toBe(0);
+      );
+      const cli = answerCli(file, fetchImpl);
+      expect(await cli.run(["--format", "compact"])).toBe(0);
       const [url, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
       expect(String(url)).toContain("/v1/thread/answer");
       expect(JSON.parse(String(init?.body))).toEqual({
@@ -751,7 +771,7 @@ describe("delegation CLI", () => {
         interactionId: "interaction-1",
         result: { answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } } },
       });
-      expect(JSON.parse(outputText(output))).toEqual({
+      expect(JSON.parse(outputText(cli.output))).toEqual({
         thread: "codex://threads/child",
         interaction: "interaction-1",
         turn: "turn-1",
@@ -759,118 +779,42 @@ describe("delegation CLI", () => {
         status: "running",
       });
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      await files.close();
     }
   });
 
   it("passes the answers file shape through and reports structured answer errors", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "codexhost-cli-answers-"));
-    const environment = {
-      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
-      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
-    };
+    const files = await answersFixture();
     const fetchImpl = successfulFetch({});
     try {
-      for (const content of ["not json"]) {
-        const file = path.join(
-          directory,
-          `${Buffer.from(content).toString("hex").slice(0, 12)}.json`,
-        );
-        await writeFile(file, content);
-        expect(
-          await runDelegationCli({
-            arguments: [
-              "thread",
-              "answer",
-              "child",
-              "--interaction",
-              "interaction-1",
-              "--answers-file",
-              file,
-            ],
-            environment,
-            output: new PassThrough(),
-            diagnosticOutput: new PassThrough(),
-            fetchImpl,
-          }),
-        ).toBe(1);
-      }
+      const invalid = await files.write("not json");
+      expect(await answerCli(invalid, fetchImpl).run()).toBe(1);
+      expect(fetchImpl).not.toHaveBeenCalled();
       // The CLI passes the existing reply result through, including native extensions.
       for (const result of [
         { answers: { decision: { answers: ["Continue"] } }, nativeExtension: true },
         { answers: {} },
       ]) {
-        const file = path.join(
-          directory,
-          `${Buffer.from(JSON.stringify(result)).toString("hex")}.json`,
-        );
-        await writeFile(file, JSON.stringify(result));
-        expect(
-          await runDelegationCli({
-            arguments: [
-              "thread",
-              "answer",
-              "child",
-              "--interaction",
-              "interaction-1",
-              "--answers-file",
-              file,
-            ],
-            environment,
-            output: new PassThrough(),
-            diagnosticOutput: new PassThrough(),
-            fetchImpl,
-          }),
-        ).toBe(0);
+        const file = await files.write(JSON.stringify(result));
+        expect(await answerCli(file, fetchImpl).run()).toBe(0);
         const [, init] = vi.mocked(fetchImpl).mock.calls.at(-1) ?? [];
         expect(JSON.parse(String(init?.body))).toMatchObject({ result });
       }
-      expect(
-        await runDelegationCli({
-          arguments: [
-            "thread",
-            "answer",
-            "child",
-            "--interaction",
-            "interaction-1",
-            "--answers-file",
-            path.join(directory, "missing.json"),
-          ],
-          environment,
-          output: new PassThrough(),
-          diagnosticOutput: new PassThrough(),
-          fetchImpl,
-        }),
-      ).toBe(1);
+      expect(await answerCli(path.join(files.directory, "missing.json"), fetchImpl).run()).toBe(1);
 
       const stale = successfulFetch({
         error: { code: "QUESTION_NOT_PENDING", message: "Question request is not pending" },
       });
-      const diagnosticOutput = new PassThrough();
-      const file = path.join(directory, "valid.json");
-      await writeFile(file, JSON.stringify({ answers: { decision: { answers: ["Continue"] } } }));
-      expect(
-        await runDelegationCli({
-          arguments: [
-            "thread",
-            "answer",
-            "child",
-            "--interaction",
-            "interaction-1",
-            "--answers-file",
-            file,
-          ],
-          environment,
-          output: new PassThrough(),
-          diagnosticOutput,
-          fetchImpl: stale,
-        }),
-      ).toBe(1);
-      expect(JSON.parse(outputText(diagnosticOutput))).toEqual({
+      const file = await files.write(
+        JSON.stringify({ answers: { decision: { answers: ["Continue"] } } }),
+      );
+      const cli = answerCli(file, stale);
+      expect(await cli.run()).toBe(1);
+      expect(JSON.parse(outputText(cli.diagnosticOutput))).toEqual({
         error: { code: "QUESTION_NOT_PENDING", message: "Question request is not pending" },
       });
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      await files.close();
     }
   });
 
