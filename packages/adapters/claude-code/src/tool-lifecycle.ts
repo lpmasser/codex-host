@@ -10,7 +10,7 @@ import type {
 import type { HostItemId, HostTurnId, JsonValue } from "@codexhost/shared-contracts";
 
 import { projectClaudeFileChange } from "./file-change.js";
-import { claudeTranscriptItemId } from "./item-identity.js";
+import { claudeToolItemId } from "./item-identity.js";
 import { isClaudeTaskTool, type ClaudeTaskTracker } from "./task-tracker.js";
 import type { ClaudeTurnEvent } from "./transport.js";
 
@@ -39,7 +39,6 @@ export interface ClaudeToolLifecycleOptions {
   outputLimit: number;
   taskTracker: ClaudeTaskTracker;
   /** The Turn's message/thinking Item key; Tool Items share it for history parity. */
-  nativeTurnKey: string;
   newItemId(): HostItemId;
   emit(event: HostEvent): void;
   onDetached(command: ClaudeDetachedCommand): void;
@@ -89,9 +88,7 @@ export class ClaudeToolLifecycle {
   readonly #onDetached: (command: ClaudeDetachedCommand) => void;
   readonly #outputLimit: number;
   readonly #taskTracker: ClaudeTaskTracker;
-  readonly #nativeTurnKey: string;
   readonly #tools = new Map<string, ActiveTool>();
-  #toolOrdinal = 0;
 
   constructor(options: ClaudeToolLifecycleOptions) {
     this.#cwd = options.cwd;
@@ -100,7 +97,6 @@ export class ClaudeToolLifecycle {
     this.#onDetached = options.onDetached;
     this.#outputLimit = options.outputLimit;
     this.#taskTracker = options.taskTracker;
-    this.#nativeTurnKey = options.nativeTurnKey;
   }
 
   get size(): number {
@@ -109,10 +105,7 @@ export class ClaudeToolLifecycle {
 
   start(turnId: HostTurnId, event: Extract<ClaudeTurnEvent, { type: "tool.started" }>): void {
     if (this.#tools.has(event.callId)) throw new Error("Claude Code Tool started more than once");
-    // Tool Items share the Turn's transcript identity; the ordinal counts this
-    // lifecycle's Items in order of appearance so a later history projection
-    // addresses the same Renderer Item.
-    const itemId = claudeTranscriptItemId(this.#nativeTurnKey, "tool", (this.#toolOrdinal += 1));
+    const itemId = claudeToolItemId(event.callId);
     const command = event.toolName === "Bash" ? stringField(event.arguments, "command") : undefined;
     const item: HostCommandExecutionItem | HostToolExecutionItem = command
       ? {
@@ -153,12 +146,7 @@ export class ClaudeToolLifecycle {
       throw new Error("Claude Code Tool completion references an unknown Tool");
     }
     this.#tools.delete(event.callId);
-    if (
-      tool.item.type === "commandExecution" &&
-      event.backgroundTaskId &&
-      !event.isError &&
-      !cancellationRequested
-    ) {
+    if (tool.item.type === "commandExecution" && event.backgroundTaskId && !event.isError) {
       this.#emit({ type: "item.detached", turnId, itemId: tool.item.itemId });
       this.#onDetached({
         turnId,

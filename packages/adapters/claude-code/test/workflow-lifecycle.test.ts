@@ -19,12 +19,12 @@ function lifecycle() {
 describe("Claude Workflow lifecycle", () => {
   it("opens one delegation per run and replaces its agents as they report", () => {
     const { events, workflows } = lifecycle();
-    workflows.start({ type: "workflow.started", callId: "workflow-call" });
+    workflows.start(turnId, { type: "workflow.started", callId: "workflow-call" });
     expect(events).toEqual([]);
     expect(workflows.pendingCount).toBe(1);
 
     expect(
-      workflows.update(turnId, {
+      workflows.update({
         type: "workflow.updated",
         callId: "workflow-call",
         taskId: "workflow-task",
@@ -45,7 +45,7 @@ describe("Claude Workflow lifecycle", () => {
       },
     ]);
 
-    const changed = workflows.update(turnId, {
+    const changed = workflows.update({
       type: "workflow.updated",
       callId: "workflow-call",
       agents: [
@@ -89,7 +89,7 @@ describe("Claude Workflow lifecycle", () => {
 
     // A repeated frame changes nothing.
     const emitted = events.length;
-    workflows.update(turnId, {
+    workflows.update({
       type: "workflow.updated",
       callId: "workflow-call",
       agents: [{ index: 2, label: "count:b.txt", state: "queued" }],
@@ -101,11 +101,10 @@ describe("Claude Workflow lifecycle", () => {
 
   it("keeps a launched run open until its native task settles", () => {
     const { events, workflows } = lifecycle();
-    workflows.start({ type: "workflow.started", callId: "workflow-call", name: "review" });
+    workflows.start(turnId, { type: "workflow.started", callId: "workflow-call", name: "review" });
 
     expect(
       workflows.launched(
-        turnId,
         {
           type: "workflow.launched",
           callId: "workflow-call",
@@ -118,11 +117,12 @@ describe("Claude Workflow lifecycle", () => {
     ).toEqual({ callId: "workflow-call", taskId: "workflow-task" });
     expect(events).toMatchObject([
       { type: "item.started", item: { prompt: "review", subagents: [] } },
+      { type: "item.detached", turnId, itemId: "workflow-item-1" },
     ]);
     expect(workflows.pendingCount).toBe(0);
-    expect(workflows.taskIds()).toEqual(["workflow-task"]);
+    expect(workflows.taskIds(turnId)).toEqual(["workflow-task"]);
 
-    workflows.update(turnId, {
+    workflows.update({
       type: "workflow.updated",
       callId: "workflow-call",
       agents: [
@@ -133,7 +133,7 @@ describe("Claude Workflow lifecycle", () => {
       ],
     });
     expect(
-      workflows.settle(turnId, {
+      workflows.settle({
         type: "subagent.settled",
         nativeSubagentId: "workflow-task",
         status: "completed",
@@ -157,9 +157,9 @@ describe("Claude Workflow lifecycle", () => {
         },
       },
     });
-    expect(workflows.taskIds()).toEqual([]);
+    expect(workflows.taskIds(turnId)).toEqual([]);
     expect(
-      workflows.settle(turnId, {
+      workflows.settle({
         type: "subagent.settled",
         nativeSubagentId: "workflow-task",
         status: "completed",
@@ -169,10 +169,9 @@ describe("Claude Workflow lifecycle", () => {
 
   it("settles a run that did not launch from its tool result", () => {
     const { events, workflows } = lifecycle();
-    workflows.start({ type: "workflow.started", callId: "denied" });
+    workflows.start(turnId, { type: "workflow.started", callId: "denied" });
     expect(
       workflows.launched(
-        turnId,
         { type: "workflow.launched", callId: "denied", isError: true, background: false },
         false,
       ),
@@ -182,12 +181,18 @@ describe("Claude Workflow lifecycle", () => {
       snapshot: { outcome: { status: "failed", error: { code: "nativeFailure" } } },
     });
 
-    workflows.start({ type: "workflow.started", callId: "cancelled" });
+    workflows.start(turnId, { type: "workflow.started", callId: "cancelled" });
     workflows.launched(
-      turnId,
       { type: "workflow.launched", callId: "cancelled", isError: false, background: true },
       true,
     );
+    expect(events.at(-1)).toMatchObject({ type: "item.detached" });
+    workflows.settle({
+      type: "subagent.settled",
+      callId: "cancelled",
+      nativeSubagentId: "cancelled-task",
+      status: "interrupted",
+    });
     expect(events.at(-1)).toMatchObject({
       snapshot: { outcome: { status: "cancelled" } },
     });
@@ -195,9 +200,9 @@ describe("Claude Workflow lifecycle", () => {
 
   it("ends open runs with the Turn and drops runs that never reached Claude Code", () => {
     const { events, workflows } = lifecycle();
-    workflows.start({ type: "workflow.started", callId: "never-ran" });
-    workflows.start({ type: "workflow.started", callId: "running" });
-    workflows.update(turnId, {
+    workflows.start(turnId, { type: "workflow.started", callId: "never-ran" });
+    workflows.start(turnId, { type: "workflow.started", callId: "running" });
+    workflows.update({
       type: "workflow.updated",
       callId: "running",
       taskId: "running-task",
@@ -208,6 +213,109 @@ describe("Claude Workflow lifecycle", () => {
 
     expect(events.map(({ type }) => type)).toEqual(["item.started", "item.completed"]);
     expect(events.at(-1)).toMatchObject({
+      snapshot: {
+        outcome: { status: "cancelled" },
+        item: { subagents: [{ nativeSubagentId: "agent-a", status: "interrupted" }] },
+      },
+    });
+    expect(workflows.pendingCount).toBe(0);
+  });
+
+  it("keeps a launched run working after its Turn and reports its agents at Session level", () => {
+    const { events, workflows } = lifecycle();
+    const otherTurnId = hostTurnIdSchema.parse("turn-2");
+    workflows.start(turnId, { type: "workflow.started", callId: "workflow-call" });
+    workflows.update({
+      type: "workflow.updated",
+      callId: "workflow-call",
+      taskId: "workflow-task",
+      agents: [
+        { index: 1, label: "a", state: "running", agentId: "agent-a" },
+        { index: 2, label: "b", state: "queued" },
+      ],
+    });
+    workflows.launched(
+      {
+        type: "workflow.launched",
+        callId: "workflow-call",
+        isError: false,
+        background: true,
+        taskId: "workflow-task",
+      },
+      false,
+    );
+
+    workflows.finalize(otherTurnId, { status: "succeeded" });
+    expect(events.map(({ type }) => type)).toEqual(["item.started", "item.detached"]);
+    workflows.finalize(turnId, { status: "succeeded" });
+    expect(events.at(-1)).toMatchObject({
+      type: "item.detached",
+      turnId,
+      itemId: "workflow-item-1",
+    });
+    expect(workflows.taskIds(turnId)).toEqual(["workflow-task"]);
+    expect(workflows.taskIds(otherTurnId)).toEqual([]);
+
+    const emitted = events.length;
+    expect(
+      workflows.update({
+        type: "workflow.updated",
+        callId: "workflow-call",
+        agents: [
+          { index: 1, label: "a", state: "done", agentId: "agent-a", resultPreview: "ok" },
+          { index: 2, label: "b", state: "running", agentId: "agent-b" },
+        ],
+      }),
+    ).toEqual(["agent-a", "agent-b"]);
+    expect(events.slice(emitted)).toMatchObject([
+      {
+        type: "item.updated",
+        turnId,
+        update: {
+          type: "subagents.replace",
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "agent-a", status: "completed" }),
+            expect.objectContaining({ nativeSubagentId: "agent-b", status: "running" }),
+          ],
+        },
+      },
+    ]);
+
+    expect(
+      workflows.settle({
+        type: "subagent.settled",
+        nativeSubagentId: "workflow-task",
+        status: "interrupted",
+      }),
+    ).toMatchObject({ callId: "workflow-call" });
+    expect(events.at(-1)).toMatchObject({
+      type: "item.completed",
+      turnId,
+      snapshot: {
+        item: {
+          subagents: [
+            expect.objectContaining({ nativeSubagentId: "agent-a", status: "completed" }),
+            expect.objectContaining({ nativeSubagentId: "agent-b", status: "interrupted" }),
+          ],
+        },
+        outcome: { status: "cancelled" },
+      },
+    });
+    expect(events.filter(({ type }) => type === "item.completed")).toHaveLength(1);
+  });
+
+  it("abandons every open run when the native process that ran them ends", () => {
+    const { events, workflows } = lifecycle();
+    workflows.start(turnId, { type: "workflow.started", callId: "workflow-call" });
+    workflows.update({
+      type: "workflow.updated",
+      callId: "workflow-call",
+      taskId: "workflow-task",
+      agents: [{ index: 1, label: "a", state: "running", agentId: "agent-a" }],
+    });
+    workflows.abandon({ status: "cancelled", reason: "Claude Code Session closed" });
+    expect(events.at(-1)).toMatchObject({
+      type: "item.completed",
       snapshot: {
         outcome: { status: "cancelled" },
         item: { subagents: [{ nativeSubagentId: "agent-a", status: "interrupted" }] },

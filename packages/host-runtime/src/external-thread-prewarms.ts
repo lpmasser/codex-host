@@ -59,8 +59,7 @@ export class ExternalThreadPrewarms {
     }
     // Native work wins even if it originated outside the usual request path.
     if (
-      thread.running ||
-      thread.activeTurnId ||
+      thread.execution.running ||
       thread.turns.length ||
       thread.record.turnMappings.length ||
       thread.session.hasBackgroundWork?.()

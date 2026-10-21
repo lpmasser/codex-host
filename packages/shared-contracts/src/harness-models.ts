@@ -258,6 +258,8 @@ export const harnessSessionCapabilitiesSchema = z
       .optional(),
     /** True when a native primitive accepts running input for execution without cancelling the Turn. */
     steer: z.boolean().optional(),
+    /** Reports native execution starts, independent Session activity and steered-input consumption. */
+    nativeExecutionLifecycle: z.boolean().optional(),
   })
   .strict();
 

@@ -132,6 +132,7 @@ export class HarnessDelegationCoordinator {
   readonly #listOfficial: (input: ThreadListInput) => Promise<DelegationThreadListResult>;
   readonly #officialThreadCwd: (threadId: string) => Promise<string | undefined>;
   readonly #activeOfficialParents: () => string[];
+  readonly #externalTurnBusy: (thread: ExternalThread) => boolean;
   readonly #externalThreadBusy: (thread: ExternalThread) => boolean;
   readonly #pendingQuestions: (threadId: string) => DelegationPendingQuestion[];
 
@@ -165,6 +166,7 @@ export class HarnessDelegationCoordinator {
     activeOfficialParents(): string[];
     externalThreadBusy(thread: ExternalThread): boolean;
     pendingQuestions(threadId: string): DelegationPendingQuestion[];
+    externalTurnBusy(thread: ExternalThread): boolean;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment;
@@ -184,6 +186,7 @@ export class HarnessDelegationCoordinator {
     this.#activeOfficialParents = input.activeOfficialParents;
     this.#externalThreadBusy = input.externalThreadBusy;
     this.#pendingQuestions = input.pendingQuestions;
+    this.#externalTurnBusy = input.externalTurnBusy;
   }
 
   async listHarnesses(): Promise<HarnessListResult> {
@@ -377,7 +380,7 @@ export class HarnessDelegationCoordinator {
             record: thread.record,
             turns: thread.turns,
             sessionId: thread.sessionId,
-            running: thread.running,
+            running: thread.execution.running,
           });
         }
         await this.#repository.setDelegationStatus(delegationId, "running");
@@ -448,7 +451,7 @@ export class HarnessDelegationCoordinator {
         readOnly: true,
       });
     }
-    if (this.#externalThreadBusy(thread) || thread.activeTurnId) {
+    if (this.#externalTurnBusy(thread)) {
       if (!input.steer) {
         throw new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
       }
@@ -487,9 +490,24 @@ export class HarnessDelegationCoordinator {
     if (thread.record.subagent) {
       throw new DelegationControlError("DELEGATION_FAILED", "Thread is read-only");
     }
-    const turnId = thread.activeTurnId;
-    if (!thread.running || !turnId) {
-      return { threadId: thread.id, turnId: null, harnessId: thread.harnessId, cancelled: false };
+    const turnId = thread.execution.activeTurnId ?? thread.execution.pendingTurnId;
+    if (!thread.execution.running || !turnId) {
+      let cancelled = false;
+      const backgroundTurnIds = [...thread.projectedTurns]
+        .filter(([, projection]) => projection.projector.hasOpenDetachedItems)
+        .map(([id]) => id);
+      for (const backgroundTurnId of backgroundTurnIds) {
+        const result = await thread.session.execute({
+          type: "turn.cancel",
+          turnId: backgroundTurnId,
+        });
+        if (!result.ok) {
+          if (result.error.code === "invalidState") continue; // Native task settled before cancellation.
+          throw new DelegationControlError("DELEGATION_FAILED", result.error.message);
+        }
+        cancelled ||= result.value.cancellationRequested;
+      }
+      return { threadId: thread.id, turnId: null, harnessId: thread.harnessId, cancelled };
     }
     const result = await thread.session.execute({ type: "turn.cancel", turnId });
     if (!result.ok) {
@@ -528,10 +546,10 @@ export class HarnessDelegationCoordinator {
       if (error && !projectedTerminal)
         throw new DelegationControlError("INTERNAL_ERROR", error.message);
     }
-    const turns = thread.activeTurnId
+    const turns = thread.execution.activeTurnId
       ? [
           ...thread.turns,
-          thread.projectedTurns.get(thread.activeTurnId)?.projector.pendingTurn() ?? {},
+          thread.projectedTurns.get(thread.execution.activeTurnId)?.projector.pendingTurn() ?? {},
         ]
       : thread.turns;
     const busy = this.#externalThreadBusy(thread);

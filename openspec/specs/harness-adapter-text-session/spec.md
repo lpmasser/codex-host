@@ -36,7 +36,7 @@ Opening a create-mode Pi Session SHALL NOT start a Pi process. The Session SHALL
 
 ### Requirement: Accepted text Turns have an ordered complete lifecycle
 
-A Session SHALL expose one single-consumer ordered output stream. Every accepted text Turn SHALL produce exactly one `turn.started` and one `turn.completed`, SHALL retain the established Agent Message lifecycle, MAY expose zero or more Reasoning Item lifecycles only for explicit visible native reasoning, and SHALL complete every started Item before the Turn terminal event.
+A Session SHALL expose one single-consumer ordered output stream. Every accepted text Turn that starts execution SHALL produce exactly one `turn.started` and one `turn.completed`, SHALL retain the established Agent Message lifecycle, MAY expose zero or more Reasoning Item lifecycles only for explicit visible native reasoning, and SHALL complete every foreground Item before the Turn terminal event. An explicitly detached native background Command or Subagent Item MAY update and complete after that event.
 
 #### Scenario: Successful text Turn with Reasoning
 
@@ -185,3 +185,23 @@ A concrete Adapter SHALL publish a Native Session Ref only when the native Harne
 - **WHEN** 具体 Harness 不提供可靠的 Usage Telemetry
 - **THEN** 其 Session MUST 将 `initialUsage` 暴露为 `null`，并且不发出 Usage 快照
 - **AND** 所有现有文本、cancel、state、fault 和 close 行为 MUST 保持不变
+
+### Requirement: Native execution facts are enabled by Session capability
+
+A Session MAY declare `nativeExecutionLifecycle: true` to separate input admission, native execution, and Session activity. The Host SHALL retain accepted requests as pending until `turn.started`, and derive execution state in one owner. Failed or cancelled unstarted requests MAY complete without `turn.started`. Native Session activity SHALL NOT alone block another Turn request. Without this declaration, acceptance SHALL retain the existing active-Turn behavior and Session activity events SHALL NOT alter running state.
+
+#### Scenario: A pending input follows an autonomous execution
+
+- **WHEN** a declared Session starts an autonomous Turn while an accepted request is still pending
+- **THEN** the autonomous Turn and pending request SHALL retain separate identities
+- **AND** ending either SHALL NOT clear the other, regardless of Session idle event order
+
+### Requirement: Host owns steered user-message projection
+
+A declared Session SHALL report consumed steered input through `input.consumed`, with a Session-unique input identity, `consumingTurnId`, input contents, and any supplied `clientUserMessageId`. It SHALL emit the fact after the consuming Turn starts and before its terminal, and SHALL NOT emit the steered userMessage Item itself. Consumption MAY precede the command receipt. The Host SHALL publish exactly one userMessage on the consuming Turn and preserve Desktop correlation. An undeclared Session SHALL retain acceptance-time projection on the requested Turn.
+
+#### Scenario: Steered input runs in a later Turn
+
+- **WHEN** declared native execution consumes accepted steer input in the following Turn
+- **THEN** the Host SHALL publish its userMessage there exactly once, including when the same fact is repeated
+- **AND** the acceptance receipt SHALL remain `nativeAccepted` without starting or replaying another input

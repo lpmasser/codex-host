@@ -6,6 +6,7 @@ import {
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostInteractionIdSchema,
+  hostItemIdSchema,
   hostTurnIdSchema,
   jsonObjectSchema,
   nativeCheckpointRefSchema,
@@ -97,6 +98,7 @@ const turnSteerSchema = z
     type: z.literal("turn.steer"),
     turnId: hostTurnIdSchema,
     input: z.array(textInputSchema),
+    clientUserMessageId: z.string().optional(),
   })
   .strict();
 const turnCancelSchema = z
@@ -224,6 +226,11 @@ export const harnessSessionStateSchema = z.custom<HarnessSessionState>((value) =
 
 const eventKeys = new Map<string, ReadonlySet<string>>([
   ["session.state.changed", new Set(["type", "state"])],
+  ["session.activity.changed", new Set(["type", "activity"])],
+  [
+    "input.consumed",
+    new Set(["type", "consumingTurnId", "inputId", "input", "clientUserMessageId"]),
+  ],
   ["session.usage.changed", new Set(["type", "usage", "observedForTurnId"])],
   ["usage.request", new Set(["type", "request"])],
   ["usage.history", new Set(["type", "complete"])],
@@ -242,7 +249,16 @@ const eventKeys = new Map<string, ReadonlySet<string>>([
 const interactionKeys = new Map<string, ReadonlySet<string>>([
   [
     "question",
-    new Set(["type", "interactionId", "turnId", "itemId", "title", "questions", "expiresAt"]),
+    new Set([
+      "type",
+      "interactionId",
+      "turnId",
+      "itemId",
+      "ownerItemId",
+      "title",
+      "questions",
+      "expiresAt",
+    ]),
   ],
   [
     "approval",
@@ -250,6 +266,7 @@ const interactionKeys = new Map<string, ReadonlySet<string>>([
       "type",
       "interactionId",
       "turnId",
+      "ownerItemId",
       "title",
       "description",
       "subject",
@@ -281,14 +298,31 @@ export const harnessOutputSchema = z.custom<HarnessOutput>((value) => {
     if (!strictKeys(event, eventKeys.get(String(event?.type)))) return false;
     if (event.type === "session.state.changed")
       return harnessSessionStateSchema.safeParse(event.state).success;
+    if (event.type === "session.activity.changed")
+      return (
+        event.activity === "idle" ||
+        event.activity === "running" ||
+        event.activity === "requires_action"
+      );
     if (event.type === "session.faulted") return harnessErrorSchema.safeParse(event.error).success;
+    if (event.type === "input.consumed")
+      return (
+        hostTurnIdSchema.safeParse(event.consumingTurnId).success &&
+        hostItemIdSchema.safeParse(event.inputId).success &&
+        z.array(textInputSchema).min(1).safeParse(event.input).success &&
+        (event.clientUserMessageId === undefined || typeof event.clientUserMessageId === "string")
+      );
     if (event.type === "usage.history") return typeof event.complete === "boolean";
     return true;
   }
   if (output.kind === "interaction") {
     if (Object.keys(output).some((key) => key !== "kind" && key !== "interaction")) return false;
     const interaction = output.interaction as Record<string, unknown> | undefined;
-    return strictKeys(interaction, interactionKeys.get(String(interaction?.type)));
+    return (
+      strictKeys(interaction, interactionKeys.get(String(interaction?.type))) &&
+      (interaction.ownerItemId === undefined ||
+        hostItemIdSchema.safeParse(interaction.ownerItemId).success)
+    );
   }
   return false;
 });

@@ -67,14 +67,14 @@ it("keeps the real Claude Adapter's same-native transports disjoint through Host
       inputs.push(input);
       if (!first) expect(oldClosed).toBe(true);
       let permissionMode = input.permissionMode;
-      const pending = () =>
-        Promise.withResolvers<Awaited<ReturnType<ClaudeTransport["runTurn"]>>>().promise;
+      let handler: Parameters<ClaudeTransport["setEventHandler"]>[0] = () => undefined;
+      let segmentId = 0;
       const transport: ClaudeTransport = {
         sessionId: input.sessionId,
-        setAutonomousTurnHandler: () => undefined,
-        setIdleTurnHandler: () => undefined,
-        setThreadEventHandler: () => undefined,
-        setIdleLive: () => undefined,
+        setEventHandler: (next) => {
+          handler = next;
+        },
+        isRunning: () => false,
         hasBackgroundTasks: () => false,
         stopBackgroundTask: async () => undefined,
         stopTasks: async () => undefined,
@@ -86,22 +86,19 @@ it("keeps the real Claude Adapter's same-native transports disjoint through Host
         setPermissionMode: async (value) => {
           permissionMode = value;
         },
-        compact: pending,
-        init: pending,
-        recap: pending,
-        runTurn: vi.fn((_text, userMessageId) => {
+        // Each accepted input starts a native execution that never reaches its result.
+        submitInput: vi.fn(async (_text, messageId) => {
           history.push({
             type: "user",
-            uuid: userMessageId,
+            uuid: messageId,
             session_id: input.sessionId,
             message: { role: "user", content: [{ type: "text", text: "synthetic" }] },
           });
-          return pending();
+          void handler({ type: "segment.started", segmentId: ++segmentId, inputIds: [messageId] });
         }),
-        steer: async () => undefined,
+        cancelInput: async () => false,
         respondToInteraction: async () => undefined,
-        abort: async () => undefined,
-        abortContinuation: async () => undefined,
+        abort: async () => ({ stillQueued: [] }),
         close: vi.fn(async () => {
           if (first) {
             closing.resolve();
@@ -148,7 +145,7 @@ it("keeps the real Claude Adapter's same-native transports disjoint through Host
     expect(response).not.toHaveProperty("error");
     expect(transports).toHaveLength(2);
     expect(transports[1]?.sessionId).toBe(old.sessionId);
-    expect(transports[1]?.runTurn).toHaveBeenCalledOnce();
+    expect(transports[1]?.submitInput).toHaveBeenCalledOnce();
   } finally {
     gate.resolve();
     await stopFixture(f);

@@ -153,7 +153,7 @@ describe("Claude history mapping", () => {
             {
               item: {
                 type: "toolExecution",
-                itemId: "claude-item-v2-user-1-tool-1",
+                itemId: "claude-tool-tool-1",
                 toolName: "Read",
                 arguments: {},
                 output: { content: [{ type: "text", text: "ignored" }] },
@@ -233,7 +233,7 @@ describe("Claude history mapping", () => {
             {
               item: {
                 type: "commandExecution",
-                itemId: "claude-item-v2-user-1-tool-1",
+                itemId: "claude-tool-bash-1",
                 command: "pwd",
                 output: "/work/project",
               },
@@ -242,7 +242,7 @@ describe("Claude history mapping", () => {
             {
               item: {
                 type: "toolExecution",
-                itemId: "claude-item-v2-user-1-tool-2",
+                itemId: "claude-tool-write-1",
                 toolName: "Write",
                 arguments: { path: "a.txt" },
                 output: { content: [{ type: "text", text: "permission denied" }] },
@@ -391,7 +391,7 @@ describe("Claude history mapping", () => {
     ]);
   });
 
-  it("omits Claude background task-notification records without hiding later human Turns", () => {
+  it("keeps autonomous native identities while hiding task-notification input", () => {
     const notification = `<task-notification>
 <task-id>a7b2e1021a9dc42e0</task-id>
 <tool-use-id>call_oIKmvIhI8V7NLb7dB7DFwZkN</tool-use-id>
@@ -418,11 +418,17 @@ describe("Claude history mapping", () => {
       {
         nativeTurnRef: { nativeTurnKey: "user-1" },
         input: [{ type: "text", text: "start three agents" }],
-        items: [
-          { item: { type: "agentMessage", text: "agents started" } },
-          { item: { type: "agentMessage", text: "first agent finished" } },
-          { item: { type: "agentMessage", text: "all agents finished" } },
-        ],
+        items: [{ item: { type: "agentMessage", text: "agents started" } }],
+      },
+      {
+        nativeTurnRef: { nativeTurnKey: "notification-origin" },
+        input: [],
+        items: [{ item: { type: "agentMessage", text: "first agent finished" } }],
+      },
+      {
+        nativeTurnRef: { nativeTurnKey: "notification-xml" },
+        input: [],
+        items: [{ item: { type: "agentMessage", text: "all agents finished" } }],
       },
       {
         nativeTurnRef: { nativeTurnKey: "user-2" },

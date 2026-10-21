@@ -140,7 +140,7 @@ export class ExternalThreadIdleRelease {
         reason = "closeFailed";
       } else if (this.#closing.has(thread.id)) {
         state = "closing";
-      } else if (thread.running || thread.activeTurnId) {
+      } else if (thread.execution.running) {
         state = "running";
         reason = "operation";
       } else if (thread.persistenceError || activity?.outputFailed) {
@@ -190,8 +190,7 @@ export class ExternalThreadIdleRelease {
       thread.record.state === "ready" &&
       !!thread.record.nativeSessionRef &&
       !thread.persistenceError &&
-      !thread.running &&
-      !thread.activeTurnId &&
+      !thread.execution.running &&
       this.options.canRelease(thread) &&
       Date.now() - state.lastActivity >= this.#settings.timeoutMinutes * 60_000
     );

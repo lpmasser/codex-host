@@ -14,6 +14,7 @@ import { CLAUDE_DEFAULT_PERMISSION_MODE_ID } from "../src/permission-modes.js";
 import { ClaudePendingSessions } from "../src/pending-session.js";
 import type {
   ClaudeAdapterDependencies,
+  ClaudeSessionEvent,
   ClaudeTransportFactoryInput,
   ClaudeTurnTransport,
 } from "../src/transport.js";
@@ -95,19 +96,21 @@ async function fixture(turns = 1) {
     readSubagentMessages: async () => [],
     createTransport: vi.fn((input) => {
       let permissionMode = input.permissionMode;
+      let handler: (event: ClaudeSessionEvent) => void | Promise<void> = () => undefined;
+      let ordinal = 0;
       const transport = {
         input,
         sessionId: input.sessionId,
         start: vi.fn(async () => undefined),
         close: vi.fn(async () => undefined),
-        abort: vi.fn(async () => undefined),
-        abortContinuation: vi.fn(async () => undefined),
-        setAutonomousTurnHandler: () => undefined,
-        setIdleTurnHandler: () => undefined,
-        setThreadEventHandler: () => undefined,
-        setIdleLive: () => undefined,
+        abort: vi.fn(async () => ({ stillQueued: [] })),
+        setEventHandler: (next) => {
+          handler = next;
+        },
+        cancelInput: async () => false,
         hasBackgroundTasks: () => false,
         stopBackgroundTask: async () => undefined,
+        isRunning: () => false,
         stopTasks: async () => undefined,
         getContextUsage: async () => null,
         getPermissionMode: () => permissionMode,
@@ -116,12 +119,13 @@ async function fixture(turns = 1) {
         },
         setModel: async () => undefined,
         setThinkingOption: async () => undefined,
-        steer: async () => undefined,
         respondToInteraction: async () => undefined,
-        compact: async () => ({ status: "succeeded" as const }),
-        init: async () => ({ status: "succeeded" as const }),
-        recap: async () => ({ status: "succeeded" as const }),
-        runTurn: async (text, userMessageId, onEvent) => {
+        submitInput: async (text, userMessageId) => {
+          const segmentId = ++ordinal;
+          await handler({ type: "segment.started", segmentId, inputIds: [userMessageId] });
+          const onEvent = (
+            event: Extract<ClaudeSessionEvent, { type: "segment.event" }>["event"],
+          ) => handler({ type: "segment.event", segmentId, event });
           const next = messages(input.sessionId, text);
           assert.ok(next[0]);
           assert.ok(next[1]);
@@ -133,7 +137,7 @@ async function fixture(turns = 1) {
             messageId: next[1].uuid,
             checkpointId: next[1].uuid,
           });
-          return { status: "succeeded" };
+          await handler({ type: "segment.completed", segmentId, result: { status: "succeeded" } });
         },
       } satisfies ClaudeTurnTransport & { input: ClaudeTransportFactoryInput };
       transports.push(transport);

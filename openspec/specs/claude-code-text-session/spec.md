@@ -77,7 +77,7 @@ The first accepted text Turn SHALL resolve the user-installed Claude Code execut
 - **AND** each caller-assigned User UUID is submitted once
 
 ### Requirement: Claude Native history maps deterministically
-`readSnapshot()` SHALL read only the identified Native Session through the official Claude SDK history API and SHALL deterministically map each human User message and its following supported Assistant text and explicit visible thinking into one Host Turn. The caller-assigned User UUID SHALL remain the Native Turn identity. Claude Tool-result User messages, synthetic or metadata User records, local-command output or caveat records, native Model-selection and Compact command envelopes, and background task-notification records SHALL NOT become human Host Turns. Other genuine human slash-command prompts SHALL remain eligible for projection. codexhost SHALL NOT persist a second Transcript.
+`readSnapshot()` SHALL read only the identified Native Session through the official Claude SDK history API and SHALL deterministically map each human User message and its following supported Assistant text and explicit visible thinking into one Host Turn. The caller-assigned User UUID SHALL remain the Native Turn identity. Claude Tool-result User messages, synthetic or metadata User records, local-command output or caveat records, native Model-selection and Compact command envelopes, and background task-notification records SHALL NOT become human Host Turns. Other genuine human slash-command prompts SHALL remain eligible for projection. codexhost SHALL NOT persist a second Transcript. Historical main and Subagent thinking blocks SHALL use the same native signature classification: narration becomes commentary Agent Message and all other explicit visible thinking remains Reasoning. Native signatures SHALL remain in their source history; no second classification store is required.
 
 #### Scenario: Completed Claude history is read repeatedly
 - **WHEN** a Claude Session containing completed text Turns and visible Assistant thinking is read more than once
@@ -157,7 +157,17 @@ The first accepted text Turn SHALL resolve the user-installed Claude Code execut
 - **AND** source history SHALL remain unchanged
 
 ### Requirement: Claude text streaming has one complete ordered lifecycle
-Every accepted Claude text Turn SHALL emit one Turn start, retain the established Root Agent Message lifecycle, emit zero or more Root Reasoning Item lifecycles only for explicit streamed Claude thinking, emit one terminal for every started Item, and emit one Turn terminal. Partial and complete Root Assistant text SHALL be reconciled by native execution scope and native Assistant `message.id`; complete content from a later Root response in the same Tool loop SHALL NOT be treated as a cumulative snapshot of the Host Turn. Claude messages carrying a non-empty `parent_tool_use_id` SHALL remain nested execution and SHALL NOT append, compare with, create, or close Root Assistant, Reasoning, or ordinary Tool Items. Live Reasoning SHALL use only Root `thinking_delta` text and SHALL ignore complete Assistant `thinking` blocks. Whenever a Thinking option other than Off is active, the Adapter SHALL request summarized Thinking display when creating the Query, because adaptive Thinking otherwise streams only redacted `thinking_delta` frames whose text is empty and no Reasoning would be observable. Unknown native message types and all unsupported non-text content MUST NOT cross the HarnessAdapter seam.
+Every Claude text Turn that begins native execution SHALL emit one Turn start, retain the established Root Agent Message lifecycle, emit zero or more Root Reasoning Item lifecycles only for explicit streamed Claude thinking, emit one terminal for every started Item, and emit one Turn terminal. Partial and complete Root Assistant text SHALL be reconciled by native execution scope and native Assistant `message.id`; complete content from a later Root response in the same Tool loop SHALL NOT be treated as a cumulative snapshot of the Host Turn. Claude messages carrying a non-empty `parent_tool_use_id` SHALL remain nested execution and SHALL NOT append, compare with, create, or close Root Assistant, Reasoning, or ordinary Tool Items. The Adapter SHALL buffer Root thinking deltas by native block until the complete block signature can be classified. A signature whose protobuf metadata marks `narration` SHALL become a separate commentary Agent Message; all other blocks SHALL retain streamed text as Reasoning. Signatures SHALL be read only at the Claude native boundary and SHALL NOT be exposed as text. Complete narration without partial deltas MAY supply its explicit visible text; complete-only ordinary or protected thinking SHALL remain omitted from live Reasoning. An interrupted block without confirmed narration SHALL retain its streamed text as Reasoning and settle with the Turn outcome, including Query EOF, fault, or close without a native Result. Whenever a Thinking option other than Off is active, the Adapter SHALL request summarized Thinking display when creating the Query, because adaptive Thinking otherwise streams only redacted `thinking_delta` frames whose text is empty and no Reasoning would be observable. Unknown native message types and all unsupported non-text content MUST NOT cross the HarnessAdapter seam.
+
+#### Scenario: Native policy refuses input before execution
+- **WHEN** Claude reports `command_lifecycle refused` for an input that has not started
+- **THEN** the Adapter SHALL reject any pending acceptance and fail the corresponding pending Host Turn with `nativeFailure`
+- **AND** it SHALL NOT emit `turn.started`, replay the input, or terminate an unrelated execution
+
+#### Scenario: Session ends with unconsumed input
+- **WHEN** Claude reports `command_lifecycle discarded` for unconsumed input, whether or not it was queued
+- **THEN** the Adapter SHALL retire the input and cancel its pending Host Turn without emitting `turn.started`
+- **AND** an already-issued queued acceptance SHALL remain a fact of receipt, not a promise that execution occurred
 
 #### Scenario: Partial text and full Assistant agree
 - **WHEN** SDK partial events stream a Root text prefix and the complete Root Assistant message with the same native `message.id` contains the prefix plus a suffix
@@ -190,12 +200,14 @@ Every accepted Claude text Turn SHALL emit one Turn start, retain the establishe
 
 #### Scenario: Streamed thinking has a complete Assistant counterpart
 - **WHEN** Root SDK stream events emit non-empty `thinking_delta` text for one Assistant message and the complete Assistant wrapper with the same native `message.id` contains thinking blocks
-- **THEN** the Adapter SHALL append only the `thinking_delta` text through one Reasoning Item for that message
-- **AND** it SHALL ignore the complete `thinking` blocks without appending their suffix
+- **THEN** it SHALL classify each complete block by the same signature metadata rule as Claude Desktop
+- **AND** narration SHALL become a separate commentary Agent Message before the following Tool or Question, while ordinary thinking remains Reasoning
+- **AND** ordinary Reasoning SHALL retain only streamed text, while narration SHALL include a matching complete-message suffix exactly once
 
 #### Scenario: Thinking streaming is unavailable
 - **WHEN** no Root partial thinking event is emitted but a complete Assistant message contains non-empty visible thinking text
-- **THEN** the Adapter SHALL emit no Reasoning Item from the complete `thinking` blocks
+- **THEN** signed narration MAY become a commentary Agent Message
+- **AND** ordinary, unknown, or protected complete-only thinking SHALL emit no live Reasoning Item
 
 #### Scenario: One Turn contains multiple Assistant messages
 - **WHEN** a Claude Tool loop or retry produces Root `thinking_delta` text in more than one native Assistant message
@@ -614,45 +626,46 @@ Claude Code SHALL advertise Subagent observation and SHALL map Root `Agent` or `
 - **THEN** Claude Adapter SHALL update only that delegation's normalized state
 - **AND** it SHALL tolerate absent optional task messages without failing the Root Turn
 
-#### Scenario: A background Subagent settles before Claude answers for it
-- **WHEN** Claude reports a background Subagent as settled through a task notification or by dropping it from the live background task level
-- **THEN** Claude Adapter SHALL publish that Subagent's terminal state immediately
-- **AND** it SHALL keep that Subagent occupying the user task, because the Root answer it triggers runs in a later native Segment
-- **AND** occupancy SHALL be settled only when the native Session stops opening Segments for this user task, since the number of Segments Claude spends on queued notifications is not observable
-- **AND** Root text, reasoning, Tool Use, or a Segment start SHALL cancel any pending idle decision so a slow continuation cannot close the Turn early
+#### Scenario: Agent Tool result launches background work
+- **WHEN** the correlated Agent or Task Tool Result acknowledges a successful background launch
+- **THEN** Claude Adapter SHALL preserve its native identity and detach the delegation Item
+- **AND** the Root Turn SHALL complete at its native Result while the task and Item remain live
+- **AND** background activity SHALL NOT occupy the foreground input slot or start a continuation timer
 
-#### Scenario: A held Root Turn receives settlement without a continuation
-- **WHEN** the Root has reached its native Result and a later task notification or live background task level marks an occupied Subagent as settled
-- **THEN** Claude Adapter SHALL start the existing continuation quiescence period while the Root is idle
-- **AND** if no Root continuation starts during that period, it SHALL release the settled Subagents' pending continuation occupancy
-- **AND** it SHALL complete the held Turn and accept another user Turn once no running background Subagents remain
-- **AND** Root output, compaction, or an interaction request SHALL cancel the pending idle decision, and later Subagent settlement SHALL NOT restart it until the Root reaches its next native Result
-
-#### Scenario: Agent Tool result returns
-- **WHEN** the correlated Root Agent or Task Tool Result returns with a stable `agentId`
-- **THEN** Claude Adapter SHALL preserve that native identity for Child Host Thread registration and complete the spawn operation according to the Tool Result outcome
-- **AND** a successful background launch SHALL keep the native Subagent running
-- **AND** Claude Adapter SHALL distinguish an asynchronous launch acknowledgement from the delegated Agent's terminal result
-- **AND** that launch acknowledgement SHALL NOT emit `turn.completed` while the native Subagent remains running
-- **AND** occupancy SHALL start at the `run_in_background` Tool Use, keyed by `callId` until `agentId` is bound
-- **AND** a later Root `result` or Assistant `message.completed` SHALL NOT emit `turn.completed` while any occupied background spawn from this user task remains unsettled
+#### Scenario: Background work settles
+- **WHEN** Claude reports the native task terminal
+- **THEN** its pending Interactions SHALL close before its detached delegation Item completes
+- **AND** the Item SHALL receive the actual task outcome on its original Host Turn
+- **AND** a task settlement alone SHALL NOT manufacture a Root execution
 
 #### Scenario: Root sends more work to an existing Agent
-- **WHEN** Claude invokes `SendMessage` with an existing native Agent recipient
-- **THEN** Claude Adapter SHALL emit a send delegation targeting that same native Subagent
-- **AND** successful message delivery SHALL leave the Agent running rather than report the Agent completed
+- **WHEN** Claude invokes SendMessage with an existing native Agent recipient
+- **THEN** message delivery SHALL remain distinct from that Agent's task lifetime
+- **AND** a native task still reported live SHALL retain its Item and request ownership until its terminal
+- **AND** a synchronous send without a live task SHALL complete normally
+- **AND** one task terminal SHALL settle every detached delegation referring to that native task
 
-#### Scenario: Background task notification resumes Claude
-- **WHEN** Claude consumes a task notification while the requested Host Turn is still held for running background Subagents and generates a follow-up Root answer
-- **THEN** Claude Transport SHALL parse its stable `task-id`, preserve the full continuation until its native Result, and report that Subagent's terminal state
-- **AND** Claude Adapter SHALL emit the correlated Session-scoped Subagent completion on the same Host Turn
-- **AND** it SHALL NOT emit `turn.completed` until no Root Segment, background Subagent, or continuation is executing, including a Subagent settled during an earlier Segment of the same user task
-- **AND** Assistant `message.completed` SHALL close the current Root Agent Message Item without emitting `turn.completed`
+#### Scenario: Background task notification resumes Claude after the Root Result
+- **WHEN** Claude consumes a task notification after the requested Host Turn completed and produces Root output
+- **THEN** Claude Adapter SHALL project that actual native Segment as an autonomous Host Turn
+- **AND** it SHALL complete at that Segment's native Result without reopening the old Turn
 
-#### Scenario: Background task notification resumes Claude after the requested Turn completed
-- **WHEN** Claude consumes a task notification after the requested Host Turn has completed and generates a follow-up Root answer
-- **THEN** Claude Adapter SHALL emit the correlated Session-scoped Subagent completion and one autonomous Host Turn with stable native identity
-- **AND** that Host Turn SHALL run live as a Claude continuation without a Turn request
+#### Scenario: Background request crosses Root completion
+- **WHEN** a native background Agent or Workflow asks for approval or user input before or after the Root Result
+- **THEN** the request SHALL retain its native task owner and remain answerable while that request is pending
+- **AND** another foreground Turn SHALL remain independently admissible
+- **AND** the Root Result SHALL close only Root-scoped requests
+- **AND** native abort, actual task terminal, and Session close or fault SHALL retire task requests before their Items
+
+#### Scenario: Workflow agent appears after its Root completed
+- **WHEN** Workflow progress first names an agent after the Root Turn completed
+- **THEN** the existing detached delegation Item SHALL receive that agent through a correlated update
+- **AND** Host Runtime SHALL register its normal read-only Child Thread
+
+#### Scenario: Task launches while cancellation is in progress
+- **WHEN** a background task launch arrives after cancellation took its initial task snapshot
+- **THEN** Claude Adapter SHALL retain the task and immediately request its native stop
+- **AND** cancellation acceptance SHALL NOT fabricate a task terminal
 
 ### Requirement: Claude continuations without a Turn request run as live autonomous Turns
 Claude Adapter SHALL project a native Segment that Claude starts without a Host Turn request, such as its answer to a background Subagent or background command notification after the requested Host Turn completed, as one autonomous Host Turn that runs while the Segment runs. Claude Transport SHALL hold that Segment's events only until its first Root output and then deliver them, and every later event, as they arrive.

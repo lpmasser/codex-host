@@ -532,33 +532,11 @@ describe("Claude native Turn interpretation", () => {
         resultSummary: "Agent finished",
       },
     ]);
-    expect(
-      turn.consume({
-        type: "system",
-        subtype: "background_tasks_changed",
-        tasks: [],
-      }).events,
-    ).toEqual([{ type: "subagents.live", nativeSubagentIds: [] }]);
   });
 
-  it("reports the live background Subagent level and each Segment start", () => {
+  it("reports each native Segment start", () => {
     const turn = new ClaudeNativeTurnAccumulator();
 
-    expect(
-      turn.consume({
-        type: "system",
-        subtype: "background_tasks_changed",
-        tasks: [
-          { task_id: "a08c4ffa3d980cff8", task_type: "local_agent", description: "Inspect" },
-          { task_id: "a1b2c3d4e5f607182", task_type: "local_agent", description: "Review" },
-        ],
-      }).events,
-    ).toEqual([
-      {
-        type: "subagents.live",
-        nativeSubagentIds: ["a08c4ffa3d980cff8", "a1b2c3d4e5f607182"],
-      },
-    ]);
     expect(turn.consume({ type: "system", subtype: "init", cwd: "/tmp" }).events).toEqual([
       { type: "segment.started" },
     ]);
@@ -828,13 +806,7 @@ describe("Claude native Turn interpretation", () => {
   it("uses only streamed thinking when the complete wrapper contains more thinking", () => {
     const turn = new ClaudeNativeTurnAccumulator();
 
-    expect(turn.consume(thinkingPartial("visible ", "assistant-thinking")).events).toEqual([
-      {
-        type: "reasoning.delta",
-        messageId: "assistant-thinking",
-        delta: "visible ",
-      },
-    ]);
+    expect(turn.consume(thinkingPartial("visible ", "assistant-thinking")).events).toEqual([]);
     expect(
       turn.consume(
         assistantBlocks(
@@ -846,7 +818,8 @@ describe("Claude native Turn interpretation", () => {
         ),
       ).events,
     ).toEqual([
-      { type: "reasoning.completed", messageId: "assistant-thinking" },
+      { type: "reasoning.delta", messageId: "assistant-thinking:thinking:0", delta: "visible " },
+      { type: "reasoning.completed", messageId: "assistant-thinking:thinking:0" },
       { type: "text.delta", messageId: "assistant-thinking", delta: "answer" },
       {
         type: "message.completed",
@@ -893,7 +866,8 @@ describe("Claude native Turn interpretation", () => {
         ),
       ).events,
     ).toEqual([
-      { type: "reasoning.completed", messageId: "reasoning-conflict" },
+      { type: "reasoning.delta", messageId: "reasoning-conflict:thinking:0", delta: "streamed" },
+      { type: "reasoning.completed", messageId: "reasoning-conflict:thinking:0" },
       {
         type: "message.completed",
         messageId: "reasoning-conflict",

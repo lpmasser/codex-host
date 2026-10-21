@@ -18,6 +18,10 @@ import {
 import { AppServerHost } from "../src/index.js";
 
 type ClaudeAdapterDependencies = NonNullable<ConstructorParameters<typeof ClaudeCodeAdapter>[1]>;
+type ClaudeNativeHandler = Parameters<
+  ReturnType<ClaudeAdapterDependencies["createTransport"]>["setEventHandler"]
+>[0];
+type ClaudeNativeEvent = Parameters<ClaudeNativeHandler>[0];
 
 const RUN_REAL = process.env.CODEXHOST_RUN_CLAUDE_HOST_REAL === "1";
 const REAL_TIMEOUT_MS = 180_000;
@@ -105,13 +109,20 @@ function writeRequest(input: PassThrough, request: JsonObject): void {
 }
 
 describe("AppServerHost hermetic Claude projection", () => {
-  it("keeps a successful Claude Turn mapped and rereads its Native history", async () => {
+  it("keeps native Turn ownership through pending input, autonomous execution, history and cancellation", async () => {
     const mappingStoreDirectory = await fs.mkdtemp(
       path.join(tmpdir(), "codexhost-host-claude-hermetic-"),
     );
     let uuid = 0;
     let nativeSessionId: string | undefined;
     let nativeTurnKey: string | undefined;
+    let nativeHandler: ClaudeNativeHandler = () => undefined;
+    let nativeFault: (error: unknown) => void = () => undefined;
+    let deferredInput: string | undefined;
+    let steeredInput: string | undefined;
+    let deferInput = false;
+    let nativeRunning = false;
+    const laterHistory: unknown[] = [];
     const dependencies: ClaudeAdapterDependencies = {
       randomUUID: () => `claude-hermetic-${++uuid}`,
       bypassPermissionsAvailable: () => true,
@@ -146,21 +157,32 @@ describe("AppServerHost hermetic Claude projection", () => {
               stop_reason: "end_turn",
             },
           },
+          ...laterHistory,
         ];
       },
       readSubagentMessages: async () => [],
       createTransport: (input) => {
         nativeSessionId = input.sessionId;
+        nativeFault = input.onFault;
         let permissionMode = input.permissionMode;
+        let handler: ClaudeNativeHandler = () => undefined;
+        let ordinal = 0;
         return {
           sessionId: input.sessionId,
-          steer: async () => undefined,
-          setAutonomousTurnHandler: () => undefined,
-          setIdleTurnHandler: () => undefined,
-          setThreadEventHandler: () => undefined,
-          setIdleLive: () => undefined,
+          setEventHandler: (next) => {
+            handler = (event) => {
+              if (event.type === "activity.changed") nativeRunning = event.activity !== "idle";
+              return next(event);
+            };
+            nativeHandler = handler;
+          },
+          cancelInput: async (messageId) => {
+            await handler({ type: "input.terminated", messageId, state: "cancelled" });
+            return true;
+          },
           hasBackgroundTasks: () => false,
           stopBackgroundTask: async () => undefined,
+          isRunning: () => nativeRunning,
           stopTasks: async () => undefined,
           start: async () => undefined,
           getContextUsage: async () => ({
@@ -174,10 +196,20 @@ describe("AppServerHost hermetic Claude projection", () => {
           setPermissionMode: async (mode) => {
             permissionMode = mode;
           },
-          compact: async () => ({ status: "succeeded" }),
-          init: async () => ({ status: "succeeded" }),
-          recap: async () => ({ status: "succeeded" }),
-          runTurn: async (_text, userMessageId, onEvent) => {
+          submitInput: async (_text, userMessageId, priority) => {
+            if (priority === "next") {
+              steeredInput = userMessageId;
+              return;
+            }
+            if (deferInput) {
+              deferredInput = userMessageId;
+              return;
+            }
+            const segmentId = ++ordinal;
+            await handler({ type: "segment.started", segmentId, inputIds: [userMessageId] });
+            const onEvent = (
+              event: Extract<ClaudeNativeEvent, { type: "segment.event" }>["event"],
+            ) => handler({ type: "segment.event", segmentId, event });
             nativeTurnKey = userMessageId;
             onEvent({
               type: "text.delta",
@@ -189,11 +221,14 @@ describe("AppServerHost hermetic Claude projection", () => {
               messageId: "hermetic-assistant",
               checkpointId: "claude-hermetic-assistant",
             });
-            return { status: "succeeded" };
+            await handler({
+              type: "segment.completed",
+              segmentId,
+              result: { status: "succeeded" },
+            });
           },
           respondToInteraction: async () => undefined,
-          abort: async () => undefined,
-          abortContinuation: async () => undefined,
+          abort: async () => ({ stillQueued: [] }),
           close: async () => undefined,
         };
       },
@@ -281,6 +316,208 @@ describe("AppServerHost hermetic Claude projection", () => {
           },
         },
       });
+
+      // A background Agent keeps the Session running after its parent Turn completes.
+      // That activity must not reserve the next foreground input slot.
+      await nativeHandler({ type: "activity.changed", activity: "running" });
+      await collector.waitFor(
+        (m) =>
+          method(m, "thread/status/changed") &&
+          ((m.params as JsonObject).status as JsonObject).type === "active",
+      );
+      // B is accepted while an earlier native continuation has not yet reached the Host.
+      deferInput = true;
+      writeRequest(desktopInput, {
+        id: 4,
+        method: "turn/start",
+        params: { threadId, input: [{ type: "text", text: "input B" }] },
+      });
+      const pending = await collector.waitFor((message) => requestId(message, 4));
+      expect(pending.error).toBeUndefined();
+      const pendingId = ((pending.result as JsonObject).turn as JsonObject).id;
+      expect(deferredInput).toBeDefined();
+      expect(
+        collector.messages.some(
+          (m) =>
+            method(m, "turn/started") &&
+            (m.params as JsonObject).turn &&
+            ((m.params as JsonObject).turn as JsonObject).id === pendingId,
+        ),
+      ).toBe(false);
+      const user = (id: string, text: string, autonomous = false) => ({
+        type: "user",
+        uuid: id,
+        session_id: nativeSessionId,
+        ...(autonomous ? { origin: { kind: "task-notification" } } : {}),
+        message: { role: "user", content: text },
+      });
+      const reply = (id: string, text: string) => ({
+        type: "assistant",
+        uuid: id,
+        session_id: nativeSessionId,
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      });
+      const emitReply = async (segmentId: number, id: string, text: string) => {
+        await nativeHandler({
+          type: "segment.event",
+          segmentId,
+          event: { type: "text.delta", messageId: id, delta: text },
+        });
+        await nativeHandler({
+          type: "segment.event",
+          segmentId,
+          event: { type: "message.completed", messageId: id, checkpointId: id },
+        });
+        await nativeHandler({
+          type: "segment.completed",
+          segmentId,
+          result: { status: "succeeded" },
+        });
+      };
+      laterHistory.push(
+        user("notification-A", "notification", true),
+        reply("reply-A", "earlier A"),
+      );
+      await nativeHandler({ type: "activity.changed", activity: "running" });
+      await nativeHandler({ type: "segment.started", segmentId: 2, inputIds: [] });
+      await nativeHandler({
+        type: "segment.event",
+        segmentId: 2,
+        event: { type: "text.delta", messageId: "reply-A", delta: "earlier A" },
+      });
+      const startedA = await collector.waitFor(
+        (m) =>
+          method(m, "turn/started") &&
+          ((m.params as JsonObject).turn as JsonObject).id !==
+            ((completed.params as JsonObject).turn as JsonObject).id,
+      );
+      const activeA = ((startedA.params as JsonObject).turn as JsonObject).id;
+      if (typeof activeA !== "string") throw new Error("No autonomous Turn ID");
+      writeRequest(desktopInput, {
+        id: 8,
+        method: "turn/steer",
+        params: {
+          threadId,
+          expectedTurnId: activeA,
+          clientUserMessageId: "client-steer",
+          input: [{ type: "text", text: "adjust A" }],
+        },
+      });
+      expect((await collector.waitFor((m) => requestId(m, 8))).error).toBeUndefined();
+      expect(
+        collector.messages.some(
+          (m) => method(m, "item/completed") && JSON.stringify(m).includes("client-steer"),
+        ),
+      ).toBe(false);
+      await nativeHandler({
+        type: "input.started",
+        segmentId: 2,
+        messageId: steeredInput as string,
+      });
+      const applied = await collector.waitFor(
+        (m) => method(m, "item/completed") && JSON.stringify(m).includes("client-steer"),
+      );
+      expect((applied.params as JsonObject).turnId).toBe(activeA);
+      expect(
+        collector.messages.filter(
+          (m) => method(m, "item/completed") && JSON.stringify(m).includes("client-steer"),
+        ),
+      ).toHaveLength(1);
+      laterHistory.push({
+        type: "attachment",
+        uuid: "queued-attachment",
+        session_id: nativeSessionId,
+        attachment: {
+          type: "queued_command",
+          commandMode: "prompt",
+          source_uuid: steeredInput,
+          prompt: "adjust A",
+        },
+      });
+      await nativeHandler({
+        type: "segment.event",
+        segmentId: 2,
+        event: { type: "message.completed", messageId: "reply-A", checkpointId: "reply-A" },
+      });
+      await nativeHandler({
+        type: "segment.completed",
+        segmentId: 2,
+        result: { status: "succeeded" },
+      });
+      const completedA = await collector.waitFor(
+        (m) => method(m, "turn/completed") && JSON.stringify(m).includes("earlier A"),
+      );
+      const turnA = (completedA.params as JsonObject).turn as JsonObject;
+      expect(turnA.id).not.toBe(pendingId);
+      laterHistory.push(user(deferredInput as string, "input B"), reply("reply-B", "reply to B"));
+      await nativeHandler({
+        type: "segment.started",
+        segmentId: 3,
+        inputIds: [deferredInput as string],
+      });
+      await emitReply(3, "reply-B", "reply to B");
+      await nativeHandler({ type: "activity.changed", activity: "idle" });
+      const completedB = await collector.waitFor(
+        (m) =>
+          method(m, "turn/completed") &&
+          ((m.params as JsonObject).turn as JsonObject).id === pendingId,
+      );
+      expect(JSON.stringify(completedB)).toContain("reply to B");
+      expect(JSON.stringify(completedB)).not.toContain("earlier A");
+      const mapped = await mappingStore.getThread(hostThreadIdSchema.parse(threadId));
+      expect(mapped?.turnMappings).toHaveLength(3);
+      writeRequest(desktopInput, {
+        id: 5,
+        method: "thread/read",
+        params: { threadId, includeTurns: true },
+      });
+      const reread = await collector.waitFor((m) => requestId(m, 5));
+      const turns = ((reread.result as JsonObject).thread as JsonObject).turns as JsonObject[];
+      expect(turns.map((t) => t.id)).toEqual([
+        ((completed.params as JsonObject).turn as JsonObject).id,
+        turnA.id,
+        pendingId,
+      ]);
+      expect(JSON.stringify(turns[1])).toContain("earlier A");
+      expect(JSON.stringify(turns[1])).toContain("adjust A");
+      expect(JSON.stringify(turns[2])).not.toContain("earlier A");
+
+      writeRequest(desktopInput, {
+        id: 6,
+        method: "turn/start",
+        params: { threadId, input: [{ type: "text", text: "withdraw before start" }] },
+      });
+      const submitted = await collector.waitFor((m) => requestId(m, 6));
+      const withdrawnId = ((submitted.result as JsonObject).turn as JsonObject).id;
+      if (typeof withdrawnId !== "string") throw new Error("No pending Turn ID");
+      writeRequest(desktopInput, {
+        id: 7,
+        method: "turn/interrupt",
+        params: { threadId, turnId: withdrawnId },
+      });
+      expect((await collector.waitFor((m) => requestId(m, 7))).error).toBeUndefined();
+      const withdrawn = await collector.waitFor(
+        (m) =>
+          method(m, "turn/completed") &&
+          ((m.params as JsonObject).turn as JsonObject).id === withdrawnId,
+      );
+      expect(withdrawn).toMatchObject({ params: { turn: { status: "interrupted" } } });
+      expect(
+        collector.messages.some(
+          (m) =>
+            method(m, "turn/started") &&
+            ((m.params as JsonObject).turn as JsonObject).id === withdrawnId,
+        ),
+      ).toBe(false);
+      const beforeFault = collector.messages.length;
+      await nativeHandler({ type: "activity.changed", activity: "running" });
+      nativeFault(new Error("synthetic native failure after a Turn"));
+      await collector.waitFor(
+        (m) =>
+          collector.messages.indexOf(m) >= beforeFault &&
+          method(m, "thread/status/changed") &&
+          ((m.params as JsonObject).status as JsonObject).type === "idle",
+      );
     } finally {
       desktopInput.end();
       await running;

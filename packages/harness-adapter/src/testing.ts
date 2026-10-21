@@ -208,6 +208,7 @@ export class FakeHarnessSession implements HarnessSession {
     supportsRollbackLastTurn = false,
     permissionModeScope: HarnessPermissionModeScope = "live",
     supportsSteer = false,
+    supportsNativeExecutionLifecycle = false,
   ) {
     this.harnessId = harnessId;
     const availableThinkingOptions = thinkingOptionsForModel(catalog, initialModel);
@@ -230,6 +231,7 @@ export class FakeHarnessSession implements HarnessSession {
       },
       subagents: { observe: false, readTranscript: false },
       ...(supportsSteer ? { steer: true } : {}),
+      ...(supportsNativeExecutionLifecycle ? { nativeExecutionLifecycle: true } : {}),
     };
     this.cwd = cwd;
     this.#catalog = catalog;
@@ -257,6 +259,10 @@ export class FakeHarnessSession implements HarnessSession {
   setStateForSnapshot(state: HarnessSessionState): void {
     if (this.#closed) throw new Error("Fake Harness Session is closed");
     this.#state = cloneJson(state);
+  }
+
+  publishActivity(activity: "idle" | "running" | "requires_action"): void {
+    this.#event({ type: "session.activity.changed", activity });
   }
 
   publishEphemeralCommand(turnId: HostTurnId, item: HostItem): void {
@@ -481,7 +487,12 @@ export class FakeHarnessSession implements HarnessSession {
       this.#completeTurnDuringSteerAcceptance = false;
       this.succeedTurn();
     }
-    return { ok: true, value: { accepted: true } };
+    return {
+      ok: true,
+      value: {
+        accepted: true,
+      },
+    };
   }
 
   appendText(text: string): void {
@@ -539,8 +550,8 @@ export class FakeHarnessSession implements HarnessSession {
   detachItem(itemId: HostItemId): void {
     const active = this.#requireActive();
     const item = active.items.get(itemId);
-    if (item?.type !== "commandExecution") {
-      throw new Error("Fake Harness Item is not a Command Execution");
+    if (item?.type !== "commandExecution" && item?.type !== "subagentDelegation") {
+      throw new Error("Fake Harness Item is not native background work");
     }
     active.items.delete(itemId);
     active.completedItems.push({ item, outcome: { status: "succeeded" } });
@@ -550,6 +561,10 @@ export class FakeHarnessSession implements HarnessSession {
   /** Emits an event outside the scripted Turn, e.g. a detached Item's later output. */
   emitEvent(event: HostEvent): void {
     this.#event(event);
+  }
+
+  emitInteraction(interaction: HostInteraction): void {
+    this.#channel.emit({ kind: "interaction", interaction });
   }
 
   appendCommandOutput(itemId: HostItemId, text: string): void {
@@ -1065,6 +1080,7 @@ export class FakeHarnessAdapter implements HarnessAdapter {
   readonly supportsRollbackLastTurn: boolean;
   /** Sessions opened after this is set declare native steering. */
   supportsSteer = false;
+  supportsNativeExecutionLifecycle = false;
   readonly permissionModeScope: HarnessPermissionModeScope;
   inspectionCalls = 0;
   #closePromise: Promise<void> | null = null;
@@ -1342,6 +1358,7 @@ export class FakeHarnessAdapter implements HarnessAdapter {
       this.supportsRollbackLastTurn,
       this.permissionModeScope,
       this.supportsSteer,
+      this.supportsNativeExecutionLifecycle,
     );
     this.sessions.push(session);
     this.#sessionsByNativeId.set(nativeRef.nativeSessionId, session);

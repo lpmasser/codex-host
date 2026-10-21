@@ -82,6 +82,7 @@ import type {
 import {
   parseHarnessAccountCredits,
   type HostEvent,
+  type InputConsumedEvent,
   type HostUsage,
 } from "@codexhost/harness-adapter";
 import type {
@@ -834,6 +835,7 @@ export class AppServerHost {
       activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
       pendingQuestions: (threadId) => this.#questions.read(threadId),
+      externalTurnBusy: (thread) => this.#externalTurnBusy(thread),
     });
     const maintenanceOperation = <T>(run: () => Promise<T>): Promise<T> =>
       options.runtimeMaintenance ? options.runtimeMaintenance.operation(run) : run();
@@ -1060,9 +1062,7 @@ export class AppServerHost {
       this.#pendingOfficialTurnStarts.size > 0 ||
       this.#activeOfficialTurns.size > 0 ||
       this.#runningSubagentsByParent.size > 0 ||
-      this.#externalRuntime
-        .values()
-        .some((thread) => thread.running || thread.activeTurnId !== null)
+      this.#externalRuntime.values().some((thread) => thread.execution.running)
     );
   }
 
@@ -2462,7 +2462,9 @@ export class AppServerHost {
 
   async #canHandleDelegationStart(input: DelegationStartInput): Promise<boolean> {
     if (input.parentThreadId) return this.#ownsDelegationThread(input.parentThreadId);
-    const externalActive = this.#externalRuntime.values().some((thread) => thread.running);
+    const externalActive = this.#externalRuntime
+      .values()
+      .some((thread) => thread.execution.running);
     return externalActive || this.#activeOfficialTurns.size > 0;
   }
 
@@ -2928,7 +2930,7 @@ export class AppServerHost {
       records,
       runtimeFor: (threadId) => {
         const thread = this.#externalRuntime.get(threadId);
-        return thread ? { running: thread.running } : null;
+        return thread ? { running: thread.execution.running } : null;
       },
       requestOfficialPage: async (params) =>
         officialThreadListPageFromResponse(await this.#requestOfficial("thread/list", params)),
@@ -3002,7 +3004,7 @@ export class AppServerHost {
     const subagentStatus = this.#subagentThreadStatuses.get(threadId);
     if (subagentStatus) return { running: subagentStatus === "active" };
     const thread = this.#externalRuntime.get(threadId);
-    return thread ? { running: thread.running } : null;
+    return thread ? { running: thread.execution.running } : null;
   }
 
   /** `section_position` lists merge External section placements into the official order. */
@@ -3206,7 +3208,7 @@ export class AppServerHost {
       record,
       turns: [],
       sessionId: thread.sessionId,
-      running: thread.running,
+      running: thread.execution.running,
     });
     thread.record = record;
     thread.thread = { ...thread.thread, ...projected, turns: thread.thread.turns ?? [] };
@@ -3686,7 +3688,7 @@ export class AppServerHost {
     thread: ExternalThread,
     params: ReturnType<typeof threadCommandExecuteParamsSchema.parse>,
   ): Promise<void> {
-    if (this.#externalThreadBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
+    if (this.#externalTurnBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
       await this.#writer.json(
         rpcError(request, -32072, "External Thread already has an active operation"),
       );
@@ -3762,7 +3764,7 @@ export class AppServerHost {
     }
     // Admission belongs to the caller. A steering replacement retains its
     // reservation until this command starts, after the old Turn has stopped.
-    if (thread.running || thread.activeTurnId) {
+    if (thread.execution.turnBusy) {
       throw new ExternalCommandError(-32072, "External Thread already has an active operation");
     }
     const turnId = requestedTurnId ?? hostTurnIdSchema.parse(randomUUID());
@@ -3775,8 +3777,7 @@ export class AppServerHost {
       }),
     };
     const gate = turnProjectionGate();
-    thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.execution.requestStarted(turnId);
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
@@ -3798,8 +3799,7 @@ export class AppServerHost {
       return { turnId: result.value.turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.turnEnded(turnId);
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       thread.ephemeralTurnIds.delete(turnId);
@@ -3949,7 +3949,7 @@ export class AppServerHost {
           record: { ...thread.record, transportModelId },
           turns: thread.turns,
           sessionId: thread.sessionId,
-          running: thread.running,
+          running: thread.execution.running,
         });
       }
       await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(projected) }));
@@ -4042,7 +4042,7 @@ export class AppServerHost {
           record: { ...thread.record, transportModelId },
           turns: thread.turns,
           sessionId: thread.sessionId,
-          running: thread.running,
+          running: thread.execution.running,
         });
         // Resume restores the saved selection, so an unsaved change must not
         // be reported as a completed selection.
@@ -4249,7 +4249,7 @@ export class AppServerHost {
     if (!thread.historyHydrated) return;
     for (const turnId of thread.steeredTurnIds) {
       if (
-        turnId !== thread.activeTurnId &&
+        turnId !== thread.execution.activeTurnId &&
         turns.some(
           (turn) =>
             turn.id === turnId &&
@@ -4500,7 +4500,7 @@ export class AppServerHost {
       );
       return;
     }
-    if (includeTurns && !thread.running && !historyFresh) {
+    if (includeTurns && !thread.execution.running && !historyFresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -4533,7 +4533,7 @@ export class AppServerHost {
     const requiresRefresh =
       request.method === "thread/turns/list" ||
       (request.method === "thread/items/list" && !thread.historyHydrated);
-    if (!thread.running && !historyFresh && headPage && requiresRefresh) {
+    if (!thread.execution.running && !historyFresh && headPage && requiresRefresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -4569,7 +4569,7 @@ export class AppServerHost {
     params: JsonObject,
     historyFresh: boolean,
   ): Promise<void> {
-    if (!thread.running && !historyFresh) {
+    if (!thread.execution.running && !historyFresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -4639,8 +4639,8 @@ export class AppServerHost {
 
   #externalHistoryTurns(thread: ExternalThread): JsonObject[] {
     const turns = this.#withOpenBackgroundCommands(thread, thread.turns);
-    if (!thread.activeTurnId) return turns;
-    const active = thread.projectedTurns.get(thread.activeTurnId);
+    if (!thread.execution.activeTurnId) return turns;
+    const active = thread.projectedTurns.get(thread.execution.activeTurnId);
     return active ? [...turns, active.projector.pendingTurn()] : turns;
   }
 
@@ -4671,7 +4671,11 @@ export class AppServerHost {
   }
 
   #externalThreadBusy(thread: ExternalThread): boolean {
-    return thread.running || this.#externalSteering.hasPending(thread.id);
+    return thread.execution.running || this.#externalSteering.hasPending(thread.id);
+  }
+
+  #externalTurnBusy(thread: ExternalThread): boolean {
+    return thread.execution.turnBusy || this.#externalSteering.hasPending(thread.id);
   }
 
   async #startDelegatedExternalTurn(
@@ -4679,7 +4683,7 @@ export class AppServerHost {
     text: string,
     requestedTurnId: string,
   ): Promise<void> {
-    if (this.#externalThreadBusy(thread)) {
+    if (this.#externalTurnBusy(thread)) {
       throw new Error("External Thread already has an active Turn");
     }
     const turnId = hostTurnIdSchema.parse(requestedTurnId);
@@ -4692,8 +4696,7 @@ export class AppServerHost {
         initialInput: [{ type: "text", text }],
       }),
     };
-    thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.execution.requestStarted(turnId);
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, {
@@ -4706,8 +4709,7 @@ export class AppServerHost {
       input: [{ type: "text", text }],
     });
     if (!result.ok) {
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.turnEnded(turnId);
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       this.#signalActiveWorkChanged();
@@ -4716,7 +4718,7 @@ export class AppServerHost {
   }
 
   async #startExternalTurn(request: JsonRpcRequest, thread: ExternalThread): Promise<void> {
-    if (this.#externalThreadBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
+    if (this.#externalTurnBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id)) {
       await this.#writer.json(
         rpcError(request, -32072, "External Thread already has an active Turn"),
       );
@@ -4773,13 +4775,17 @@ export class AppServerHost {
 
   /** Watch uses the same steering operation as Desktop. */
   async #steerDelegatedExternalTurn(thread: ExternalThread, text: string): Promise<string> {
-    if (this.#externalSteering.hasPending(thread.id) || !thread.running || !thread.activeTurnId) {
+    if (
+      this.#externalSteering.hasPending(thread.id) ||
+      !thread.execution.running ||
+      !thread.execution.activeTurnId
+    ) {
       throw new DelegationControlError("THREAD_BUSY", "Thread is not ready for steering");
     }
     try {
       const started = await this.#externalSteering.run(
         thread,
-        { expectedTurnId: thread.activeTurnId, input: [{ type: "text", text }] },
+        { expectedTurnId: thread.execution.activeTurnId, input: [{ type: "text", text }] },
         (replacementText, assertActive) =>
           this.#beginExternalInputTurn(thread, replacementText, assertActive),
         (input) => this.#insertExternalInput(thread, input),
@@ -4844,40 +4850,30 @@ export class AppServerHost {
       },
     ];
     const projectionDone = Promise.withResolvers<undefined>();
-    thread.pendingSteerProjections.add(projectionDone.promise);
+    thread.pendingSteerProjections.set(projectionDone.promise, input.turnId);
     try {
       const result = await thread.session.execute({
         type: "turn.steer",
         turnId: input.turnId,
         input: steered,
+        ...(input.clientUserMessageId ? { clientUserMessageId: input.clientUserMessageId } : {}),
       });
       if (!result.ok) throw new ExternalSteerError(-32074, result.error.message);
       thread.steeredTurnIds.add(input.turnId);
-      const item = {
-        type: "userMessage" as const,
-        itemId: hostItemIdSchema.parse(randomUUID()),
-        input: steered,
-      };
-      try {
-        const projection = this.#projectedTurn(thread, input.turnId);
-        if (input.clientUserMessageId) {
-          projection.projector.bindUserMessageClientId(item.itemId, input.clientUserMessageId);
+      if (!thread.execution.nativeLifecycle) {
+        try {
+          await this.#publishExternalInput(thread, {
+            consumingTurnId: input.turnId,
+            inputId: randomUUID(),
+            input: steered,
+            ...(input.clientUserMessageId
+              ? { clientUserMessageId: input.clientUserMessageId }
+              : {}),
+          });
+        } catch (error) {
+          // Native delivery already succeeded. Reporting failure here would invite a duplicate retry.
+          this.#diagnose(error);
         }
-        await this.#projectHarnessOutput(thread, {
-          kind: "event",
-          event: { type: "item.started", turnId: input.turnId, item },
-        });
-        await this.#projectHarnessOutput(thread, {
-          kind: "event",
-          event: {
-            type: "item.completed",
-            turnId: input.turnId,
-            snapshot: { item, outcome: { status: "succeeded" } },
-          },
-        });
-      } catch (error) {
-        // Native delivery already succeeded. Reporting failure here would invite a duplicate retry.
-        this.#diagnose(error);
       }
       return {
         turnId: input.turnId,
@@ -4887,6 +4883,32 @@ export class AppServerHost {
       projectionDone.resolve(undefined);
       thread.pendingSteerProjections.delete(projectionDone.promise);
     }
+  }
+
+  async #publishExternalInput(
+    thread: ExternalThread,
+    input: Omit<InputConsumedEvent, "type">,
+  ): Promise<void> {
+    const item = {
+      type: "userMessage" as const,
+      itemId: hostItemIdSchema.parse(input.inputId),
+      input: input.input,
+      ...(input.clientUserMessageId ? { clientUserMessageId: input.clientUserMessageId } : {}),
+    };
+    const projection = this.#projectedTurn(thread, input.consumingTurnId);
+    if (projection.projector.hasItem(item.itemId)) return;
+    await this.#projectHarnessOutput(thread, {
+      kind: "event",
+      event: { type: "item.started", turnId: input.consumingTurnId, item },
+    });
+    await this.#projectHarnessOutput(thread, {
+      kind: "event",
+      event: {
+        type: "item.completed",
+        turnId: input.consumingTurnId,
+        snapshot: { item, outcome: { status: "succeeded" } },
+      },
+    });
   }
 
   /** Keep command restoration and dispatch identical for start and steer submissions. */
@@ -4967,11 +4989,7 @@ export class AppServerHost {
     if (this.#closeRequested || this.#externalRuntime.get(thread.id) !== thread) {
       throw new ExternalSteerError(-32073, "External Thread is no longer available");
     }
-    if (
-      thread.running ||
-      thread.activeTurnId ||
-      this.#pendingExternalCommandRequests.has(thread.id)
-    ) {
+    if (thread.execution.turnBusy || this.#pendingExternalCommandRequests.has(thread.id)) {
       throw new ExternalSteerError(-32072, "External Thread already has an active Turn");
     }
     const turnId = hostTurnIdSchema.parse(randomUUID());
@@ -4991,8 +5009,7 @@ export class AppServerHost {
       }),
     };
     const gate = turnProjectionGate();
-    thread.running = true;
-    thread.activeTurnId = turnId;
+    thread.execution.requestStarted(turnId);
     thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
@@ -5011,8 +5028,7 @@ export class AppServerHost {
       return { turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.turnEnded(turnId);
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       gate.resolve();
@@ -5062,15 +5078,16 @@ export class AppServerHost {
       this.#externalSteering.interrupt(thread.id, requestedTurnId);
     if (
       typeof requestedTurnId !== "string" ||
-      !thread.running ||
-      thread.activeTurnId !== requestedTurnId
+      (thread.execution.activeTurnId !== requestedTurnId &&
+        thread.execution.pendingTurnId !== requestedTurnId &&
+        !thread.projectedTurns.get(requestedTurnId as HostTurnId)?.projector.hasOpenDetachedItems)
     ) {
       await this.#writer.json(
         rpcError(request, -32074, "External turn/interrupt must reference the active Turn"),
       );
       return;
     }
-    const turnId = thread.activeTurnId;
+    const turnId = hostTurnIdSchema.parse(requestedTurnId);
     const cancellationGate = turnProjectionGate();
     const gate: TurnProjectionGate = {
       promise: Promise.all([
@@ -5079,7 +5096,8 @@ export class AppServerHost {
       ]).then(() => undefined),
       resolve: cancellationGate.resolve,
     };
-    thread.responseGates.set(turnId, gate);
+    if (thread.execution.activeTurnId === turnId || thread.execution.pendingTurnId === turnId)
+      thread.responseGates.set(turnId, gate);
     const result = await thread.session.execute({ type: "turn.cancel", turnId });
     if (!result.ok) {
       try {
@@ -5132,6 +5150,10 @@ export class AppServerHost {
     }
     let event = output.event;
     if (this.#meterTurnTiming(thread, event)) await this.#notifyThreadUsage(thread);
+    if (event.type === "input.consumed") {
+      if (thread.execution.nativeLifecycle) await this.#publishExternalInput(thread, event);
+      return;
+    }
     if (event.type === "item.started" && event.item.type === "subagentDelegation") {
       event = {
         ...event,
@@ -5174,6 +5196,17 @@ export class AppServerHost {
         },
       };
     }
+    if (event.type === "session.activity.changed") {
+      if (!thread.execution.activityChanged(event.activity)) return;
+      await this.#setThreadStatus(
+        thread,
+        thread.execution.running || this.#hasRunningSubagents(thread.id)
+          ? { type: "active", activeFlags: [] }
+          : { type: "idle" },
+      );
+      this.#signalActiveWorkChanged();
+      return;
+    }
     if (event.type === "session.state.changed") {
       try {
         if (event.state.nativeRef) {
@@ -5213,7 +5246,7 @@ export class AppServerHost {
         ? this.#isKnownExternalTurn(thread, event.observedForTurnId)
           ? event.observedForTurnId
           : null
-        : (thread.activeTurnId ?? this.#latestCompletedTurnId(thread));
+        : (thread.execution.activeTurnId ?? this.#latestCompletedTurnId(thread));
       thread.usageTurnId = turnId;
       if (turnId) {
         await this.#waitForTurnResponse(thread, turnId);
@@ -5228,7 +5261,10 @@ export class AppServerHost {
     if (event.type === "usage.request" || event.type === "usage.history") {
       if (this.#externalRuntime.get(thread.id) !== thread) return;
       if (event.type === "usage.request") {
-        const changed = thread.usageMeter.recordRequest(event.request, thread.activeTurnId);
+        const changed = thread.usageMeter.recordRequest(
+          event.request,
+          thread.execution.activeTurnId,
+        );
         // Replayed history is announced once by the following usage.history.
         if (!changed || event.request.historical === true) return;
       } else {
@@ -5262,20 +5298,27 @@ export class AppServerHost {
       const status = event.status === "pending" || event.status === "running" ? "active" : "idle";
       this.#trackRunningSubagent(thread.id, record.hostThreadId, status);
       await this.#setSubagentThreadStatus(record.hostThreadId, status);
-      if (!thread.running && !thread.activeTurnId && !this.#hasRunningSubagents(thread.id)) {
+      if (!thread.execution.running && !this.#hasRunningSubagents(thread.id)) {
         await this.#setThreadStatus(thread, { type: "idle" });
       }
       return;
     }
     if (event.type === "session.faulted") {
+      thread.execution.sessionFaulted();
+      if (!thread.execution.running)
+        await this.#setThreadStatus(
+          thread,
+          this.#hasRunningSubagents(thread.id)
+            ? { type: "active", activeFlags: [] }
+            : { type: "idle" },
+        );
       this.#externalSteering.fault(thread.id, new Error(event.error.message));
       thread.stateObserver.fault(new Error(event.error.message));
       this.#externalRuntime.markSessionUnavailable(thread);
       this.#diagnose(`${thread.harnessId} Harness Session faulted: ${event.error.message}`);
       // Idle Threads must not keep a dead Session; the next open restores from disk.
       if (
-        !thread.running &&
-        !thread.activeTurnId &&
+        !thread.execution.running &&
         !this.#hasRunningSubagents(thread.id) &&
         !thread.session.hasBackgroundWork?.()
       ) {
@@ -5287,7 +5330,7 @@ export class AppServerHost {
     }
 
     if (event.type === "turn.autonomous.started") {
-      if (thread.running || thread.activeTurnId) {
+      if (thread.execution.activeTurnId) {
         throw new Error("External autonomous Turn started while another Turn is active");
       }
       const projection: ProjectedTurn = {
@@ -5299,8 +5342,7 @@ export class AppServerHost {
           initialInput: event.input,
         }),
       };
-      thread.running = true;
-      thread.activeTurnId = event.turnId;
+      thread.execution.turnStarted(event.turnId);
       thread.projectedTerminalTurnId = null;
       thread.projectedTurns.set(event.turnId, projection);
       thread.responseGates.set(event.turnId, {
@@ -5316,7 +5358,15 @@ export class AppServerHost {
     }
 
     if (event.type === "turn.completed" && thread.pendingSteerProjections.size > 0) {
-      await Promise.allSettled([...thread.pendingSteerProjections]);
+      const completedTurnId = event.turnId;
+      await Promise.allSettled(
+        [...thread.pendingSteerProjections]
+          .filter(([, turnId]) => turnId === completedTurnId)
+          .map(([promise]) => promise),
+      );
+    }
+    if (event.type === "turn.started") {
+      thread.execution.turnStarted(event.turnId);
     }
     const projection = this.#projectedTurn(thread, event.turnId);
     await this.#waitForTurnResponse(thread, event.turnId);
@@ -5372,12 +5422,9 @@ export class AppServerHost {
         thread.thread.recencyAt = completedAt;
       }
       thread.historyHydrated = false;
-      thread.running = false;
-      thread.activeTurnId = null;
-      // Detached Items (native background commands) settle on this Turn later.
+      thread.execution.turnEnded(event.turnId);
       if (!projection.projector.hasOpenDetachedItems) thread.projectedTurns.delete(event.turnId);
       thread.responseGates.delete(event.turnId);
-      thread.pendingSteerProjections.clear();
       this.#signalActiveWorkChanged();
       // A Turn that ended has no Question left to answer; only its own are retired.
       await this.#questions.closeWhere(
@@ -5408,7 +5455,7 @@ export class AppServerHost {
       });
     }
     if (
-      event.type === "item.completed" &&
+      (event.type === "item.completed" || event.type === "interaction.closed") &&
       projection.projector.completed &&
       !projection.projector.hasOpenDetachedItems
     ) {
@@ -5418,7 +5465,7 @@ export class AppServerHost {
     if (event.type === "turn.completed") {
       await this.#setThreadStatus(
         thread,
-        this.#hasRunningSubagents(thread.id)
+        thread.execution.running || this.#hasRunningSubagents(thread.id)
           ? { type: "active", activeFlags: [] }
           : { type: "idle" },
       );
@@ -5565,13 +5612,13 @@ export class AppServerHost {
     const previousStatus = this.#subagentThreadStatuses.get(threadId);
     const child = this.#externalRuntime.get(threadId);
     if (child) {
-      child.running = status === "active";
+      child.execution.subagentChanged(status === "active");
       if (status === "idle") child.historyHydrated = false;
       child.thread = externalThreadValue({
         record: child.record,
         turns: child.turns,
         sessionId: child.sessionId,
-        running: child.running,
+        running: child.execution.running,
       });
     }
     if (status === "idle" && previousStatus === "active") {

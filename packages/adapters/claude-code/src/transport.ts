@@ -92,12 +92,12 @@ export interface ClaudeLastRequestUsage {
 
 export type ClaudeTurnEvent =
   | { type: "segment.started" }
-  | { type: "subagents.live"; nativeSubagentIds: string[] }
   | { type: "compaction.started" }
   | { type: "compaction.completed"; outcome: "succeeded" | "failed" }
   | { type: "text.delta"; messageId: string; delta: string }
   | { type: "reasoning.delta"; messageId: string; delta: string }
   | { type: "reasoning.completed"; messageId: string }
+  | { type: "narration.completed"; messageId: string; text: string }
   | {
       type: "message.completed";
       messageId: string;
@@ -184,15 +184,12 @@ export type ClaudeTurnEvent =
       taskId?: string;
       resultSummary?: string;
     }
-  | {
-      type: "interaction.requested";
-      request: ClaudeInteractionRequest;
-      /**
-       * Requested by a native agent rather than the Root. It stays pending across the Root
-       * terminal while that agent keeps running.
-       */
-      agentScoped?: boolean;
-    }
+  /**
+   * A Root request arrives as a Segment event. An agent's request names the Root Agent or
+   * Workflow call that launched the agent and arrives, with its close, as a Session event: the
+   * agent's task keeps running past the Root execution that started it.
+   */
+  | { type: "interaction.requested"; request: ClaudeInteractionRequest; ownerCallId?: string }
   | {
       type: "interaction.closed";
       requestId: string;
@@ -227,45 +224,32 @@ export interface ClaudePlanLimitEvent {
   sevenDay?: ClaudePlanLimitWindow;
 }
 
-export interface ClaudeIdleTurnHandler {
-  onEvent(event: ClaudeTurnEvent): void;
-  onTerminal(result: ClaudeTransportTurnResult): void;
-}
+/** Native input terminals that do not promise execution. */
+export const claudeInputTerminationReasons = {
+  cancelled: "Input withdrawn before execution",
+  discarded: "Claude Session ended before input execution",
+  refused: "Claude input was refused by the native receive policy",
+} as const;
 
-/**
- * A native Segment that no requested Turn owns, such as Claude answering a background task
- * notification. `start` runs once, when the Segment first produces Root output or reaches its
- * Terminal without any; the Segment's events and Terminal then follow live.
- */
-export interface ClaudeAutonomousTurnHandler extends ClaudeIdleTurnHandler {
-  /** The opaque Turn key may be synthetic; only an observed User UUID belongs in native history. */
-  start(nativeTurnKey: string, userMessageId: string | null): void;
-}
-
-/** The running Turn ended before Claude queued this steer. */
-export class ClaudeSteerMissedTurnError extends Error {
-  constructor() {
-    super("Claude Code steer missed the active Turn");
-    this.name = "ClaudeSteerMissedTurnError";
-  }
-}
+/** Native facts are independent of the input submission that observes them. */
+export type ClaudeSessionEvent =
+  | { type: "activity.changed"; activity: "idle" | "running" | "requires_action" }
+  | { type: "segment.started"; segmentId: number; inputIds: string[] }
+  | { type: "segment.event"; segmentId: number; event: ClaudeTurnEvent }
+  | { type: "segment.completed"; segmentId: number; result: ClaudeTransportTurnResult }
+  | { type: "input.started"; segmentId: number; messageId: string }
+  | {
+      type: "input.terminated";
+      messageId: string;
+      state: keyof typeof claudeInputTerminationReasons;
+    }
+  | { type: "thread.event"; event: ClaudeTurnEvent };
 
 export interface ClaudeTurnTransport {
   readonly sessionId: string;
-  setAutonomousTurnHandler(handler: ClaudeAutonomousTurnHandler): void;
-  setIdleTurnHandler(handler: ClaudeIdleTurnHandler | null): void;
-  /**
-   * Receives settlements that have no preceding unpublished Subagent lifecycle.
-   * A task-notification Segment may never produce a Terminal, so independent
-   * settlements must not wait for that Segment. Settlements that depend on an
-   * unpublished creation/reactivation wait with it to preserve causal order.
-   * Without a Thread handler, settlements wait until the Segment starts its autonomous Turn.
-   */
-  setThreadEventHandler(handler: ((event: ClaudeTurnEvent) => void) | null): void;
-  setIdleLive(live: boolean): void;
-  /** Native background tasks of any type are still active on this process. */
+  setEventHandler(handler: (event: ClaudeSessionEvent) => void | Promise<void>): void;
+  isRunning(): boolean;
   hasBackgroundTasks(): boolean;
-  /** Requests a native stop; the task still settles through its `task_notification`. */
   stopBackgroundTask(taskId: string): Promise<void>;
   /**
    * Stops native background tasks and resolves once Claude Code reports that each one ended.
@@ -280,44 +264,12 @@ export interface ClaudeTurnTransport {
   setModel(model?: string): Promise<void>;
   setThinkingOption(thinkingOptionId: HarnessThinkingOptionId): Promise<void>;
   setPermissionMode(permissionMode: ClaudePermissionMode): Promise<void>;
-  compact(
-    userMessageId: string,
-    customInstructions: string | undefined,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult>;
-  init(
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult>;
-  recap(
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult>;
-  /**
-   * Rejects while a requested or autonomous Turn runs. A Segment that has not produced Root
-   * output yet belongs to no Turn: the requested Turn takes over its native stream, starting
-   * with the events that Segment still holds.
-   */
-  runTurn(
-    text: string,
-    userMessageId: string,
-    onEvent: (event: ClaudeTurnEvent) => void,
-  ): Promise<ClaudeTransportTurnResult>;
-  /**
-   * Inserts text into the active Turn at Claude's tool boundary (`priority: "next"`).
-   * Resolves when Claude emits `command_lifecycle` `queued` for that message: from then on Claude
-   * owns its delivery, joining the running Turn after the current tool call, or running it next.
-   * Rejects with {@link ClaudeSteerMissedTurnError} when the Turn ends first.
-   */
-  steer(text: string, messageId: string): Promise<void>;
+  /** Resolves on native queued acceptance, independently of execution completion. */
+  submitInput(text: string, messageId: string, priority: "next" | "later"): Promise<void>;
+  /** Withdraws a queued input; false is not evidence that a started input stopped. */
+  cancelInput(messageId: string): Promise<boolean>;
   respondToInteraction(response: ClaudeInteractionResponse): Promise<void>;
-  /** Interrupts the running requested or autonomous Turn; its Terminal still follows. */
-  abort(): Promise<void>;
-  /**
-   * Interrupts the Root Segment Claude Code runs after the requested Turn's Result, such as
-   * its answer to a task notification. Its terminal reaches the idle Turn handler.
-   */
-  abortContinuation(): Promise<void>;
+  abort(segmentId: number): Promise<{ stillQueued: string[] | null }>;
   close(): Promise<void>;
 }
 

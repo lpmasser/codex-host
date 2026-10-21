@@ -10,7 +10,9 @@ import type { HostItemId, HostTurnId } from "@codexhost/shared-contracts";
 import type { ClaudeTurnEvent } from "./transport.js";
 
 interface ActiveSubagentDelegation {
+  turnId: HostTurnId;
   item: HostSubagentDelegationItem;
+  detached: boolean;
 }
 
 export interface ClaudeSubagentLifecycleOptions {
@@ -36,8 +38,30 @@ export class ClaudeSubagentLifecycle {
     this.#newItemId = options.newItemId;
   }
 
-  get size(): number {
-    return this.#delegations.size;
+  pendingCount(turnId: HostTurnId): number {
+    return [...this.#delegations.values()].filter(
+      (delegation) => delegation.turnId === turnId && !delegation.detached,
+    ).length;
+  }
+
+  owner(callId: string): { turnId: HostTurnId; itemId: HostItemId } | undefined {
+    const delegation = this.#delegations.get(callId);
+    return delegation ? { turnId: delegation.turnId, itemId: delegation.item.itemId } : undefined;
+  }
+
+  isDetached(itemId: HostItemId): boolean {
+    return [...this.#delegations.values()].some(
+      (entry) => entry.item.itemId === itemId && entry.detached,
+    );
+  }
+
+  taskIds(turnId?: HostTurnId): string[] {
+    return [...this.#delegations.values()].flatMap((delegation) => {
+      const id = delegation.item.subagents[0]?.nativeSubagentId;
+      return delegation.detached && id && (turnId === undefined || delegation.turnId === turnId)
+        ? [id]
+        : [];
+    });
   }
 
   nativeSubagentId(callId: string): string | undefined {
@@ -63,11 +87,11 @@ export class ClaudeSubagentLifecycle {
       ...(event.prompt ? { prompt: event.prompt } : {}),
       subagents: [subagent],
     };
-    this.#delegations.set(event.callId, { item });
+    this.#delegations.set(event.callId, { turnId, item, detached: false });
     this.#emit({ type: "item.started", turnId, item });
   }
 
-  update(turnId: HostTurnId, event: Extract<ClaudeTurnEvent, { type: "subagent.updated" }>): void {
+  update(event: Extract<ClaudeTurnEvent, { type: "subagent.updated" }>): void {
     const active = this.#delegations.get(event.callId);
     if (!active) return;
     const current = active.item.subagents[0];
@@ -83,29 +107,29 @@ export class ClaudeSubagentLifecycle {
     active.item = { ...active.item, subagents: [subagent] };
     this.#emit({
       type: "item.updated",
-      turnId,
+      turnId: active.turnId,
       itemId: active.item.itemId,
       update: { type: "subagents.replace", subagents: active.item.subagents },
     });
   }
 
   complete(
-    turnId: HostTurnId,
     event: Extract<ClaudeTurnEvent, { type: "subagent.completed" }>,
     cancellationRequested: boolean,
   ): HostSubagentState {
     const active = this.#delegations.get(event.callId);
     if (!active)
       throw new Error("Claude Code Subagent completion references an unknown delegation");
-    this.#delegations.delete(event.callId);
+    const turnId = active.turnId;
     const current = active.item.subagents[0];
     if (!current) throw new Error("Claude Code Subagent delegation has no Agent state");
-    const status = cancellationRequested
-      ? "interrupted"
-      : event.isError
-        ? "failed"
-        : active.item.operation === "send" || event.continuesInBackground
-          ? "running"
+    const background = event.continuesInBackground && !event.isError;
+    const status = background
+      ? "running"
+      : cancellationRequested
+        ? "interrupted"
+        : event.isError
+          ? "failed"
           : "completed";
     const subagent: HostSubagentState = {
       ...current,
@@ -114,6 +138,7 @@ export class ClaudeSubagentLifecycle {
       ...(event.resultSummary ? { resultSummary: event.resultSummary } : {}),
     };
     const item = { ...active.item, subagents: [subagent] };
+    active.item = item;
     this.#emit({
       type: "item.updated",
       turnId,
@@ -125,12 +150,19 @@ export class ClaudeSubagentLifecycle {
       : event.isError
         ? { status: "failed", error: subagentFailure() }
         : { status: "succeeded" };
+    if (background) {
+      active.detached = true;
+      this.#emit({ type: "item.detached", turnId, itemId: item.itemId });
+      return subagent;
+    }
+    this.#delegations.delete(event.callId);
     this.#emit({ type: "item.completed", turnId, snapshot: { item, outcome } });
     return subagent;
   }
 
   finalize(turnId: HostTurnId, outcome: HostItemOutcome): void {
     for (const [callId, active] of this.#delegations) {
+      if (active.turnId !== turnId || active.detached) continue;
       this.#delegations.delete(callId);
       const current = active.item.subagents[0];
       if (!current) continue;
@@ -142,6 +174,44 @@ export class ClaudeSubagentLifecycle {
             : "failed";
       const item = { ...active.item, subagents: [{ ...current, status }] };
       this.#emit({ type: "item.completed", turnId, snapshot: { item, outcome } });
+    }
+  }
+
+  settle(event: Extract<ClaudeTurnEvent, { type: "subagent.settled" }>): boolean {
+    const matched = [...this.#delegations].filter(
+      ([callId, delegation]) =>
+        delegation.detached &&
+        (callId === event.callId ||
+          (event.nativeSubagentId !== undefined &&
+            delegation.item.subagents[0]?.nativeSubagentId === event.nativeSubagentId)),
+    );
+    if (matched.length === 0) return false;
+    const outcome: HostItemOutcome =
+      event.status === "completed"
+        ? { status: "succeeded" }
+        : event.status === "failed"
+          ? { status: "failed", error: subagentFailure() }
+          : { status: "cancelled", reason: "Background Agent stopped" };
+    for (const [callId, entry] of matched) {
+      this.#delegations.delete(callId);
+      const subagents = entry.item.subagents.map((agent) => ({
+        ...agent,
+        status: event.status,
+        ...(event.resultSummary ? { resultSummary: event.resultSummary } : {}),
+      }));
+      this.#emit({
+        type: "item.completed",
+        turnId: entry.turnId,
+        snapshot: { item: { ...entry.item, subagents }, outcome },
+      });
+    }
+    return true;
+  }
+
+  abandon(outcome: HostItemOutcome): void {
+    for (const delegation of this.#delegations.values()) delegation.detached = false;
+    for (const turnId of new Set([...this.#delegations.values()].map((entry) => entry.turnId))) {
+      this.finalize(turnId, outcome);
     }
   }
 }

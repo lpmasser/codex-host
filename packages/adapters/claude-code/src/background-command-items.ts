@@ -2,6 +2,7 @@ import { open } from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 
 import type { HostEvent, HostItemOutcome } from "@codexhost/harness-adapter";
+import type { HostTurnId } from "@codexhost/shared-contracts";
 
 import type { ClaudeTurnEvent } from "./transport.js";
 import type { ClaudeDetachedCommand } from "./tool-lifecycle.js";
@@ -66,9 +67,9 @@ export class ClaudeBackgroundCommandItems {
     this.#outputLimit = options.outputLimit;
   }
 
-  taskIds(): string[] {
+  taskIds(turnId?: HostTurnId): string[] {
     return [...this.#commands.values()].flatMap(({ command, outcome }) =>
-      outcome ? [] : [command.taskId],
+      outcome || (turnId !== undefined && command.turnId !== turnId) ? [] : [command.taskId],
     );
   }
 

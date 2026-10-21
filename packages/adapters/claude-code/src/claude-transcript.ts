@@ -74,14 +74,14 @@ export async function readClaudeTranscript(input: {
     } catch {
       continue;
     }
-    if (
-      !isRecord(entry) ||
-      (entry.type !== "user" && entry.type !== "assistant") ||
-      typeof entry.uuid !== "string" ||
-      !isRecord(entry.message)
-    ) {
-      continue;
-    }
+    if (!isRecord(entry) || typeof entry.uuid !== "string") continue;
+    const conversation =
+      (entry.type === "user" || entry.type === "assistant") && isRecord(entry.message);
+    const queuedInput =
+      entry.type === "attachment" &&
+      isRecord(entry.attachment) &&
+      entry.attachment.type === "queued_command";
+    if (!conversation && !queuedInput) continue;
     messages.set(entry.uuid, { ...entry, session_id: input.sessionId });
   }
   return [...messages.values()];

@@ -747,7 +747,15 @@ export async function startHarnessBrokerServer(input: {
         let result;
         if (command.type === "turn.start") result = await record.session.execute(command);
         // The Broker forwards acceptance unchanged; it does not infer execution placement.
-        else if (command.type === "turn.steer") result = await record.session.execute(command);
+        else if (command.type === "turn.steer")
+          result = await record.session.execute({
+            type: command.type,
+            turnId: command.turnId,
+            input: command.input,
+            ...(command.clientUserMessageId !== undefined
+              ? { clientUserMessageId: command.clientUserMessageId }
+              : {}),
+          });
         else if (command.type === "turn.cancel") result = await record.session.execute(command);
         else if (command.type === "interaction.respond") {
           result = await record.session.execute({

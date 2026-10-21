@@ -24,7 +24,7 @@ async function fixture(
   adapter = new FakeHarnessAdapter(harnessIdSchema.parse("pi")),
   officialThreadCwd: (threadId: string) => Promise<string | undefined> = async () => undefined,
   environment: NodeJS.ProcessEnv = {},
-  externalThreadBusy: (thread: ExternalThread) => boolean = (thread) => thread.running,
+  externalThreadBusy: (thread: ExternalThread) => boolean = (thread) => thread.execution.running,
 ) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-delegation-coordinator-"));
   const store = new MappingStore({ directory });
@@ -57,8 +57,7 @@ async function fixture(
       throw new Error("Unexpected steer");
     },
     startExternalTurn: async (thread, text, turnId) => {
-      thread.running = true;
-      thread.activeTurnId = hostTurnIdSchema.parse(turnId);
+      thread.execution.requestStarted(hostTurnIdSchema.parse(turnId));
       const result = await thread.session.execute({
         type: "turn.start",
         turnId: hostTurnIdSchema.parse(turnId),
@@ -79,6 +78,7 @@ async function fixture(
     activeOfficialParents: () => [],
     externalThreadBusy,
     pendingQuestions: () => [...pending],
+    externalTurnBusy: (thread) => thread.execution.turnBusy,
   });
   return {
     adapter,
@@ -415,8 +415,7 @@ describe("HarnessDelegationCoordinator", () => {
       session.succeedTurn();
       const thread = value.runtime.get(started.threadId);
       if (!thread) throw new Error("Missing delegated Thread");
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.clear();
 
       const followUp = await value.coordinator.send({
         threadId: started.threadId,
@@ -438,14 +437,43 @@ describe("HarnessDelegationCoordinator", () => {
         },
       );
       session.completeCancellation();
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.clear();
       await expect(value.coordinator.cancel({ threadId: started.threadId })).resolves.toMatchObject(
         {
           turnId: null,
           cancelled: false,
         },
       );
+    } finally {
+      await value.close();
+    }
+  });
+
+  it("cancels an accepted Turn before its execution starts", async () => {
+    const value = await fixture();
+    try {
+      const started = await value.coordinator.start({
+        harnessId: "pi",
+        task: "queued input",
+        cwd: "/synthetic",
+        parentThreadId: "parent-thread",
+      });
+      const thread = value.runtime.get(started.threadId);
+      const session = value.adapter.sessions[0];
+      if (!thread || !session) throw new Error("Missing delegated Session");
+      // The Host has accepted the request, but has not received turn.started yet.
+      thread.execution.sessionReplaced({ ...session.capabilities, nativeExecutionLifecycle: true });
+      thread.execution.requestStarted(hostTurnIdSchema.parse(started.turnId));
+      const execute = vi.spyOn(session, "execute");
+
+      await expect(value.coordinator.cancel({ threadId: started.threadId })).resolves.toEqual({
+        threadId: started.threadId,
+        turnId: started.turnId,
+        harnessId: "pi",
+        cancelled: true,
+      });
+      expect(execute).toHaveBeenCalledWith({ type: "turn.cancel", turnId: started.turnId });
+      session.completeCancellation();
     } finally {
       await value.close();
     }
@@ -562,8 +590,7 @@ describe("HarnessDelegationCoordinator", () => {
       if (!thread) throw new Error("delegated Thread was not registered");
       expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
       // The Adapter completed the Turn as failed, then its process died.
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.clear();
       thread.historyHydrated = false;
       thread.turns = [
         { id: started.turnId, status: "failed", items: [], error: { message: "process exited" } },
@@ -615,8 +642,7 @@ describe("HarnessDelegationCoordinator", () => {
       const thread = value.registered[0];
       if (!thread) throw new Error("delegated Thread was not registered");
       // Old Turn has ended; the replacement Turn has not started.
-      thread.running = false;
-      thread.activeTurnId = null;
+      thread.execution.clear();
       thread.turns = [{ id: started.turnId, status: "interrupted", items: [] }];
       // Parent inference must still see the Thread as the active caller.
       expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);

@@ -42,6 +42,7 @@ import {
   ExternalThreadLifecycle,
 } from "./external-thread-lifecycle.js";
 import { UsageMeter } from "./usage-metering.js";
+import { ExternalThreadExecution } from "./external-thread-execution.js";
 
 export interface TurnProjectionGate {
   promise: Promise<void>;
@@ -66,8 +67,7 @@ export interface ExternalThread {
   transportModelId: string;
   turns: JsonObject[];
   historyHydrated: boolean;
-  running: boolean;
-  activeTurnId: HostTurnId | null;
+  execution: ExternalThreadExecution;
   // Terminal Turn projected by this process that is still the latest Turn
   // attempt; any later start clears it. A read may report it when native
   // history cannot be refreshed.
@@ -78,7 +78,7 @@ export interface ExternalThread {
   usageTurnId: HostTurnId | null;
   projectedTurns: Map<HostTurnId, { projector: CodexTurnProjector }>;
   responseGates: Map<HostTurnId, TurnProjectionGate>;
-  pendingSteerProjections: Set<Promise<void>>;
+  pendingSteerProjections: Map<Promise<void>, HostTurnId>;
   ephemeralTurnIds: Set<HostTurnId>;
   persistenceError: Error | null;
   ignoredInteractionIds: Set<HostInteractionId>;
@@ -268,6 +268,7 @@ export class ExternalThreadRuntime {
 
   #detach(threadId: string): void {
     const thread = this.#threads.get(threadId);
+    thread?.execution.clear();
     this.#threads.delete(threadId);
     if (!thread || thread.steeredTurnIds.size === 0) this.#steeredTurnIds.delete(threadId);
   }
@@ -277,11 +278,13 @@ export class ExternalThreadRuntime {
   }
 
   remove(threadId: string): void {
+    this.#threads.get(threadId)?.execution.clear();
     this.#threads.delete(threadId);
     this.#steeredTurnIds.delete(threadId);
   }
 
   clear(): void {
+    for (const thread of this.#threads.values()) thread.execution.clear();
     this.#threads.clear();
     this.#steeredTurnIds.clear();
   }
@@ -303,7 +306,7 @@ export class ExternalThreadRuntime {
   }
 
   #idleForRestore(thread: ExternalThread): boolean {
-    if (thread.running || thread.activeTurnId !== null) return false;
+    if (thread.execution.running) return false;
     if (thread.session.hasBackgroundWork?.()) return false;
     if (this.#hasRunningDescendants(thread.id)) return false;
     return true;
@@ -315,7 +318,7 @@ export class ExternalThreadRuntime {
     await this.#lifecycle.release(thread.id, thread.session, thread.outputTask);
     if (this.#threads.get(thread.id) !== thread) return;
     await this.#retireSubagents(thread);
-    if (this.#threads.get(thread.id) === thread) this.#threads.delete(thread.id);
+    if (this.#threads.get(thread.id) === thread) this.#detach(thread.id);
   }
 
   /** Called without awaiting from the output consumer: release itself drains that consumer. */
@@ -371,7 +374,11 @@ export class ExternalThreadRuntime {
     // A Subagent Thread can be opened while its Subagent is still running. Its
     // live status lives in the Host, not in the stored record, so seed it here
     // instead of publishing a Thread that claims to be idle.
-    const running = this.#subagentRunning(input.record.hostThreadId);
+    const execution = new ExternalThreadExecution(
+      input.session.capabilities,
+      this.#subagentRunning(input.record.hostThreadId),
+    );
+    const running = execution.running;
     let steeredTurnIds = this.#steeredTurnIds.get(input.record.hostThreadId);
     if (!steeredTurnIds) {
       steeredTurnIds = new Set();
@@ -400,14 +407,13 @@ export class ExternalThreadRuntime {
       transportModelId: input.transportModelId ?? input.record.transportModelId,
       turns: input.turns,
       historyHydrated: true,
-      running,
-      activeTurnId: null,
+      execution,
       latestUsage: input.session.initialUsage,
       usageMeter: new UsageMeter(),
       usageTurnId: null,
       projectedTurns: new Map(),
       responseGates: new Map(),
-      pendingSteerProjections: new Set(),
+      pendingSteerProjections: new Map(),
       ephemeralTurnIds: new Set(),
       persistenceError: null,
       projectedTerminalTurnId: null,
@@ -446,7 +452,7 @@ export class ExternalThreadRuntime {
     },
   ): Promise<ExternalThread> {
     if (
-      current.running ||
+      current.execution.running ||
       this.#threads.get(current.id) !== current ||
       input.record.hostThreadId !== current.id
     ) {
@@ -461,6 +467,7 @@ export class ExternalThreadRuntime {
       this.#diagnose(error);
     }
     await this.#retireSubagents(current, true);
+    current.execution.clear();
     this.#threads.delete(current.id);
     return this.register(input);
   }
@@ -571,14 +578,26 @@ export class ExternalThreadRuntime {
   }
 
   async refresh(thread: ExternalThread): Promise<ExternalThreadRpcError | null> {
+    // Live execution that changes after this request, including while it waits for recovery,
+    // may not be in native history yet; such a read must not replace it.
+    const active = thread.execution.activeTurnId;
+    const pending = thread.execution.pendingTurnId;
+    const terminal = thread.projectedTerminalTurnId;
+    const changed = () =>
+      active !== thread.execution.activeTurnId ||
+      pending !== thread.execution.pendingTurnId ||
+      terminal !== thread.projectedTerminalTurnId;
     try {
-      return await this.#withLifecycle(thread.id, () => this.#refresh(thread));
+      return await this.#withLifecycle(thread.id, () => this.#refresh(thread, changed));
     } catch (error) {
       return recoveryError(error);
     }
   }
 
-  async #refresh(thread: ExternalThread): Promise<ExternalThreadRpcError | null> {
+  async #refresh(
+    thread: ExternalThread,
+    changed: () => boolean,
+  ): Promise<ExternalThreadRpcError | null> {
     if (this.#threads.get(thread.id) !== thread) {
       return {
         code: -32076,
@@ -587,6 +606,10 @@ export class ExternalThreadRuntime {
     }
     const failure = this.idleRelease.failure(thread);
     if (failure) return { code: -32075, message: failure };
+    const superseded = {
+      code: -32072,
+      message: "External execution changed while reading history",
+    };
     if (thread.sessionUnavailable && this.#idleForRestore(thread)) {
       const revived = await this.#reviveIdleSession(thread);
       if (revived) return revived;
@@ -608,8 +631,10 @@ export class ExternalThreadRuntime {
         return mapExternalThreadHarnessError(snapshot.error, "read");
       }
     }
+    if (changed()) return superseded;
     try {
       const aligned = await this.#repository.alignSnapshot(thread.record, snapshot.value);
+      if (changed()) return superseded;
       thread.record = aligned.record;
       thread.turns = aligned.turns;
       thread.historyHydrated = true;
@@ -617,7 +642,7 @@ export class ExternalThreadRuntime {
         record: aligned.record,
         turns: aligned.turns,
         sessionId: thread.sessionId,
-        running: thread.running,
+        running: thread.execution.running,
       });
       return null;
     } catch {
@@ -721,6 +746,7 @@ export class ExternalThreadRuntime {
         ...(effectiveThinkingOptionId ? { effectiveThinkingOptionId } : {}),
         ...(effectivePermissionModeId ? { effectivePermissionModeId } : {}),
       };
+      thread.execution.sessionReplaced(session.capabilities);
       thread.session = session;
       thread.record = aligned.record;
       thread.turns = aligned.turns;
@@ -739,7 +765,7 @@ export class ExternalThreadRuntime {
         record: aligned.record,
         turns: aligned.turns,
         sessionId: thread.sessionId,
-        running: thread.running,
+        running: thread.execution.running,
       });
       thread.outputTask = this.#consumeOutputs(thread);
       this.idleRelease.clearOutputFailed(thread);

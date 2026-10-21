@@ -12,16 +12,17 @@ import {
   type HarnessId,
 } from "@codexhost/shared-contracts";
 
-import { CLAUDE_SUBAGENT_TOOLS } from "./native-message.js";
-import { claudeTranscriptItemId } from "./item-identity.js";
+import { claudeTranscriptItemId, claudeToolItemId } from "./item-identity.js";
+import { isClaudeNarrationSignature } from "./thinking-signature.js";
 
 interface ClaudeHistoryMessage {
   type: "user" | "assistant";
   uuid: string;
   message: Record<string, unknown>;
   /** A Subagent transcript record; live, its tools never reach the Tool lifecycle. */
-  nested: boolean;
   syntheticUser: boolean;
+  autonomousInput: boolean;
+  steeredInput: boolean;
   interrupted: boolean;
 }
 
@@ -42,7 +43,10 @@ function textParts(value: unknown): string[] {
 function thinkingParts(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((part) =>
-    isRecord(part) && part.type === "thinking" && typeof part.thinking === "string"
+    isRecord(part) &&
+    part.type === "thinking" &&
+    typeof part.thinking === "string" &&
+    !isClaudeNarrationSignature(part.signature)
       ? [part.thinking]
       : [],
   );
@@ -144,6 +148,31 @@ function conversationMessages(values: unknown[], sessionId: string): ClaudeHisto
   for (const value of values) {
     if (!isRecord(value)) throw new Error("Claude history contains a malformed message");
     if (value.type === "system") continue;
+    if (value.type === "attachment") {
+      const queued = value.attachment;
+      if (!isRecord(queued) || queued.type !== "queued_command" || queued.commandMode !== "prompt")
+        continue;
+      if (
+        typeof queued.source_uuid !== "string" ||
+        queued.source_uuid.length === 0 ||
+        textParts(queued.prompt).length === 0
+      ) {
+        throw new Error("Claude history contains an invalid queued input");
+      }
+      if (ids.has(queued.source_uuid))
+        throw new Error("Claude history contains duplicate input IDs");
+      ids.add(queued.source_uuid);
+      messages.push({
+        type: "user",
+        uuid: queued.source_uuid,
+        message: { role: "user", content: queued.prompt },
+        syntheticUser: false,
+        autonomousInput: false,
+        interrupted: false,
+        steeredInput: true,
+      });
+      continue;
+    }
     if (
       (value.type !== "user" && value.type !== "assistant") ||
       typeof value.uuid !== "string" ||
@@ -163,8 +192,13 @@ function conversationMessages(values: unknown[], sessionId: string): ClaudeHisto
       type: value.type,
       uuid: value.uuid,
       message: value.message,
-      nested: typeof value.parent_tool_use_id === "string" && value.parent_tool_use_id.length > 0,
       interrupted,
+      steeredInput: false,
+      autonomousInput:
+        value.type === "user" &&
+        !value.parent_tool_use_id &&
+        (isTaskNotificationOrigin(value) ||
+          textParts(value.message.content).some(isTaskNotificationRecord)),
       syntheticUser:
         value.type === "user" &&
         (interrupted ||
@@ -183,7 +217,11 @@ function conversationMessages(values: unknown[], sessionId: string): ClaudeHisto
 }
 
 function isHumanUser(message: ClaudeHistoryMessage): boolean {
-  return visibleUserTextParts(message).length > 0;
+  return !message.steeredInput && visibleUserTextParts(message).length > 0;
+}
+
+function isTurnInput(message: ClaudeHistoryMessage): boolean {
+  return isHumanUser(message) || message.autonomousInput;
 }
 
 /**
@@ -243,13 +281,17 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
   const turns: HostThreadSnapshot["turns"] = [];
   for (let index = 0; index < messages.length;) {
     const user = messages[index];
-    if (!user || !isHumanUser(user)) {
+    if (!user || !isTurnInput(user)) {
       index += 1;
       continue;
     }
     let end = index + 1;
-    while (end < messages.length && !isHumanUser(messages[end] as ClaudeHistoryMessage)) end += 1;
+    while (end < messages.length && !isTurnInput(messages[end] as ClaudeHistoryMessage)) end += 1;
     const turnMessages = messages.slice(index, end);
+    if (user.autonomousInput && !turnMessages.some((message) => message.type === "assistant")) {
+      index = end;
+      continue;
+    }
     const outcome = turnOutcome(turnMessages);
     const results = toolResultBlocks(turnMessages);
     const checkpointMessage = turnMessages.findLast(
@@ -259,7 +301,6 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
     let reasoningOrdinal = 0;
     // Tool Items count only what live reaches the Tool lifecycle: root, non-Subagent
     // blocks. Every such block consumes an ordinal so identities stay aligned.
-    let toolOrdinal = 0;
     turns.push({
       nativeTurnRef: nativeTurnRefSchema.parse({
         harnessId: claudeCodeHarnessId,
@@ -281,8 +322,19 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
         type: "text",
         text: displayedUserText(text),
       })),
-      items: turnMessages.flatMap((message) => {
+      items: turnMessages.flatMap((message): HostThreadSnapshot["turns"][number]["items"] => {
         if (message.type === "user") {
+          if (message.steeredInput)
+            return [
+              {
+                item: {
+                  type: "userMessage",
+                  itemId: hostItemIdSchema.parse(message.uuid),
+                  input: visibleUserTextParts(message).map((text) => ({ type: "text", text })),
+                },
+                outcome: { status: "succeeded" },
+              },
+            ];
           const recapOutput = visibleUserTextParts(user).some((text) =>
             isNamedCommandEnvelope(text, recapCommandNamePattern),
           )
@@ -331,8 +383,29 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
         const items: HostThreadSnapshot["turns"][number]["items"] = [];
         let projectedReasoning = false;
         let projectedText = false;
-        for (const [blockIndex, block] of content.entries()) {
+        for (const block of content) {
           if (!isRecord(block)) continue;
+          if (
+            block.type === "thinking" &&
+            isClaudeNarrationSignature(block.signature) &&
+            typeof block.thinking === "string" &&
+            block.thinking.length > 0
+          ) {
+            items.push({
+              item: {
+                type: "agentMessage",
+                itemId: claudeTranscriptItemId(
+                  user.uuid,
+                  "agentMessage",
+                  (agentMessageOrdinal += 1),
+                ),
+                text: block.thinking,
+                phase: "commentary",
+              },
+              outcome: itemOutcome(outcome),
+            });
+            continue;
+          }
           if (block.type === "thinking" && !projectedReasoning && reasoning.length > 0) {
             items.push({
               item: {
@@ -368,8 +441,6 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
           ) {
             continue;
           }
-          const toolItem =
-            !message.nested && !CLAUDE_SUBAGENT_TOOLS.has(block.name) ? (toolOrdinal += 1) : null;
           const result = results.get(block.id);
           if (!result) continue;
           const output = toolResultOutput(result);
@@ -384,10 +455,7 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
                 },
               }
             : { status: "succeeded" };
-          const itemId =
-            toolItem !== null
-              ? claudeTranscriptItemId(user.uuid, "tool", toolItem)
-              : hostItemIdSchema.parse(`claude-item-v1-${message.uuid}-tool-${blockIndex}`);
+          const itemId = claudeToolItemId(block.id);
           if (
             block.name === "Bash" &&
             isRecord(block.input) &&
@@ -535,7 +603,9 @@ export function mapClaudeSubagentSnapshot(
         if (block.type === "thinking" && typeof block.thinking === "string") {
           if (block.thinking.length > 0) {
             items.push({
-              item: { type: "reasoning", itemId, text: block.thinking },
+              item: isClaudeNarrationSignature(block.signature)
+                ? { type: "agentMessage", itemId, text: block.thinking, phase: "commentary" }
+                : { type: "reasoning", itemId, text: block.thinking },
               outcome: itemOutcome(outcome),
             });
           }

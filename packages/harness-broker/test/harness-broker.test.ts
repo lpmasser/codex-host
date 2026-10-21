@@ -830,6 +830,7 @@ describe("macOS Aqua Harness broker", () => {
         : path.join(root, "broker.sock");
     const native = new FakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
     native.supportsSteer = true;
+    native.supportsNativeExecutionLifecycle = true;
     const server = await startHarnessBrokerServer({ descriptorPath, socketPath, adapter: native });
     const adapter = new BrokeredHarnessAdapter({ descriptorPath });
     try {
@@ -837,6 +838,20 @@ describe("macOS Aqua Harness broker", () => {
       expect(opened.ok).toBe(true);
       if (!opened.ok) throw new Error(opened.error.message);
       expect(opened.value.capabilities.steer).toBe(true);
+      const outputs: HarnessOutput[] = [];
+      const consuming = (async () => {
+        for await (const output of opened.value.outputs) outputs.push(output);
+      })();
+      const nativeSession = native.sessions[0];
+      if (!nativeSession) throw new Error("No native Session");
+      expect(opened.value.capabilities.nativeExecutionLifecycle).toBe(true);
+      nativeSession.publishActivity("running");
+      await vi.waitFor(() =>
+        expect(outputs).toContainEqual({
+          kind: "event",
+          event: { type: "session.activity.changed", activity: "running" },
+        }),
+      );
       const turnId = hostTurnIdSchema.parse("broker-steer-turn");
       await expect(
         opened.value.execute({
@@ -851,16 +866,28 @@ describe("macOS Aqua Harness broker", () => {
           type: "turn.steer",
           turnId,
           input: [{ type: "text", text: "now" }],
+          clientUserMessageId: "client-message",
         }),
       ).resolves.toEqual({ ok: true, value: { accepted: true } });
+      const consumed = {
+        type: "input.consumed" as const,
+        consumingTurnId: hostTurnIdSchema.parse("next-native-turn"),
+        inputId: "native-steer-input",
+        input: [{ type: "text" as const, text: "now" }],
+        clientUserMessageId: "client-message",
+      };
+      nativeSession.emitEvent(consumed);
+      await vi.waitFor(() => expect(outputs).toContainEqual({ kind: "event", event: consumed }));
       expect(native.sessions[0]?.steers).toEqual([
         {
           type: "turn.steer",
           turnId,
           input: [{ type: "text", text: "now" }],
+          clientUserMessageId: "client-message",
         },
       ]);
       await opened.value.close();
+      await consuming;
     } finally {
       await adapter.close();
       await server.close();

@@ -146,13 +146,15 @@ export interface TurnStartCommand {
 /**
  * Native input, sent only when `capabilities.steer` is true. Acceptance transfers responsibility
  * for executing it once to the Harness, without cancelling the target Turn. Execution may join
- * that Turn or follow it in the next native Turn. The Host displays acceptance once; native
- * events and history determine execution boundaries.
+ * that Turn or follow it in the next native Turn. The Host projects acceptance once unless
+ * nativeExecutionLifecycle is declared; those Sessions report input.consumed when the
+ * consuming Turn is known. Adapters do not project steered userMessage Items.
  */
 export interface TurnSteerCommand {
   type: "turn.steer";
   turnId: HostTurnId;
   input: HostTextInput[];
+  clientUserMessageId?: string;
 }
 
 export interface TurnCancelCommand {
@@ -192,6 +194,8 @@ export interface HostQuestionInteraction {
   interactionId: HostInteractionId;
   turnId: HostTurnId;
   itemId?: HostItemId;
+  /** A live native task Item owns this request; it may outlive its Root Turn. */
+  ownerItemId?: HostItemId;
   title?: string;
   questions: HostQuestion[];
   expiresAt?: string;
@@ -209,6 +213,8 @@ export interface HostApprovalInteraction {
   type: "approval";
   interactionId: HostInteractionId;
   turnId: HostTurnId;
+  /** A live native task Item owns this request; it may outlive its Root Turn. */
+  ownerItemId?: HostItemId;
   title: string;
   description?: string;
   subject: { type: "nativeAction" };
@@ -317,11 +323,12 @@ export interface HostAgentMessageItem {
   phase?: "commentary" | "final_answer";
 }
 
-/** Accepted native input; the Host publishes it once on the Turn that received the request. */
+/** Accepted native input, projected once by the Host. */
 export interface HostUserMessageItem {
   type: "userMessage";
   itemId: HostItemId;
   input: HostTextInput[];
+  clientUserMessageId?: string;
 }
 
 export interface HostReasoningItem {
@@ -470,6 +477,12 @@ export interface SessionStateChangedEvent {
   state: HarnessSessionState;
 }
 
+/** Native activity can span multiple Turns, independently of background task lifetime. */
+export interface SessionActivityChangedEvent {
+  type: "session.activity.changed";
+  activity: "idle" | "running" | "requires_action";
+}
+
 export interface SessionUsageChangedEvent {
   type: "session.usage.changed";
   usage: HostUsage | null;
@@ -503,9 +516,23 @@ export interface SubagentTranscriptChangedEvent {
   nativeSubagentId: string;
 }
 
+/** Actual execution started; an accepted input can fail or be cancelled before this event. */
 export interface TurnStartedEvent {
   type: "turn.started";
   turnId: HostTurnId;
+}
+
+/**
+ * A nativeExecutionLifecycle Session consumed steered input. Emit after the consuming Turn
+ * starts and before it ends, even when consumption precedes the command receipt. inputId is
+ * unique within the Session and stable for this input; the Host owns its userMessage Item.
+ */
+export interface InputConsumedEvent {
+  type: "input.consumed";
+  consumingTurnId: HostTurnId;
+  inputId: string;
+  input: HostTextInput[];
+  clientUserMessageId?: string;
 }
 
 export interface AutonomousTurnStartedEvent {
@@ -534,7 +561,7 @@ export interface ItemCompletedEvent {
 }
 
 /**
- * The Item keeps running after its Turn completes (a native background command).
+ * The native command or Subagent delegation keeps running after its Turn completes.
  * It settles later with `item.updated` / `item.completed` on the same Turn.
  */
 export interface ItemDetachedEvent {
@@ -566,12 +593,14 @@ export interface SessionFaultedEvent {
 
 export type HostEvent =
   | SessionStateChangedEvent
+  | SessionActivityChangedEvent
   | SessionUsageChangedEvent
   | UsageRequestEvent
   | UsageHistoryEvent
   | SubagentStateChangedEvent
   | SubagentTranscriptChangedEvent
   | TurnStartedEvent
+  | InputConsumedEvent
   | AutonomousTurnStartedEvent
   | ItemStartedEvent
   | ItemUpdatedEvent

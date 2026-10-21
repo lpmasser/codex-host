@@ -16,9 +16,22 @@ codexhost 对外部 Harness Thread 保留一个「调整方向」操作，按当
 - `ExternalTurnSteering` 统一校验非空文本、`expectedTurnId` 和 `threadId + clientUserMessageId` 去重。原生拒绝不会自动改走退路，也不会自动重试。
 - `turn/steer` 回执包含 `turnId` 和 `delivery`：`nativeAccepted` 表示原生已接受，`turnId` 仍是提交时的目标 ID，不是最终执行位置；`newTurn` 表示停止旧 Turn 后已启动替换 Turn，`turnId` 是该新 Turn 的 ID。
 
-原生插话成功后，Host 在当前 Turn 发布 `userMessage` Item。Desktop 提交带 `clientUserMessageId` 时，投影把它写入 Item 的 `clientId`，用于结算 Desktop 的乐观 steer 消息；Adapter 不发布这条 Host Item。Host 会让并发的 Turn 终态投影等待这条已接受输入完成实时投影，避免 Harness 接受输入后立刻结束时遗漏乐观消息结算。刷新后的历史仍完全按 Adapter 的原生历史解析，不把不同的原生 Turn 强行合并。
+Host 统一发布插话的 `userMessage` Item；Adapter 只报告原生事实。Desktop 提交的 `clientUserMessageId` 写入 Item 的 `clientId`，用于结算乐观 steer 消息。投影时机按 Session 声明决定：
 
-接受消息在实时视图中只发布一次。Claude 的迟到输入可以由 `input: []` 的后续自主 Turn 执行：前一 Turn 已显示接受消息，后续 Turn 不再复制；刷新后，原生 user 行把输入放回下一历史 Turn。DSH 对已提交 steer 的 requestId 跳过实时自主 Turn 输入回显，原生日志与历史读取仍保留该输入。此处的空 input 表示没有新的待展示用户消息，不表示没有原生输入。
+- `nativeExecutionLifecycle` 缺省或为 false：原生接受后，Host 在请求目标 Turn 上发布一次，保持既有路径。并发 Turn 终态等待已接受输入的投影；后续自主 Turn 使用空 input，避免复制接受消息。
+- 声明 `nativeExecutionLifecycle: true`：Session 通过 `input.consumed { inputId, consumingTurnId, input, clientUserMessageId? }` 报告实际消费事实。事件属于 Session，应在消费 Turn 开始后、结束前交付；可以先于命令回执。Host 按 Session 内唯一的输入身份在消费 Turn 发布一次，重复事实不重复发布。该声明要求提供消费事实，Host 不设计时器猜测归属。当前由 Claude 声明，其他 Adapter 无需改动。
+
+刷新后的历史完全按 Adapter 的原生历史解析，不强行合并原生 Turn。DSH 对已提交 steer 的 requestId 跳过实时自主 Turn 输入回显，原生日志与历史仍保留输入；这里的空 input 表示没有新的待展示用户消息。
+
+### 执行状态的拥有者
+
+`packages/host-runtime/src/external-thread-execution.ts` 持有外部 Thread 的执行状态。请求接纳、原生开始、请求拒绝／取消／完成、Session 活动和故障、恢复及释放通过转换方法更新；running 与输入 busy 由该模块派生。只读子线程的运行状态来自已有子 Agent 观察，不冒充可写 Session 的活动事件。请求队列和 steering 的占位仍由对应协调器持有。
+
+`HarnessSessionCapabilities.nativeExecutionLifecycle` 是可选的事实报告契约，当前三个相关行为一起启用：
+
+- 请求接纳先占 pending，收到 `turn.started` 后成为 active；先行自主段与待执行输入分别结束。
+- `session.activity.changed` 独立更新 Session 活动。只有后台活动时 running 可以为真，但不占输入 busy；Root Result 不代替 Session idle。
+- 插话按上述消费事实发布。未声明的 Session 保持接纳即 active、接受时投影，Session 活动事件不改变其运行含义。恢复时重新读取新 Session 的能力并清除旧执行状态。
 
 Pi 的历史会把插入文本保存成新的用户条目。Pi Adapter 因而按“原提问加本轮已接受插入数”校验新用户条目数量，并仍把第一条原提问绑定为当前 Host Turn 的原生身份。
 
@@ -77,6 +90,7 @@ Codex Desktop **26.924.22138 / build 11645** 的本地队列在 `turnCompleted` 
 ## 验证
 
 - `packages/host-runtime/test/external-turn-steering.test.ts`：原生插入不取消、按消息去重、失败释放回执，以及停止后重发的终态等待与失败边界。
+- `packages/host-runtime/test/external-thread-execution.test.ts` 与 `app-server-host.native-execution.test.ts`：状态转换顺序、能力声明对照、消费事实先于／晚于回执、跨 Turn 投影及去重。
 - `packages/host-runtime/test/app-server-host.native-steering.test.ts`：Desktop 原生插入的 `clientId` 投影、送达方式查询、Fork/撤销窗口和重新读取后放行。
 - `packages/protocol-core/test/codex-ui-projector.test.ts`：插入的 `userMessage` 在实时与历史投影中留在所属 Turn。
 - `packages/renderer-extension/test/renderer-external-steering*.test.ts`：按送达方式选择 Desktop 展示，并保持 RpcTarget、owner/follower、失败和卸载语义。

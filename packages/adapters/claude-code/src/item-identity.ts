@@ -1,6 +1,6 @@
 import { hostItemIdSchema, type HostItemId } from "@codexhost/shared-contracts";
 
-export type ClaudeTranscriptItemKind = "agentMessage" | "reasoning" | "tool";
+export type ClaudeTranscriptItemKind = "agentMessage" | "reasoning";
 
 /**
  * Claude preserves the caller-assigned User Message UUID in native history.
@@ -13,4 +13,9 @@ export function claudeTranscriptItemId(
   ordinal: number,
 ): HostItemId {
   return hostItemIdSchema.parse(`claude-item-v2-${nativeTurnKey}-${kind}-${ordinal}`);
+}
+
+/** Tool identity exists before the autonomous input is persisted and survives its Turn. */
+export function claudeToolItemId(callId: string): HostItemId {
+  return hostItemIdSchema.parse(`claude-tool-${callId}`);
 }
