@@ -183,6 +183,7 @@ export function buildModelCatalogFromConfig(
     const label = m.model ? `${m.alias} (${m.model})` : m.alias;
     return harnessModelSchema.parse({
       ref: encodeKimiModelRef(m.alias),
+      nativeId: m.alias,
       label: label.slice(0, 256),
       ...(m.model ? { resolvedModelLabel: m.model.slice(0, 256) } : {}),
       ...(thinkingOptionsList && m.alias === config.defaultModel
@@ -313,6 +314,7 @@ export function buildModelCatalogFromAcp(
         models.push(
           harnessModelSchema.parse({
             ref: encodeKimiModelRef(alias),
+            nativeId: alias,
             label: displayName.slice(0, 256),
             ...(alias === modelOptions.currentValue
               ? { supportedThinkingOptionIds: thinkingIds }
