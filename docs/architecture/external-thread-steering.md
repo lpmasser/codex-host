@@ -85,3 +85,9 @@ Codex Desktop **26.924.22138 / build 11645** 的本地队列在 `turnCompleted` 
 - `packages/renderer-extension/test/renderer-manual-compaction.test.ts`：经窗口 `mcp-notification` 消息的外部 Thread 登记，follower、未加载／官方 Thread、其他 Host、其他 frame 与非法消息跳过，缺少 Desktop 绑定、卸载，以及按 Host 连接（含 SSH）安装。
 
 2026-09-24 曾用 Pi 0.85.1 经 `PiAdapter` 实机核对原生插入。2026-10-21 的 Adapter Gate 确认 Claude 的迟到输入在下一 Turn 恰好执行一次，DeepSeek、Qoder、Pi 与 WorkBuddy 国内版的对应样本在当前 Turn 执行一次；没有做 Desktop GUI 实测。类型检查和合成测试不能替代发布前的流式文本、工具运行、交互、连续提交、刷新历史、多窗口与远端连接验收。
+
+### Adapter 实机 Gate
+
+`tools/gate-steer/adapter.real.test.mjs` 默认跳过。先运行 `npm run typecheck` 构建当前 Adapter，再用 `CODEXHOST_STEER_REAL_HARNESSES=pi,claude-code,deepseek-harness,qoder,codebuddy,workbuddy,workbuddy-cn node node_modules/vitest/vitest.mjs run --config tests/vitest.config.js tools/gate-steer/adapter.real.test.mjs` 选择实际安装的 Harness。Gate 使用现有登录与默认 Model；`CODEXHOST_STEER_REAL_MODEL` 可指定原生目录中的 `nativeId` 或完整显示名（Pi 使用 `uino / deepseek-flash`），只传给 Adapter open，不修改用户配置。`CODEXHOST_STEER_REAL_SCENARIOS` 可选择逗号分隔的 `single`、`double`、`near-terminal` 场景，缺省运行全部。Gate 会调用真实模型并留下原生 Session。任务只在临时工作目录执行一个前台 `sleep`，结束后清理该目录。`workbuddy-cn` 测试项使用 macOS 的 `/Applications/WorkBuddy.app` 和既有 `~/.workbuddy` 登录目录，国际版沿用 Adapter 默认发现路径。
+
+每个 Harness 检查单次插入、连续两次插入、工具完成附近插入，以及错误目标、空输入和终态后的拒绝。单次与连续插入检查工具成功完成、同一 Host Turn 回复随机标记、只完成一次，以及原生历史身份仍指向原提问。终态附近场景在原 Turn 完成后继续观察完整的 30 秒，记录标记回复落在哪个 Host Turn 及其原生身份；接受的输入必须恰好回复一次且对应 Turn 成功完成，明确拒绝的输入不得执行。即使后续 Turn 提前完成也观察到窗口结束，以发现重复投递；同时保留窗口后的原生历史，未观察到回复不能据此断言永久丢失。完整事件与结果写入 `.codexhost/native-steer-real/<harness>/`，不把环境阻塞或部分场景通过当作完整验收。
