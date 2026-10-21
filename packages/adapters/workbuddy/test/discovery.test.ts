@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { workBuddyInvocation } from "../src/command.js";
 
+const internationalRelease = () => ({ dataFolderName: ".workbuddy-ai" });
+
 describe("WorkBuddy app discovery", () => {
   it.each(["WorkBuddy.exe", "WorkBuddy AI.exe", "WorkBuddyAI.exe"])(
     "finds %s inside a selected installation directory",
@@ -10,6 +12,7 @@ describe("WorkBuddy app discovery", () => {
       const cli = `${directory}\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy`;
       const dependencies = {
         platform: "win32" as const,
+        readProduct: internationalRelease,
         isDirectory: (candidate: string) => candidate === directory,
         isExecutable: (candidate: string) => candidate === executable || candidate === cli,
       };
@@ -50,6 +53,7 @@ describe("WorkBuddy app discovery", () => {
     (platform, executable, cli) => {
       const invocation = workBuddyInvocation({ CODEXHOST_WORKBUDDY_COMMAND: executable }, false, {
         platform,
+        readProduct: internationalRelease,
         isExecutable: (file) => file === executable || file === cli,
       });
       expect(invocation.command).toBe(executable);
@@ -58,6 +62,7 @@ describe("WorkBuddy app discovery", () => {
       expect(() =>
         workBuddyInvocation({ CODEXHOST_WORKBUDDY_COMMAND: executable }, false, {
           platform,
+          readProduct: internationalRelease,
           isExecutable: (file) => file !== cli,
         }),
       ).toThrow("unavailable");
@@ -82,6 +87,7 @@ describe("WorkBuddy app discovery", () => {
       true,
       {
         platform: "win32",
+        readProduct: internationalRelease,
         isExecutable: (candidate) =>
           [executable, cli].some((file) => file.toLowerCase() === candidate.toLowerCase()),
       },
@@ -110,6 +116,7 @@ describe("WorkBuddy app discovery", () => {
     const cli = `${root}/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`;
     const invocation = workBuddyInvocation({ HOME: "/Users/test" }, false, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: (candidate) => [executable, cli].includes(candidate),
     });
     expect(invocation.command).toBe(executable);
@@ -124,6 +131,7 @@ describe("WorkBuddy app discovery", () => {
     expect(() =>
       workBuddyInvocation({ USERPROFILE: "C:\\Users\\Test" }, false, {
         platform: "win32",
+        readProduct: internationalRelease,
         isExecutable: (candidate) => files.includes(candidate),
       }),
     ).toThrow("unavailable");
@@ -136,6 +144,7 @@ describe("WorkBuddy app discovery", () => {
         false,
         {
           platform: "win32",
+          readProduct: internationalRelease,
           isExecutable: (candidate) => candidate !== "C:\\missing.exe",
         },
       ),
@@ -149,11 +158,13 @@ describe("WorkBuddy app discovery", () => {
     const snapshot = `${cache}\\acc-product-config-v3.json`;
     const invocation = workBuddyInvocation({ USERPROFILE: "C:\\Users\\Test" }, false, {
       platform: "win32",
+      readProduct: internationalRelease,
       isExecutable: (candidate) =>
         [
           `${root}\\WorkBuddy.exe`,
           `${root}\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy`,
         ].includes(candidate),
+      readText: () => JSON.stringify({ dataFolderName: ".workbuddy-ai" }),
       lstat: (candidate) => ({
         isDirectory: () => [config, cache].includes(candidate),
         isFile: () => candidate === snapshot,
