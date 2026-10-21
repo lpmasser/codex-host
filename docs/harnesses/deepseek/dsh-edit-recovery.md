@@ -34,6 +34,18 @@ DSH 会给没有结果的工具调用补写 `tool/result`：崩溃后恢复，�
 
 正常会话关闭和 Fork 队列清理后，还会通过认证的原生 `HEAD /api/session.export` 等待日志写入完成；该请求不下载日志内容。原生回执和内存历史读取不等于落盘完成，尤其不能在 Windows 结束托管进程前省略这一步。持久化确认失败时明确报告失败。
 
+## 原生插话
+
+`session/prompt` 的 `mode:"steer"` 从 `@deepseek-ai/dsh-api-session-controller` `0.1.2-alpha.2` 起存在，并调用 `agent.steer`。正式入口只接受支持 Session Format V4 的 CLI（≥ `0.1.7-rc.1`），因此 Session 直接声明 `capabilities.steer`，不另设更低的插入版本门槛。
+
+`turn.steer` 只对当前未结束的活跃 Turn 发送 `mode:"steer"`，不取消、不另起 Turn。空文本是 `invalidRequest`。目标 Turn 不活跃是 `invalidState`。插入用的 `requestId` 不进入待绑定的 prompt 集合，因此中途出现的用户消息不会把已经关联好的 Turn 再绑一次。
+
+RPC 回执 `{accepted:true}` 不够。Adapter 等待同一 `requestId` 的 `agent/inbox/spliced`。`target:"next-step"` 和 `target:"next-turn"` 都返回 `{accepted:true}`，Host 报 `nativeAccepted`；接受事实不因目标 Turn 已结束而失效。原生负责将输入执行一次，Host 不重发或猜测最终 Turn。等到关联宽限仍没有 splice，是 `protocolError`，并保留该 `requestId`，避免迟到回声再去绑定。`session/agent-busy` 与 `session/steer-unavailable` 只在这次插入里映射为 `invalidState`；`turn.start` 遇到 `session/agent-busy` 仍是 `sessionBusy`。
+
+Host 发布接受消息后，Adapter 按已有 steer requestId 跳过实时用户回显，避免 next-turn 的自主 Turn 再显示一次输入。该过滤不改变原生日志，历史仍按原生 Turn 收入输入。忙时 `turn.start` 仍是 `sessionBusy`。
+
+2026-10-21 在 DSH 0.2.1-rc.2 上通过单次、连续两次与 near-terminal Adapter Gate；near-terminal 样本在原 Turn 完成一次，30 秒内无重复。行为依据已发布的 `0.1.2-alpha.2` 包：`mode` 为 `'queue' | 'steer'`，且 `mode === "steer"` 时调用 `agent.steer`。单元测试覆盖接受回执与终态竞态、请求参数、非活跃目标、`next-step` / `next-turn`、回声不重新绑定、忙时 `turn.start`，以及不发布 `userMessage`。
+
 ## 真实 CLI Gate
 
 提供基于本地 SSE 模型、隔离临时数据和真实 CLI 的生命周期 Gate：`tools/gate-dsh/lifecycle.real.test.mjs`。通过 `CODEXHOST_DSH_REAL_COMMAND` 指定原生命令，缺少命令时明确跳过。Gate 覆盖流式输出、取消、空/保留历史编辑、冷恢复、默认配置保持、源历史不变和活动关闭；不覆盖原生 Fork、工具调用恢复和限时提问，这些由定向测试与单独的真实 CLI 探测验证。四个已验证版本的平台、命令、耗时和未验证边界见[版本验证记录](dsh-version-validation.md)。不把默认配置验证推广为任意非默认配置，也不证明独立第三方客户端或任意后台工具进程的退出。
