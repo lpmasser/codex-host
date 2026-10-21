@@ -3733,6 +3733,11 @@ describe("ClaudeSdkTransport steer", () => {
   });
 
   it("reports acceptance uncertain when steer is not queued within 10s timeout", async () => {
+    const diagnostics: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      diagnostics.push(String(chunk));
+      return true;
+    });
     vi.useFakeTimers();
     try {
       const value = fixture();
@@ -3750,9 +3755,25 @@ describe("ClaudeSdkTransport steer", () => {
       );
       await vi.advanceTimersByTimeAsync(10_000);
       await rejection;
+      const timeout = diagnostics.find((line) => line.includes('"input.acceptance_timeout"'));
+      expect(timeout).toContain('"messageId":"00000000-0000-4000-8000-000000000038"');
+      expect(timeout).toContain('"pendingInputs":1');
+      // The unchanged late receipt remains distinguishable from acceptance before timeout.
+      value.fakeQuery.push({
+        type: "command_lifecycle",
+        state: "queued",
+        command_uuid: "00000000-0000-4000-8000-000000000038",
+      } as unknown as SDKMessage);
       await value.transport.close();
+      expect(
+        diagnostics.some(
+          (line) => line.includes('"input.queued"') && line.includes('"pending":false'),
+        ),
+      ).toBe(true);
+      expect(diagnostics.join("")).not.toContain("PIN");
     } finally {
       vi.useRealTimers();
+      stderr.mockRestore();
     }
   });
 });

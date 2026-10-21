@@ -40,6 +40,14 @@ SDK 公开 Query 缺少逐输入撤回和带清队列参数的中断。Transport
 
 历史保留 `queued_command` 附件：同轮 steer 的 `source_uuid` 恢复为所属段内的用户输入；运行中吸收的任务通知不拆轮。另起执行的通知输入只有产生实际助手输出才形成历史 Turn。成功空段不产生持久化记录，缺少原生 Result 证据的历史终态仍标为未知。
 
+## 输入与中断诊断
+
+Adapter 将少量 `[claude-sdk]` JSON 记录写入 Host 现有 stderr 日志（默认 `~/.codexhost/logs/host-runtime-<pid>.log`，沿用现有容量与轮转限制）。每条包含 Native Session、Transport 实例 ID、递增序号、时间和相对毫秒数；控制请求用 `requestId` 关联，用户输入用 `messageId` 关联。
+
+排查时按 `input.enqueue` → `stdin.write` → `stdout.message` 的 queued 回执 → `sdk.message` → `input.queued` 对照。`stdin.write` 只证明写入调用返回，附背压和缓冲区状态，不证明 Claude 已读取；`stdout.message` 是原始管道边界，`sdk.message` 是 SDK 向 Adapter 交付的边界。控制请求/响应、选择题结算、中断、执行段结束和进程退出也有元数据记录；接收超时会留下输入队列、等待读取者、当前执行段和交互数量。迟到 queued 的 `pending:false` 表示 Host 已不再等待这次接收确认。
+
+日志不记录提示词、问题/回答正文、工具输入/输出、推理内容、凭据或原生错误正文，也不逐条记录文本增量。它不改变十秒确认期限、中断或排队规则；新增代码仅在后续正常加载 Adapter 后生效，不能回补旧现场缺失的帧。
+
 ## 验证范围
 
 原生时序实测版本为 Claude Code 2.1.283、Agent SDK 0.3.220、macOS。现有 Transport、Adapter、历史和 Host 测试覆盖归属、审批、取消、空段及重读；Broker 测试核对跨进程事件和消息 ID。隔离 CLI 验证使用本地固定响应服务，覆盖先行自主段、steer 和排队撤回，不调用云端模型或重启日常 Desktop。

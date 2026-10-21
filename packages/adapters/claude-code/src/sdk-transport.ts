@@ -19,6 +19,7 @@ import {
   type ClaudeSlashCommandSnapshot,
 } from "./slash-commands.js";
 import { projectClaudeAccountUsage } from "./account-usage.js";
+import { ClaudeSdkDiagnostics } from "./sdk-diagnostics.js";
 
 import { resolveClaudeCodeExecutable, withNodeRuntimeOnPath } from "./command.js";
 import {
@@ -72,6 +73,10 @@ class PushableInput<T> implements AsyncIterable<T> {
   #closed = false;
   #queue: T[] = [];
   #waiters: Array<(result: IteratorResult<T>) => void> = [];
+
+  diagnosticState(): { closed: boolean; queued: number; readers: number } {
+    return { closed: this.#closed, queued: this.#queue.length, readers: this.#waiters.length };
+  }
 
   push(value: T): void {
     if (this.#closed) throw new Error("Claude SDK input is closed");
@@ -164,10 +169,14 @@ function delay(milliseconds: number): Promise<void> {
 function rejectAfter(
   milliseconds: number,
   message: string,
+  onTimeout?: () => void,
 ): { promise: Promise<never>; cancel(): void } {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const promise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error(message)), milliseconds);
+    timeoutId = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(message));
+    }, milliseconds);
   });
   return {
     promise,
@@ -427,9 +436,11 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   #skillNames: ReadonlySet<string> = new Set();
   #started = false;
   #backgroundTasks = new Set<string>();
+  readonly #diagnostics: ClaudeSdkDiagnostics;
 
   constructor(options: ClaudeSdkTransportOptions) {
     this.sessionId = options.sessionId;
+    this.#diagnostics = new ClaudeSdkDiagnostics(options.sessionId);
     this.#cwd = options.cwd;
     this.#abortTimeoutMs = options.abortTimeoutMs ?? DEFAULT_ABORT_TIMEOUT_MS;
     this.#closeTimeoutMs = options.closeTimeoutMs;
@@ -452,7 +463,25 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   #emit(event: ClaudeSessionEvent): Promise<void> {
+    if (event.type === "segment.started" || event.type === "segment.completed") {
+      this.#diagnostic(event.type, { segmentId: event.segmentId });
+    }
     return Promise.resolve(this.#eventHandler?.(event));
+  }
+
+  #diagnostic(event: string, fields: Record<string, unknown> = {}): void {
+    this.#diagnostics.event(event, {
+      started: this.#started,
+      closing: this.#closePromise !== null,
+      activity: this.#activity,
+      segmentId: this.#segment?.id ?? null,
+      segmentStarted: this.#segment?.started ?? false,
+      pendingInputs: this.#pendingInputs.size,
+      interactions: this.#interactions.size,
+      backgroundTasks: this.#backgroundTasks.size,
+      input: this.#input.diagnosticState(),
+      ...fields,
+    });
   }
 
   #nativeSegment(): NativeSegment {
@@ -548,6 +577,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       throw error;
     }
     this.#started = true;
+    this.#diagnostic("sdk.ready");
     this.#consumeTask = this.#consume(activeQuery);
   }
 
@@ -570,6 +600,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   async getContextUsage(): Promise<ClaudeTransportContextUsage | null> {
     const activeQuery = this.#query;
     if (!this.#started || !activeQuery) return null;
+    this.#diagnostic("context_usage.request");
     return parseContextUsage(await activeQuery.getContextUsage());
   }
 
@@ -680,10 +711,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     const timeout = rejectAfter(
       10_000,
       "Claude input acceptance could not be confirmed; it may still execute",
+      () => this.#diagnostic("input.acceptance_timeout", { messageId }),
     );
     const accepted = new Promise<void>((resolve, reject) => {
       this.#pendingInputs.set(messageId, { resolve, reject });
     });
+    this.#diagnostic("input.enqueue", { messageId, priority });
     this.#input.push({
       type: "user",
       message: { role: "user", content: text },
@@ -694,6 +727,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       priority,
     });
     return Promise.race([accepted, timeout.promise]).finally(() => {
+      this.#diagnostic("input.wait_finished", { messageId });
       timeout.cancel();
       this.#pendingInputs.delete(messageId);
     });
@@ -817,11 +851,16 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       throw new Error("Claude SDK transport has no matching execution");
     }
     segment.accumulator.requestCancel();
-    const timeout = rejectAfter(this.#abortTimeoutMs, INTERRUPT_TIMEOUT_MESSAGE);
+    this.#diagnostic("interrupt.request");
+    const timeout = rejectAfter(this.#abortTimeoutMs, INTERRUPT_TIMEOUT_MESSAGE, () =>
+      this.#diagnostic("interrupt.timeout"),
+    );
     try {
       const receipt = await Promise.race([activeQuery.interrupt(), timeout.promise]);
+      this.#diagnostic("interrupt.received");
       return { stillQueued: receipt?.still_queued ?? null };
     } catch (error) {
+      this.#diagnostic("interrupt.failed");
       await this.close();
       throw error instanceof Error ? error : new Error(INTERRUPT_TIMEOUT_MESSAGE);
     } finally {
@@ -974,6 +1013,12 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     reason: "responded" | "cancelled" | "superseded",
   ): Promise<void> {
     if (!this.#interactions.delete(pending.request.requestId)) return Promise.resolve();
+    this.#diagnostic("interaction.settle", {
+      requestId: pending.controlRequestId,
+      interactionId: pending.request.requestId,
+      kind: pending.request.type,
+      reason,
+    });
     this.#controlRequestIds.delete(pending.controlRequestId);
     pending.signal.removeEventListener("abort", pending.onAbort);
     const event = {
@@ -1010,6 +1055,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   async #close(): Promise<void> {
+    this.#diagnostic("transport.close");
     this.#rejectPendingInputs();
     const failures: unknown[] = [];
     this.#closeInteractions(null, "cancelled");
@@ -1153,6 +1199,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       return;
     const messageId = message.command_uuid;
     if (message.state === "queued") {
+      this.#diagnostic("input.queued", { messageId, pending: this.#pendingInputs.has(messageId) });
       this.#pendingInputs.get(messageId)?.resolve();
     } else if (message.state === "started") {
       const segment = this.#nativeSegment();
@@ -1262,6 +1309,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   async #consume(activeQuery: Query): Promise<void> {
     try {
       for await (const message of activeQuery) {
+        this.#diagnostics.message("sdk.message", message);
         this.#observeBackgroundTasks(message);
         this.#observeAgentOwners(message);
         this.#observeSlashCommands(message);
@@ -1389,6 +1437,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       await this.#flushPendingThinking();
       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
     } catch (error) {
+      this.#diagnostic("sdk.consume_failed");
       try {
         await this.#flushPendingThinking();
       } catch {
@@ -1421,11 +1470,17 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       windowsHide: true,
       detached: process.platform !== "win32",
     });
+    this.#diagnostics.event("process.spawn", { pid: child.pid, openMode: this.#openMode });
+    this.#diagnostics.observeWrites(child.stdin, child.pid);
+    child.once("exit", (code, signal) => {
+      this.#diagnostic("process.exit", { pid: child.pid, code, signal });
+    });
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
     });
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => {
+      this.#diagnostics.line("stdout.message", line, { pid: child.pid });
       if (!line.includes("codexhost-control-") || !line.includes("control_response")) return;
       let value: unknown;
       try {
