@@ -7,6 +7,8 @@ const SKILL_VERSION = 10;
 export const DELEGATION_SKILL_NAME = "codexhost-delegation";
 const SKILL_RELATIVE_PATH = path.join("skills", DELEGATION_SKILL_NAME, "SKILL.md");
 const PREVIOUS_MANAGED_DIGESTS: readonly string[] = [
+  // Upstream v10, with child-session naming guidance.
+  "242a07e7521949e5d651102f6b353c48e7575a679e3403c5c5db295abad9896b",
   "a6e753ed092239429ebc0dcba8090fb9425fa65292b7810ba990c13a531816a6",
   "9d2f491850fb0b4084a31ba9b5e4a550b5e833747af322090d8ed0ff80b88c30",
   "2bb0aebb9b06febbc6c0c0bcdb0b32506c7cdbf8dc3b734cc6b2a86621270e4e",

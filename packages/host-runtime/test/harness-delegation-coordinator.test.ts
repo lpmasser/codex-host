@@ -19,7 +19,7 @@ import { describe, expect, it, vi } from "vitest";
 import { runDelegationCli } from "../src/delegation-cli.js";
 import { startDelegationControlServer } from "../src/delegation-control-server.js";
 import { HarnessDelegationCoordinator } from "../src/harness-delegation-coordinator.js";
-import type { DelegationPendingQuestion, ThreadAnswerInput } from "../src/delegation-types.js";
+import type { DelegationPendingQuestion } from "../src/delegation-types.js";
 import { ExternalThreadRepository } from "../src/external-thread-repository.js";
 import { ExternalThreadRuntime, type ExternalThread } from "../src/external-thread-runtime.js";
 
@@ -42,7 +42,6 @@ async function fixture(
   const notifications: unknown[] = [];
   const delivered: string[] = [];
   const pending: DelegationPendingQuestion[] = [];
-  const answers: ThreadAnswerInput[] = [];
   const runtime = new ExternalThreadRuntime({
     adapters,
     environment,
@@ -87,17 +86,6 @@ async function fixture(
     activeOfficialParents: () => [],
     externalThreadBusy,
     pendingQuestions: () => [...pending],
-    answerQuestion: async (input) => {
-      answers.push(input);
-      return {
-        threadId: input.threadId,
-        interactionId: input.interactionId,
-        turnId: "turn-answered",
-        harnessId: "pi",
-        status: "running",
-        next: { read: "read", wait: "wait" },
-      };
-    },
   });
   return {
     adapter,
@@ -106,7 +94,6 @@ async function fixture(
     delivered,
     notifications,
     pending,
-    answers,
     registered,
     repository,
     runtime,
@@ -148,7 +135,12 @@ describe("HarnessDelegationCoordinator", () => {
     const value = await fixture(undefined, async () => ({ title: "Main project" }));
     const server = await startDelegationControlServer({
       token: "test-token",
-      api: value.coordinator,
+      api: Object.assign(value.coordinator, {
+        // AppServerHost wires Questions separately; this fixture only creates Threads.
+        answer: async () => {
+          throw new Error("No Question responder in this fixture");
+        },
+      }),
     });
     try {
       const output = new PassThrough();
@@ -810,22 +802,6 @@ describe("HarnessDelegationCoordinator", () => {
         timedOut: false,
         pendingQuestions: [{ interactionId: "interaction-1" }],
       });
-
-      // The answer goes to the owning Host session with the normalized input.
-      await expect(
-        value.coordinator.answer({
-          threadId: started.threadId,
-          interactionId: "interaction-1",
-          result: { answers: { decision: { answers: ["continue"] } } },
-        }),
-      ).resolves.toMatchObject({ status: "running", interactionId: "interaction-1" });
-      expect(value.answers).toEqual([
-        {
-          threadId: started.threadId,
-          interactionId: "interaction-1",
-          result: { answers: { decision: { answers: ["continue"] } } },
-        },
-      ]);
 
       value.pending.length = 0;
       await expect(
