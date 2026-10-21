@@ -1,6 +1,10 @@
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 const scenario = process.argv[2];
+if (scenario === "--version") {
+  process.stdout.write("2.147.0\n");
+  process.exit(0);
+}
 for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
   if (message.id === undefined) continue;
@@ -8,6 +12,11 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (message.method === "initialize")
     result = { protocolVersion: 1, agentCapabilities: { loadSession: true } };
   else if (message.method === "session/new") result = { sessionId: "native" };
+  else if (
+    scenario === "missing-steer-receipt" &&
+    ["session/prompt", "session/steer"].includes(message.method)
+  )
+    continue;
   else if (message.method === "session/prompt" && scenario === "exit-open-pipes") {
     spawn(process.execPath, ["-e", "setTimeout(()=>process.exit(0),3000)"], {
       stdio: ["ignore", process.stdout, process.stderr],
@@ -19,6 +28,15 @@ for await (const line of createInterface({ input: process.stdin })) {
     message.method.includes("resolveInterruption")
   )
     continue;
-  else if (message.method === "session/prompt") result = { stopReason: "end_turn" };
+  else if (message.method === "session/steer") {
+    const block = message.params?.contentBlocks?.[0];
+    result = {
+      steered:
+        message.params?.sessionId === "native" && block?.type === "text" && block.text === "now",
+      ...(message.params?.sessionId === "native"
+        ? { ownerRequestId: "owner" }
+        : { reason: "idle" }),
+    };
+  } else if (message.method === "session/prompt") result = { stopReason: "end_turn" };
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\n");
 }

@@ -124,6 +124,7 @@ WorkBuddy 插件复用经过验证的 CodeBuddy ACP Session 语义，但保持�
 | Revise previous message | 通过 `rollbackLastTurn` 创建独立、可写的新 Session，并精确移除一个完整的最后 Turn；源 Session 保持不变，Model、Thinking 和 Permission Mode 会继承或采用显式修订设置。 |
 | Cross-Harness delegation | 普通持久化 WorkBuddy Thread 的委派 CLI 发现、凭据传递以及创建、读取、等待、继续、取消路径已接线；这与 WorkBuddy 自身的 Agent 子任务是两套独立能力。由于尚未完成已登录 WorkBuddy 的递归调用验收，README 暂不标记支持。 |
 | Images | 当前公共 Turn 输入仍为文本；CLI 声明图像能力不等于 Host 已提供图片输入。 |
+| 原生插话 | 与 CodeBuddy 共用 Session。只有这次启动的内置 CLI 报告无前缀产品版本不低于 2.143.1 时才声明 `steer`，并调用无下划线前缀的 `session/steer`。2.134.0 起有该方法，2.143.1 起才有 `{steered}` 接受回执；没有回执就不能可靠返回 `accepted`。此前观察到的 WorkBuddy AI 5.5.2 与 Windows 5.5.6 内置 CLI 是 CodeBuddy 2.137.1，低于该门槛，因此不声明。版本读不到时同样不声明。原生 `steered:true` 对应 Host `nativeAccepted`，由原生负责执行一次，不保证当前 Turn；实际分轮跟随原生事件与历史，Host 不重发。Adapter 不发布 `userMessage` Item。忙碌中的 `turn.start` 仍是 `sessionBusy`。2026-10-21 内置 CLI 2.147.0 国内版的 near-terminal Gate 通过，国际版打开 Session 超时，未通过实测。 |
 
 上述“已实现”表示 Adapter 的协议和公共契约路径已接线，不表示本轮完成了认证后的付费在线验收。尤其是 Model 目录、权限名称、历史格式和子 Agent 事件仍须在已登录的目标账号与实际 WorkBuddy 版本上复核；运行时以原生响应为准，不把 2.137.1 的观察结果硬编码为永久产品能力。
 

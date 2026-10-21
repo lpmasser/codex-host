@@ -56,6 +56,7 @@ import type {
   ClaudeTurnEvent,
   ClaudeTurnTransport,
 } from "./transport.js";
+import { ClaudeSteerMissedTurnError } from "./transport.js";
 
 const CLIENT_APP = "codexhost-claude-code-adapter/0.0.0";
 // Claude Code hides generic SDK entrypoints from its native Session picker. Keep persisted
@@ -477,6 +478,10 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   readonly #queryFactory: typeof query;
   #thinkingOptionId: HarnessThinkingOptionId;
   #active: ActiveTurn | null = null;
+  readonly #pendingSteers = new Map<
+    string,
+    { resolve(): void; reject(error: ClaudeSteerMissedTurnError): void }
+  >();
   #autonomous: AutonomousSegment | null = null;
   #autonomousTurnHandler: ClaudeAutonomousTurnHandler | null = null;
   #idleHandler: ClaudeIdleTurnHandler | null = null;
@@ -783,6 +788,35 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     return promise;
   }
 
+  /**
+   * Claude accepts the input with `queued`; Claude Code 2.1.280 then emits `started` after the
+   * current tool call, when `priority: "next"` joins the running Turn. Waiting for `started` would
+   * hold the caller for a whole tool call.
+   */
+  steer(text: string, messageId: string): Promise<void> {
+    if (this.#closePromise || !this.#started || !this.#query || !this.#active) {
+      return Promise.reject(new ClaudeSteerMissedTurnError());
+    }
+    const promise = new Promise<void>((resolve, reject) => {
+      this.#pendingSteers.set(messageId, { resolve, reject });
+    });
+    try {
+      this.#input.push({
+        type: "user",
+        message: { role: "user", content: text },
+        parent_tool_use_id: null,
+        session_id: this.sessionId,
+        uuid: messageId as `${string}-${string}-${string}-${string}-${string}`,
+        origin: { kind: "human" },
+        priority: "next",
+      });
+    } catch {
+      this.#pendingSteers.delete(messageId);
+      return Promise.reject(new ClaudeSteerMissedTurnError());
+    }
+    return promise;
+  }
+
   respondToInteraction(response: ClaudeInteractionResponse): Promise<void> {
     const pending = this.#interactions.get(response.requestId);
     if (!pending) {
@@ -1029,6 +1063,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   async #close(): Promise<void> {
+    this.#rejectPendingSteers();
     const failures: unknown[] = [];
     this.#closeInteractions("all", "cancelled");
     try {
@@ -1145,6 +1180,30 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     }
   }
 
+  #rejectPendingSteers(): void {
+    const pending = [...this.#pendingSteers.values()];
+    this.#pendingSteers.clear();
+    const error = new ClaudeSteerMissedTurnError();
+    for (const entry of pending) entry.reject(error);
+  }
+
+  /** `queued` is Claude's acceptance of this message into the running Session. */
+  #observeSteer(message: unknown): void {
+    if (
+      this.#pendingSteers.size === 0 ||
+      !isRecord(message) ||
+      message.type !== "command_lifecycle"
+    ) {
+      return;
+    }
+    if (message.state !== "queued") return;
+    if (typeof message.command_uuid !== "string" || message.command_uuid.length === 0) return;
+    const pending = this.#pendingSteers.get(message.command_uuid);
+    if (!pending) return;
+    this.#pendingSteers.delete(message.command_uuid);
+    pending.resolve();
+  }
+
   #observeBackgroundTasks(message: unknown): void {
     if (!isRecord(message) || message.type !== "system") return;
     if (message.subtype === "background_tasks_changed" && Array.isArray(message.tasks)) {
@@ -1202,12 +1261,14 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
         }
         const planLimit = parseClaudePlanLimitEvent(message);
         if (planLimit) this.#onPlanLimit(planLimit);
+        this.#observeSteer(message);
         const active = this.#active;
         if (active) {
           const interpreted = active.accumulator.consume(message);
           for (const event of interpreted.events) active.onEvent(event);
           if (interpreted.terminal) {
             this.#closeInteractions("root", "superseded");
+            this.#rejectPendingSteers();
             this.#active = null;
             active.resolve(interpreted.terminal);
           }
@@ -1275,6 +1336,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
     } catch (error) {
       const active = this.#active;
       this.#closeInteractions("all", "cancelled");
+      this.#rejectPendingSteers();
       this.#active = null;
       active?.reject(error);
       if (!this.#closePromise) this.#onFault(error);

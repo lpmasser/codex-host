@@ -256,6 +256,8 @@ export const harnessSessionCapabilitiesSchema = z
       })
       .strict()
       .optional(),
+    /** True when a native primitive accepts running input for execution without cancelling the Turn. */
+    steer: z.boolean().optional(),
   })
   .strict();
 
@@ -476,3 +478,22 @@ export const threadOwnershipListResultSchema = z
   });
 
 export type ThreadOwnershipListResult = z.infer<typeof threadOwnershipListResultSchema>;
+
+export const threadSteeringInspectParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+  })
+  .strict();
+
+/**
+ * How a steer submitted now reaches the Thread: `official` keeps Codex's own steer,
+ * `nativeAccepted` uses native acceptance (execution can be in the current or next native Turn);
+ * `newTurn` stops the target and starts a replacement Turn.
+ */
+export const threadSteeringInspectResultSchema = z
+  .object({
+    delivery: z.enum(["official", "nativeAccepted", "newTurn"]),
+  })
+  .strict();
+
+export type ThreadSteeringInspectResult = z.infer<typeof threadSteeringInspectResultSchema>;
