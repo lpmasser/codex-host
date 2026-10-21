@@ -1,5 +1,5 @@
-import { lstatSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { lstatSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { CodeBuddyError, type CodeBuddyInvocationFactory } from "@codexhost/adapter-codebuddy";
 import {
@@ -15,6 +15,12 @@ import {
 import { workBuddyDelegationArguments } from "./delegation.js";
 import { WORKBUDDY_CREDENTIAL_PRELOAD } from "./credential-bootstrap.js";
 import {
+  WORKBUDDY_DISTRIBUTIONS,
+  foreignWorkBuddyProduct,
+  workBuddyDistributionOf,
+  type WorkBuddyDistribution,
+} from "./distribution.js";
+import {
   resolveWorkBuddyBundle,
   resolveWorkBuddyInstallDirectory,
   WORKBUDDY_MACOS_ELECTRON,
@@ -29,7 +35,11 @@ export const workBuddyDiscoverySpec: HarnessDiscoverySpec = {
 };
 
 interface WorkBuddyInvocationDependencies {
+  /** The release this Harness identity runs; the existing `workbuddy` ID is international. */
+  distribution?: WorkBuddyDistribution;
   platform?: NodeJS.Platform;
+  readProduct?: (cliScript: string) => unknown;
+  readText?: (file: string) => string;
   isExecutable?: (candidate: string) => boolean;
   isDirectory?: (candidate: string) => boolean;
   lstat?: (candidate: string) => {
@@ -89,21 +99,96 @@ function bundledProductConfigPath(
   }
 }
 
+/** Product configuration declaring another release or product identity is never forwarded. */
+function rejectForeignProduct(
+  source: string,
+  product: unknown,
+  distribution: WorkBuddyDistribution,
+): void {
+  const foreign = foreignWorkBuddyProduct(product, distribution);
+  const { displayName } = WORKBUDDY_DISTRIBUTIONS[distribution];
+  if (foreign === "other")
+    throw new CodeBuddyError(
+      "invalidRequest",
+      `${source} declares another product's data root, not ${displayName}`,
+    );
+  if (foreign)
+    throw new CodeBuddyError(
+      "invalidRequest",
+      `${source} declares ${WORKBUDDY_DISTRIBUTIONS[foreign].displayName}, not ${displayName}; select the ${WORKBUDDY_DISTRIBUTIONS[foreign].harnessId} Harness for it`,
+    );
+}
+
+/**
+ * The App-written snapshot under the selected root. An unreadable one keeps the bundled CLI
+ * fallback; one declaring the other release means the root itself belongs to that release.
+ */
+function verifiedSnapshot(
+  candidate: string | undefined,
+  distribution: WorkBuddyDistribution,
+  readText: (file: string) => string,
+): string | undefined {
+  if (!candidate) return;
+  let product: unknown;
+  try {
+    product = JSON.parse(readText(candidate));
+  } catch {
+    return;
+  }
+  rejectForeignProduct("The product snapshot in this WorkBuddy root", product, distribution);
+  return candidate;
+}
+
+/** Explicit inherited product configuration must belong to the selected release. */
+function verifyExplicitProductConfiguration(
+  environment: NodeJS.ProcessEnv,
+  distribution: WorkBuddyDistribution,
+  readText: (file: string) => string,
+): void {
+  const path = environment[WORKBUDDY_PRODUCT_CONFIG_PATH_ENV]?.trim();
+  const sources: [string, () => string][] = [
+    ...(path
+      ? [[WORKBUDDY_PRODUCT_CONFIG_PATH_ENV, () => readText(path)] as [string, () => string]]
+      : []),
+    ...WORKBUDDY_PRODUCT_CONFIG_INLINE_ENVS.flatMap((name) => {
+      const value = environment[name];
+      return value?.trim() ? [[name, () => value] as [string, () => string]] : [];
+    }),
+  ];
+  for (const [name, read] of sources) {
+    let product: unknown;
+    try {
+      product = JSON.parse(read());
+    } catch {
+      // The value is never echoed: product configuration may carry account data.
+      throw new CodeBuddyError(
+        "invalidRequest",
+        `${name} cannot be verified as ${WORKBUDDY_DISTRIBUTIONS[distribution].displayName} product configuration`,
+      );
+    }
+    rejectForeignProduct(name, product, distribution);
+  }
+}
+
 export function workBuddyEnvironment(
   environment: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
+  distribution: WorkBuddyDistribution = "global",
 ): NodeJS.ProcessEnv {
   const paths = targetPath(platform);
-  const configuredRoot = environment.WORKBUDDY_CONFIG_DIR;
+  const { configDirectoryEnvironmentVariable, dataFolderName } =
+    WORKBUDDY_DISTRIBUTIONS[distribution];
+  const configuredRoot = environment[configDirectoryEnvironmentVariable];
   const root = paths.resolve(
     configuredRoot?.trim()
       ? configuredRoot
-      : paths.join(environment.HOME || environment.USERPROFILE || homedir(), ".workbuddy-ai"),
+      : paths.join(environment.HOME || environment.USERPROFILE || homedir(), dataFolderName),
   );
   return {
     ...environment,
-    // The bundled core reads CODEBUDDY_CONFIG_DIR. Force both names to one
-    // WorkBuddy-owned root so a global CodeBuddy setting cannot leak history.
+    // The native CLI runs one product and reads WORKBUDDY_CONFIG_DIR/CODEBUDDY_CONFIG_DIR.
+    // Force both to this release's root so neither a global CodeBuddy nor the other
+    // release's Host override can leak history, authentication or settings.
     CODEBUDDY_CONFIG_DIR: root,
     WORKBUDDY_CONFIG_DIR: root,
     DISABLE_AUTOUPDATER: environment.DISABLE_AUTOUPDATER ?? "1",
@@ -116,12 +201,14 @@ export function resolveWorkBuddyLaunch(
   dependencies: WorkBuddyInvocationDependencies = {},
 ) {
   const platform = dependencies.platform ?? process.platform;
-  const configured =
-    environmentValue(environment, "CODEXHOST_WORKBUDDY_COMMAND")?.trim() || undefined;
+  const distribution = dependencies.distribution ?? "global";
+  const { displayName, commandEnvironmentVariable } = WORKBUDDY_DISTRIBUTIONS[distribution];
+  const releaseOf = (cli: string) => workBuddyDistributionOf(cli, dependencies.readProduct);
+  const configured = environmentValue(environment, commandEnvironmentVariable)?.trim() || undefined;
   if (!configured && platform !== "darwin" && platform !== "win32")
     throw new CodeBuddyError(
       "notInstalled",
-      "WorkBuddy app discovery is available on macOS and Windows; set CODEXHOST_WORKBUDDY_COMMAND for a compatible native runtime on this platform",
+      `${displayName} app discovery is available on macOS and Windows; set ${commandEnvironmentVariable} for a compatible native runtime on this platform`,
     );
   const isExecutable =
     dependencies.isExecutable ?? ((candidate: string) => isExecutableFile(candidate, platform));
@@ -146,14 +233,36 @@ export function resolveWorkBuddyLaunch(
   const bundle = configuredDirectory
     ? resolveWorkBuddyInstallDirectory(configuredDirectory, environment, platform, isExecutable)
     : !configured || explicitDesktop
-      ? resolveWorkBuddyBundle(environment, platform, isExecutable, explicitExecutable)
+      ? resolveWorkBuddyBundle(
+          environment,
+          platform,
+          isExecutable,
+          explicitExecutable,
+          // Automatic discovery selects only this release; an explicit path is checked below.
+          configured ? () => true : (cli) => releaseOf(cli) === distribution,
+        )
       : undefined;
   const executable =
     configured && !explicitDesktop && !configuredDirectory
       ? explicitExecutable
       : bundle?.executable;
   if (!executable)
-    throw new CodeBuddyError("notInstalled", "WorkBuddy AI app or its bundled CLI is unavailable");
+    throw new CodeBuddyError(
+      "notInstalled",
+      `${displayName} app or its bundled CLI is unavailable`,
+    );
+  if (configured) {
+    // An explicit app, folder or standalone CLI must declare this release; plain CodeBuddy and
+    // the other WorkBuddy release are rejected instead of silently changing the Harness.
+    const release = releaseOf(bundle?.cli ?? executable);
+    if (release !== distribution)
+      throw new CodeBuddyError(
+        "invalidRequest",
+        release
+          ? `${configured} is ${WORKBUDDY_DISTRIBUTIONS[release].displayName}, not ${displayName}; select the ${WORKBUDDY_DISTRIBUTIONS[release].harnessId} Harness for it`
+          : `${configured} does not declare ${displayName} product metadata`,
+      );
+  }
 
   return { executable, bundle };
 }
@@ -172,6 +281,7 @@ export function workBuddyInvocation(
     ? dependenciesOrArguments
     : argumentsOverride;
   const platform = dependencies.platform ?? process.platform;
+  const distribution = dependencies.distribution ?? "global";
   const { executable, bundle } = resolveWorkBuddyLaunch(environment, dependencies);
   const paths = targetPath(platform);
   const cliDist = bundle && paths.join(paths.dirname(paths.dirname(bundle.cli)), "dist");
@@ -198,12 +308,18 @@ export function workBuddyInvocation(
   const serve = liteOnly && acpArguments.includes("--acp") && !acpArguments.includes("--serve");
 
   const configuredEnvironment = withNodeRuntimeOnPath(
-    workBuddyEnvironment(environment, platform),
+    workBuddyEnvironment(environment, platform, distribution),
     process.execPath,
     platform,
   );
+  const readText = dependencies.readText ?? ((file: string) => readFileSync(file, "utf8"));
+  verifyExplicitProductConfiguration(configuredEnvironment, distribution, readText);
   const productConfigPath = bundle
-    ? bundledProductConfigPath(configuredEnvironment, platform, dependencies)
+    ? verifiedSnapshot(
+        bundledProductConfigPath(configuredEnvironment, platform, dependencies),
+        distribution,
+        readText,
+      )
     : undefined;
   const childEnvironment = bundle
     ? {
