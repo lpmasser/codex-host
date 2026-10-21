@@ -13,6 +13,12 @@ import {
   workBuddyInvocation,
 } from "../src/command.js";
 
+const internationalRelease = () => ({ dataFolderName: ".workbuddy-ai" });
+const internationalSnapshot = () =>
+  JSON.stringify({ dataFolderName: ".workbuddy-ai", endpoint: "https://www.workbuddy.ai" });
+// An explicit local Model configuration without any release identity.
+const partialModelConfig = () => JSON.stringify({ models: [] });
+
 const isBundledExecutable = (candidate: string) =>
   [WORKBUDDY_MACOS_ELECTRON, WORKBUDDY_MACOS_CLI].includes(candidate);
 
@@ -67,6 +73,7 @@ describe("WorkBuddy command invocation", () => {
         true,
         {
           platform,
+          readProduct: internationalRelease,
           isExecutable: () => true,
           isDirectory: () => false,
           isFile: (candidate) => candidate.endsWith("codebuddy-lite-wb.mjs"),
@@ -98,6 +105,7 @@ describe("WorkBuddy command invocation", () => {
   it("keeps classic bundles on standalone ACP when both distributions are present", () => {
     const invocation = workBuddyInvocation({}, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: isBundledExecutable,
       isFile: () => true,
     });
@@ -112,6 +120,7 @@ describe("WorkBuddy command invocation", () => {
       true,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: isBundledExecutable,
         isFile: (candidate) => candidate.endsWith("codebuddy-lite-wb.mjs"),
       },
@@ -125,6 +134,7 @@ describe("WorkBuddy command invocation", () => {
     const seen: string[] = [];
     const invocation = workBuddyInvocation({ HOME: "/Users/test", PATH: "/ordinary/bin" }, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: (candidate) => {
         seen.push(candidate);
         return [WORKBUDDY_MACOS_ELECTRON, WORKBUDDY_MACOS_CLI].includes(candidate);
@@ -155,6 +165,7 @@ describe("WorkBuddy command invocation", () => {
     const productConfigPath = "/Users/test/.workbuddy-ai/cache/acc-product-config-v3.json";
     const invocation = workBuddyInvocation({ HOME: "/Users/test", PATH: "/ordinary/bin" }, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: isBundledExecutable,
       lstat: (candidate: string) => {
         if (candidate === productConfigPath) return productConfigMetadata();
@@ -162,6 +173,7 @@ describe("WorkBuddy command invocation", () => {
         return productConfigDirectoryMetadata();
       },
       getuid: () => 501,
+      readText: internationalSnapshot,
     });
 
     expect(invocation.environment.ACC_PRODUCT_CONFIG_PATH).toBe(productConfigPath);
@@ -173,12 +185,14 @@ describe("WorkBuddy command invocation", () => {
     const cli = "/opt/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy";
     const invocation = workBuddyInvocation({ HOME: "/home/test" }, true, {
       platform: "linux",
+      readProduct: internationalRelease,
       isExecutable: (candidate) => [executable, cli].includes(candidate),
       lstat: (candidate: string) =>
         candidate === productConfigPath
           ? productConfigMetadata()
           : productConfigDirectoryMetadata(),
       getuid: () => 501,
+      readText: internationalSnapshot,
     });
 
     expect(invocation.environment.ACC_PRODUCT_CONFIG_PATH).toBe(productConfigPath);
@@ -192,12 +206,14 @@ describe("WorkBuddy command invocation", () => {
       true,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: isBundledExecutable,
         lstat: (candidate) =>
           candidate === productConfigPath
             ? productConfigMetadata()
             : productConfigDirectoryMetadata(),
         getuid: () => 501,
+        readText: internationalSnapshot,
       },
     );
 
@@ -209,20 +225,29 @@ describe("WorkBuddy command invocation", () => {
     ["ACC_PRODUCT_CONFIG_V3", '{"models":[]}'],
     ["ACC_PRODUCT_CONFIG_V2", '{"models":[]}'],
     ["ACC_PRODUCT_CONFIG", '{"models":[]}'],
-  ])("preserves an explicit %s override", (name, value) => {
-    let inspected = false;
-    const invocation = workBuddyInvocation({ HOME: "/Users/test", [name]: value }, true, {
-      platform: "darwin",
-      isExecutable: isBundledExecutable,
-      lstat: () => {
-        inspected = true;
-        return productConfigMetadata();
+  ])("preserves an explicit %s override while checking the selected root", (name, value) => {
+    const root = "/Users/test/.workbuddy-ai";
+    const snapshot = `${root}/cache/acc-product-config-v3.json`;
+    let readRootSnapshot = false;
+    const invocation = workBuddyInvocation(
+      { HOME: "/Users/test", WORKBUDDY_CONFIG_DIR: root, [name]: value },
+      true,
+      {
+        platform: "darwin",
+        readProduct: internationalRelease,
+        isExecutable: isBundledExecutable,
+        readText: (candidate) => {
+          if (candidate === snapshot) readRootSnapshot = true;
+          return internationalSnapshot();
+        },
       },
-      getuid: () => 501,
-    });
+    );
 
     expect(invocation.environment[name]).toBe(value);
-    expect(inspected).toBe(false);
+    expect(readRootSnapshot).toBe(true);
+    expect(invocation.environment.ACC_PRODUCT_CONFIG_PATH).toBe(
+      name === "ACC_PRODUCT_CONFIG_PATH" ? value : undefined,
+    );
   });
 
   it("preserves explicitly combined path and inline product snapshots", () => {
@@ -235,7 +260,12 @@ describe("WorkBuddy command invocation", () => {
         ACC_PRODUCT_CONFIG: '{"models":["legacy"]}',
       },
       true,
-      { platform: "darwin", isExecutable: isBundledExecutable },
+      {
+        platform: "darwin",
+        readProduct: internationalRelease,
+        isExecutable: isBundledExecutable,
+        readText: partialModelConfig,
+      },
     );
 
     expect(invocation.environment.ACC_PRODUCT_CONFIG_PATH).toBe("/explicit/product.json");
@@ -254,10 +284,12 @@ describe("WorkBuddy command invocation", () => {
     const productConfigPath = "/Users/test/.workbuddy-ai/cache/acc-product-config-v3.json";
     const invocation = workBuddyInvocation({ HOME: "/Users/test" }, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: isBundledExecutable,
       lstat: (candidate) =>
         candidate === productConfigPath ? metadata : productConfigDirectoryMetadata(),
       getuid: () => 501,
+      readText: internationalSnapshot,
     });
 
     expect(invocation.environment).not.toHaveProperty("ACC_PRODUCT_CONFIG_PATH");
@@ -267,10 +299,11 @@ describe("WorkBuddy command invocation", () => {
     ["a symlinked root", "/Users/test/.workbuddy-ai", { symbolicLink: true }],
     ["a group-writable cache", "/Users/test/.workbuddy-ai/cache", { mode: 0o40720 }],
     ["a cache owned by another user", "/Users/test/.workbuddy-ai/cache", { uid: 502 }],
-  ])("does not traverse %s", (_description, rejectedPath, overrides) => {
+  ])("does not forward a snapshot from %s", (_description, rejectedPath, overrides) => {
     const productConfigPath = "/Users/test/.workbuddy-ai/cache/acc-product-config-v3.json";
     const invocation = workBuddyInvocation({ HOME: "/Users/test" }, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: isBundledExecutable,
       lstat: (candidate) => {
         if (candidate === rejectedPath)
@@ -284,6 +317,7 @@ describe("WorkBuddy command invocation", () => {
         return productConfigDirectoryMetadata();
       },
       getuid: () => 501,
+      readText: internationalSnapshot,
     });
 
     expect(invocation.environment).not.toHaveProperty("ACC_PRODUCT_CONFIG_PATH");
@@ -293,12 +327,14 @@ describe("WorkBuddy command invocation", () => {
     const productConfigPath = "/Users/test/.workbuddy-ai/cache/acc-product-config-v3.json";
     const invocation = workBuddyInvocation({ HOME: "/Users/test" }, true, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isExecutable: isBundledExecutable,
       lstat: (candidate) => {
         if (candidate === productConfigPath) throw new Error("ENOENT");
         return productConfigDirectoryMetadata();
       },
       getuid: () => 501,
+      readText: internationalSnapshot,
     });
 
     expect(invocation.environment).not.toHaveProperty("ACC_PRODUCT_CONFIG_PATH");
@@ -313,7 +349,11 @@ describe("WorkBuddy command invocation", () => {
         WORKBUDDY_CONFIG_DIR: "/custom/workbuddy-root",
       },
       false,
-      { platform: "darwin", isExecutable: (candidate) => candidate === "/custom/workbuddy-cli" },
+      {
+        platform: "darwin",
+        readProduct: internationalRelease,
+        isExecutable: (candidate) => candidate === "/custom/workbuddy-cli",
+      },
     );
 
     expect(invocation.command).toBe("/custom/workbuddy-cli");
@@ -336,12 +376,14 @@ describe("WorkBuddy command invocation", () => {
       false,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: (candidate) => candidate === "/custom/workbuddy-cli",
         lstat: () => {
           inspected = true;
           return productConfigMetadata();
         },
         getuid: () => 501,
+        readText: internationalSnapshot,
       },
     );
 
@@ -355,6 +397,7 @@ describe("WorkBuddy command invocation", () => {
       false,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: (candidate) =>
           [WORKBUDDY_MACOS_ELECTRON, WORKBUDDY_MACOS_CLI].includes(candidate),
       },
@@ -378,6 +421,7 @@ describe("WorkBuddy command invocation", () => {
     expect(() =>
       workBuddyInvocation({ HOME: "/home/test", PATH: "/ordinary/codebuddy/bin" }, false, {
         platform: "freebsd",
+        readProduct: internationalRelease,
         isExecutable: () => true,
       }),
     ).toThrow("CODEXHOST_WORKBUDDY_COMMAND");
@@ -429,12 +473,14 @@ describe("WorkBuddy command invocation", () => {
       true,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: isBundledExecutable,
         lstat: (candidate) =>
           candidate === productConfigPath
             ? productConfigMetadata()
             : productConfigDirectoryMetadata(),
         getuid: () => 501,
+        readText: internationalSnapshot,
       },
     );
 
@@ -483,7 +529,11 @@ describe("WorkBuddy model-free history copy startup", () => {
     "--output-format",
     "stream-json",
   ];
-  const dependencies = { platform: "darwin" as const, isExecutable: isBundledExecutable };
+  const dependencies = {
+    platform: "darwin" as const,
+    readProduct: internationalRelease,
+    isExecutable: isBundledExecutable,
+  };
 
   it("skips telemetry initialization only for the bundled print-copy process", () => {
     const environment = { HOME: "/Users/test" };
@@ -518,7 +568,11 @@ describe("WorkBuddy model-free history copy startup", () => {
     const copy = workBuddyInvocation(
       { HOME: "/Users/test", CODEXHOST_WORKBUDDY_COMMAND: "/custom/workbuddy" },
       false,
-      { platform: "darwin", isExecutable: (candidate) => candidate === "/custom/workbuddy" },
+      {
+        platform: "darwin",
+        readProduct: internationalRelease,
+        isExecutable: (candidate) => candidate === "/custom/workbuddy",
+      },
       copyArguments,
     );
     expect(copy.environment).not.toHaveProperty("DISABLE_TELEMETRY");

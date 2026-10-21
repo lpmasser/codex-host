@@ -1,6 +1,32 @@
 # WorkBuddy native Harness plugin
 
-WorkBuddy 作为独立的 `workbuddy` Harness 运行 WorkBuddy AI 随应用分发的原生 CLI。插件选择 CLI 公开的标准 ACP stdio 接口，而不是控制 WorkBuddy Desktop、模拟它的私有身份，或把独立 CodeBuddy 安装重命名为 WorkBuddy。
+WorkBuddy 以两个独立 Harness 运行应用随附的原生 CLI：`workbuddy` 对应国际版 WorkBuddy AI，`workbuddy-cn` 对应国内版 WorkBuddy。插件选择 CLI 公开的标准 ACP stdio 接口，而不是控制 WorkBuddy Desktop、模拟它的私有身份，或把独立 CodeBuddy 安装重命名为 WorkBuddy。
+
+## 国际版与国内版
+
+两个发行是不同产品：各自拥有产品元数据、认证端点、服务和原生数据根。同一份内置 CLI 配上另一发行的数据根与产品快照时，ACP `session/new` 返回 `Authentication required`，因此不能用一个 Harness 按目录自适应切换。
+
+| | `workbuddy` | `workbuddy-cn` |
+| --- | --- | --- |
+| 产品 | WorkBuddy AI（`workbuddy.ai`） | WorkBuddy（`workbuddy.cn`） |
+| 内置 `cli/product.json` 的 `dataFolderName` | `.workbuddy-ai` | `.workbuddy` |
+| 默认原生数据根 | `~/.workbuddy-ai` | `~/.workbuddy` |
+| 启动覆盖 | `CODEXHOST_WORKBUDDY_COMMAND` | `CODEXHOST_WORKBUDDYCN_COMMAND` |
+| 数据根覆盖（Host 环境） | `WORKBUDDY_CONFIG_DIR` | `WORKBUDDYCN_CONFIG_DIR` |
+| 已核对的安装 | macOS WorkBuddy AI 5.5.2 / 内置 CLI 2.137.1 | macOS WorkBuddy 5.6.2 / 内置 CLI 2.147.0 |
+
+现有 `workbuddy` 的 ID、启动设置与 Thread 含义保持为国际版；国内版 Thread 通过 `workbuddy-cn` 新建，不提供地区切换或历史迁移，也不按目录扫描猜测旧 Thread 的地区。两者共用 `packages/adapters/workbuddy` 中语义相同的 CodeBuddy ACP Session、历史与派生实现，按发行参数选择身份、启动覆盖和默认数据根。
+
+发行识别集中在安装边界：CLI 包内 `product.json`（`bin/codebuddy` 的上两级目录，按真实路径解析）声明的 `dataFolderName`、`endpoint`（按 URL origin 比较）或 `authentication.id` 任一已知身份字段声明本发行即可识别；三个字段都未声明，或声明了多个互相矛盾的发行时，不归入任一发行。安装目录或可执行文件名不作为地区依据，因为两版的 Windows 布局名称并不可靠区分。
+
+- 自动发现遍历两版共有的 macOS/Windows 安装布局，只接受声明本发行的安装；两版同装时各选各的，只装一版时另一 Harness 如实报告未安装，不借用该程序、认证或快照。
+- 显式安装目录、Desktop 入口或独立 CLI 必须声明本发行；指向另一发行时明确报错并提示选择对应 Harness，元数据缺失或属于普通 CodeBuddy（`.codebuddy`）时同样拒绝，不静默换版。
+- 两个 Harness 只读取自己的启动覆盖与数据根覆盖。原生 CLI 每次只运行一个产品，`WORKBUDDY_CONFIG_DIR` 是它的单产品变量；Host 同时驱动两个身份，因此国际版沿用 `WORKBUDDY_CONFIG_DIR`，国内版使用独立的 `WORKBUDDYCN_CONFIG_DIR`。所选根经 profile 供历史、子 Agent 与派生读取，并在启动子进程时才映射为原生需要的 `WORKBUDDY_CONFIG_DIR` 与 `CODEBUDDY_CONFIG_DIR`。只设置国际版覆盖时国内版仍使用 `~/.workbuddy`；普通 CodeBuddy 的 `CODEBUDDY_CONFIG_DIR` 不会进入任一发行。
+- 产品配置同样按发行校验：继承的 `ACC_PRODUCT_CONFIG_PATH`、`ACC_PRODUCT_CONFIG_V3`、`ACC_PRODUCT_CONFIG_V2`、`ACC_PRODUCT_CONFIG` 及所选根下 App 写入的快照，若通过 `dataFolderName`、`endpoint`（按 URL origin 比较，主机名大小写和尾斜杠不影响结果）或 `authentication.id`（国际版 `workbuddy-desktop-ai`，国内版 `workbuddy-desktop`）声明另一发行，启动前明确拒绝并提示选择对应 Harness；声明普通 CodeBuddy（`.codebuddy`）等非本发行的数据根同样拒绝。未声明这些身份字段的局部配置照常保留，未知自定义服务不会被推断为任一发行。显式配置无法读取或解析时拒绝，因为无法证明其发行；错误信息只给出变量名，不回显配置内容。
+- 上述身份规则及根快照读取由 `distribution.ts` 统一拥有。自动发现、显式应用目录/Desktop、独立 CLI，以及历史、子 Agent、派生、会话导入和用量统计，都在数据访问前调用同一根身份校验。非启动能力经 profile 的 `validateConfigRoot` 在公共根解析边界接入；统计直接读取不依赖预先枚举，持久化 source ID 的真实路径须位于所选根的 projects 内。显式配置的优先级、快照权限或符号链接不跳过身份检查。权限与链接检查只决定打包 CLI 能否自动转发快照；独立 CLI 不自动转发。读取快照前先确认最终目标为普通文件，FIFO 等节点明确拒绝；指向普通文件的符号链接仍检查身份。根快照真正缺失、不可读或不可解析时沿用原生内置配置，不按根目录名猜测发行。
+- Native Ref、启动设置与 Desktop 的 Model/Thinking/Permission 选择都按 Harness ID 分开保存；跨身份 Resume、Fork 与修订沿既有身份校验被拒绝。
+
+能力声明按发行分别给出。Fork 与修订依赖的公开 `--fork-session` 管理模式和 `_codebuddy.ai/session/rollback` 扩展已在国际版 2.137.1 在线验证；国内版 2.147.0 内置 CLI 静态包含同样的入口，在线完整生命周期验收见文末验证状态。
 
 ## 接口选择与已确认版本
 
@@ -13,13 +39,13 @@ WorkBuddy 作为独立的 `workbuddy` Harness 运行 WorkBuddy AI 随应用分�
 
 内置 `product.json` 将产品、认证端点和应用数据目录配置为 WorkBuddy；内部 CLI 入口仍名为 `codebuddy`，不表示它应被发现为独立的 `codebuddy` Harness。插件自动发现应用与其同一安装目录中的内置 CLI，不回退到 PATH 中的独立 CodeBuddy：
 
-- macOS：依次检查 `/Applications`、`~/Applications` 下的 `WorkBuddy AI.app` 和 `WorkBuddy.app`，使用 `Contents/MacOS/Electron` 与 `Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`。
+- macOS：依次检查 `/Applications`、`~/Applications` 下的 `WorkBuddy AI.app` 和 `WorkBuddy.app`，按上节的产品元数据只保留本发行，使用 `Contents/MacOS/Electron` 与 `Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`。
 - Windows：检查 PATH 及 `%LOCALAPPDATA%/Programs`、`%ProgramFiles%` 下的 `WorkBuddy AI`、`WorkBuddy`、`WorkBuddyAI`，匹配 `WorkBuddy AI.exe`、`WorkBuddy.exe` 或新版安装器使用的 `WorkBuddyAI.exe`，并配对同目录 `resources/app.asar.unpacked/cli/bin/codebuddy`；不混用不同安装的可执行文件与 CLI。用户标准安装根依据[官方常见问题](https://www.workbuddy.cn/docs/workbuddy/From-Beginner-to-Expert-Guide/FAQ)。路径发现和启动参数已通过模拟 Windows 文件布局测试。
 - Linux：依次检查 `/opt/WorkBuddy`、`/opt/WorkBuddy AI`、`/opt/WorkBuddyAI` 下的 `workbuddy`，并配对同目录 `resources/app.asar.unpacked/cli/bin/codebuddy`。Linux 自动发现只接受这些安装根，不把 PATH 上的 `workbuddy` 包装脚本当作应用；其他布局通过安装目录或 `CODEXHOST_WORKBUDDY_COMMAND` 显式指定。
 
-标准布局下只需安装 WorkBuddy App，不需要另外全局安装 CLI，也不要求 App 窗口保持运行；应用内部打包路径并非 WorkBuddy 对外承诺的稳定接口。`CODEXHOST_WORKBUDDY_COMMAND` 支持应用安装目录，也可显式选择支持 `--acp` 的原生 CLI，或 Windows `WorkBuddy.exe` / `WorkBuddy AI.exe` / `WorkBuddyAI.exe`、macOS WorkBuddy 应用内的 `Contents/MacOS/Electron`、Linux 应用内的 `workbuddy`。明确指定 Desktop 入口时仍校验并使用同安装目录的内置 CLI，缺失时检查失败，不把 EXE 或包装脚本当裸 CLI 启动，也不静默换用其他安装。
+标准布局下只需安装 WorkBuddy App，不需要另外全局安装 CLI，也不要求 App 窗口保持运行；应用内部打包路径并非 WorkBuddy 对外承诺的稳定接口。`CODEXHOST_WORKBUDDY_COMMAND`（国内版为 `CODEXHOST_WORKBUDDYCN_COMMAND`）支持应用安装目录，也可显式选择支持 `--acp` 且随包声明本发行 `product.json` 的原生 CLI，或 Windows `WorkBuddy.exe` / `WorkBuddy AI.exe` / `WorkBuddyAI.exe`、macOS WorkBuddy 应用内的 `Contents/MacOS/Electron`、Linux 应用内的 `workbuddy`。明确指定 Desktop 入口时仍校验并使用同安装目录的内置 CLI，缺失时检查失败，不把 EXE 或包装脚本当裸 CLI 启动，也不静默换用其他安装。
 
-连接设置页的本地 WorkBuddy 右侧详情卡片填写应用安装目录，例如 `D:\program\WorkBuddy` 或 `/opt/WorkBuddy`，无需填写 `.exe`、可执行文件或脚本。Adapter 自动校验该目录内的应用与内置脚本；目录不完整时不回退到其他安装。支持保存和清除；设置优先于命令环境变量，清除后恢复环境变量或自动发现。路径保存在 Host 数据目录，重启 codexhost 后应用，不切换运行中的 Session。详见[自定义启动路径设置](../../architecture/harness-plugin-runtime.md#自定义启动路径设置)。
+连接设置页的本地 WorkBuddy 与 WorkBuddy CN 右侧详情卡片分别填写各自的应用安装目录，例如 `D:\program\WorkBuddy` 或 `/opt/WorkBuddy`，无需填写 `.exe`、可执行文件或脚本。Adapter 自动校验该目录内的应用与内置脚本；目录不完整时不回退到其他安装。支持保存和清除；设置优先于命令环境变量，清除后恢复环境变量或自动发现。路径保存在 Host 数据目录，重启 codexhost 后应用，不切换运行中的 Session。详见[自定义启动路径设置](../../architecture/harness-plugin-runtime.md#自定义启动路径设置)。
 
 WorkBuddy 的[快速开始](https://www.workbuddy.ai/docs/workbuddy/Quickstart)描述产品安装与登录，[官方 ACP 文档](https://www.workbuddy.ai/docs/zh/cli/acp)明确以 `codebuddy --acp` 启动协议服务。CLI 的 ACP `initialize` 已在无提示、无模型请求的探测中成功，并声明 Session load 与委派相关能力；配置、取消、权限和问题流程也存在于该 CLI 的公开 ACP 接口与文档中。因此选择：
 
@@ -41,7 +67,7 @@ WorkBuddy AI 5.8.4 的 macOS 安装包仅包含 `dist/codebuddy-lite-wb.mjs`，�
 
 ## 认证与数据隔离
 
-直接运行内置 CLI 时，其内部默认值可能回退到 `~/.codebuddy`。插件不会沿用这一跨产品默认值：它只把 `WORKBUDDY_CONFIG_DIR` 视为用户选择；没有该值时，macOS 与 Windows 使用 `~/.workbuddy-ai`，Linux 使用应用自身的 `~/.workbuddy`，随后强制传给子进程的 `WORKBUDDY_CONFIG_DIR` 与 `CODEBUDDY_CONFIG_DIR` 指向同一 WorkBuddy 根。这样即使普通 CodeBuddy 配置了自己的 `CODEBUDDY_CONFIG_DIR`，WorkBuddy 的历史、认证和设置也不会泄漏到该目录。WorkBuddy CLI 负责认证、原生设置、工具和 MCP 配置；codexhost 不保存、复制或推断其凭据。
+直接运行内置 CLI 时，其内部默认值可能回退到 `~/.codebuddy`。插件不会沿用这一跨产品默认值：它只把所选发行的数据根覆盖（`WORKBUDDY_CONFIG_DIR` / `WORKBUDDYCN_CONFIG_DIR`）视为用户选择；没有该值时，macOS 与 Windows 使用所选发行的根（`~/.workbuddy-ai` 或 `~/.workbuddy`），Linux 使用应用自身的 `~/.workbuddy`，随后强制传给子进程的 `WORKBUDDY_CONFIG_DIR` 与 `CODEBUDDY_CONFIG_DIR` 指向同一 WorkBuddy 根。这样即使普通 CodeBuddy 配置了自己的 `CODEBUDDY_CONFIG_DIR`，WorkBuddy 的历史、认证和设置也不会泄漏到该目录。WorkBuddy CLI 负责认证、原生设置、工具和 MCP 配置；codexhost 不保存、复制或推断其凭据。
 
 新版内置 CLI 的独立 ACP 启动不会自行初始化加密凭据读取能力。对于应用内置入口，插件先在同一个 WorkBuddy Electron 进程中调用其 `electron_browser_workbuddy_storage` 原生绑定，再通过内置 CLI 的 credential bootstrap 接收器初始化字段加密。密钥按原生 `normalizeAtRestKeyPayload` 规则规范化，只在该进程内存与本次随机管道中传递；不写入参数、环境变量或文件，也不由 Host 解密、复制登录 Token。CLI 随后按自己的认证逻辑读取已有登录文件。完整的受管 bootstrap 环境保持原样；已有 socket、Token 或 Session ID 配置时，要求加密策略与四项通信配置均非空，否则在加载 CLI 前明确报错。`disabled` 策略交给原生 CLI；`fields`、`required` 或空策略执行字段加密引导；旧应用没有该原生绑定时继续原有启动流程。
 
@@ -62,7 +88,7 @@ ELECTRON_RUN_AS_NODE=1 \
 "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
 ```
 
-仅包含精简 CLI 的发行不提供该 TUI 入口，应通过 WorkBuddy 应用自身的官方登录流程完成认证。包含 TUI 的发行进入后输入 `/login`，完成浏览器认证再重试 Harness。Linux 把上述命令中的应用路径替换为 `/opt/WorkBuddy/workbuddy` 与 `/opt/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy`，配置根使用 `$HOME/.workbuddy`。这里使用的仍是 App 内置 CLI，不表示需要另装一个 CLI。不要使用 Desktop owner runtime 的凭据，也不要发明 `codebuddy auth login` 命令。
+仅包含精简 CLI 的发行不提供该 TUI 入口，应通过 WorkBuddy 应用自身的官方登录流程完成认证。包含 TUI 的发行进入后输入 `/login`，完成浏览器认证再重试 Harness。国内版把上例的两处根换成 `$HOME/.workbuddy`（或 `WORKBUDDYCN_CONFIG_DIR` 指定的根），并改用 `/Applications/WorkBuddy.app` 的同名入口；Linux 把应用路径替换为 `/opt/WorkBuddy/workbuddy` 与 `/opt/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy`，配置根使用 `$HOME/.workbuddy`；不要在另一发行的根上登录。这里使用的仍是 App 内置 CLI，不表示需要另装一个 CLI。不要使用 Desktop owner runtime 的凭据，也不要发明 `codebuddy auth login` 命令。
 
 若 `session/new` 成功而首个 Turn 返回 `refusal`，应检查 ACP 终态 `_meta["codebuddy.ai/errorMessage"]`。共享 CodeBuddy Session 会提取其中的 `data.details` 或 `message`，经诊断脱敏后显示；`data.category="auth"` 映射为 `authenticationRequired`，而不是仅显示 `FAILED_MODEL_REQUEST`。JSON-RPC `-32000` 本身不区分认证与其他原生拒绝。缺少可读诊断时保留原有的 stop reason / outcome 提示。
 
@@ -78,7 +104,7 @@ WorkBuddy Profile 声明该目录编码；历史读取、跨目录 Fork 的临�
 
 WorkBuddy App 会把账号、版本和服务可用性共同解析出的产品快照交给其 Hosted CLI。小快照使用 `ACC_PRODUCT_CONFIG_V3`，较大的快照原子写入 WorkBuddy 配置根下的 `cache/acc-product-config-v3.json`，再通过 `ACC_PRODUCT_CONFIG_PATH` 传给子进程。若没有这份上下文，内置 CLI 会回退到随安装包发布的 `product.json`；WorkBuddy AI 5.5.2 内置的默认 `cli` Agent 在该回退配置中只暴露 Fast、Balanced、Primary 和 Deep。
 
-对于自动发现或显式 Desktop 入口配对的内置 CLI，插件会沿用现有的 WorkBuddy 产品快照文件。调用方没有显式设置路径或任一内联产品配置环境变量时，插件检查 WorkBuddy 根目录及其 `cache` 均为非符号链接目录、快照为非符号链接且非空的普通文件，再传递 `ACC_PRODUCT_CONFIG_PATH`。POSIX 平台还校验当前用户所有权、目录不可由其他用户写入、文件不可由组或其他用户读取；Windows 文件隔离依赖原生目录 ACL，插件不以 POSIX mode/uid 判断 ACL。快照缺失或校验失败时保留内置 CLI 的回退配置；显式指定独立 CLI 时不自动推断 WorkBuddy 私有缓存，但会保留调用方显式提供的产品配置环境。
+对于自动发现或显式 Desktop 入口配对的内置 CLI，插件会沿用现有的 WorkBuddy 产品快照文件。调用方没有显式设置路径或任一内联产品配置环境变量时，插件检查 WorkBuddy 根目录及其 `cache` 均为非符号链接目录、快照为非符号链接且非空的普通文件，再传递 `ACC_PRODUCT_CONFIG_PATH`。POSIX 平台还校验当前用户所有权、目录不可由其他用户写入、文件不可由组或其他用户读取；Windows 文件隔离依赖原生目录 ACL，插件不以 POSIX mode/uid 判断 ACL。真正缺失、不可读或无法解析的根快照保留内置配置；非普通节点在读取前拒绝。可读普通快照始终验证身份，声明另一发行时明确失败；权限、所有者或链接不适合自动转发时只禁止转发。显式指定独立 CLI 不自动转发私有缓存，调用方显式提供的产品配置仍校验并保留。
 
 macOS 保持 ACP 原生目录和选择行为，不从产品文件追加 Model。Windows 独立启动的 CLI 可能因无法继承 WorkBuddy App 进程内快照而得到不完整的 ACP 目录，因此插件在 Windows 上读取传给当前 CLI 的产品配置作为补偿：以 resolved snapshot 中 `agents[name="cli"].models` 为目录，只关联顶层 `models` 中对应项的 `id`、`name` 和非空 `credits`，不会把供内部 Agent 使用的全部顶层 Model 当作 CLI 目录。结果按原生 ID 与规范化显示名称去重并追加到 ACP Session 的 `configOptions`；ACP 已列出的模型保持在前。`credits` 只作为快照中的不透明倍率标签展示，空值不推断为免费。插件不会读取或投影认证、Endpoint、功能配置等其他快照内容。
 
@@ -109,6 +135,7 @@ WorkBuddy 插件复用经过验证的 CodeBuddy ACP Session 语义，但保持�
 | Usage | 读取原生模型请求用量，上下文窗口沿用 ACP 当前会话预算，不替换为模型最大支持值。确认模型改变时旧上下文失效，累计用量保留；重复确认同一模型不清除其新用量。未实现账号总额度，也不把 credits 推断为美元。 |
 | Native history | 从隔离的 WorkBuddy 原生历史读取当前父链，保留持久化用户消息 ID；缺失、歧义、损坏或不完整状态不会伪装成成功。 |
 | Native subagents | 投影原生 Agent 子任务状态，并从同一 WorkBuddy 数据根读取受约束的只读子 Thread；派生 Session 会固定并复制已保留 Agent 结果引用的子 Transcript 前缀。这不等于获得 Desktop 私有任务或连接器。 |
+| Autonomous Turn | 国内 CLI 2.147.0 静态包含无需外部 Prompt 的后台 drain 与自主 Turn 开始/结束通知；共用 Session 尚未分配对应公共 Turn，未声明 `autonomousTurns.observe`。这是未完成 P1；依赖共用 CodeBuddy Session 的独立 PR，合入后再提国内版 PR，详见[能力清单](../../../packages/adapters/workbuddy-cn/CAPABILITIES.md#b12-原生依据与-p1-结论)。 |
 | Slash commands | 暴露固定且可安全映射的 `/compact` 与 `/init`。命令目录在 Adapter 与 Session 之间保持一致；会切换 Session、脱离当前 Thread 或依赖原生 UI 的命令不通过 Host 暴露。 |
 | Context compaction | `/compact` 交给原生 WorkBuddy 执行；只有原生历史持久化了成功的压缩记录才投影成功的 `contextCompaction` Item。自动压缩保留在触发它的原 Turn 内。 |
 | Fork | 创建独立、可继续写入的 WorkBuddy Native Session，精确保留所选 checkpoint 及以前的完整 Turn。支持同目录和跨目录，来源 Session 不被修改。 |
@@ -152,6 +179,8 @@ WorkBuddy 2.137.1 对标准 ACP `session/fork` 返回 `Method not found`，所�
 
 WorkBuddy 原生 Agent 工具创建的是同一 Native Session 体系内的子 Agent，Adapter 只读投影它们的状态和 Transcript。它们不是 CodexHost 跨 Harness Thread，也不会自动获得其他 Harness 的身份或能力。
 
+子 Agent observer 可以缓存父/子 Transcript 和投影结果；每次 `read` / `locate` 的父历史缓存命中仍经过公共根解析和同一发行身份校验。即使父历史文件版本未变，根快照改为外版后也不会继续读取新追加的子消息；缓存保留文件读取优化，不保存长期有效的根身份判断。
+
 ## 应用版本与手动更新
 
 WorkBuddy 插件通过公共 `installation("check")` 能力查询所选安装的版本，不依赖 ACP 连接成功或登录状态。应用内置 CLI 的 `product.json` 中 `genieVersion` 为桌面应用版本；更新查询复用启动时的安装选择规则，保存的安装路径优先于环境变量与自动发现，不检查另一份默认安装。
@@ -162,16 +191,18 @@ WorkBuddy 插件通过公共 `installation("check")` 能力查询所选安装的
 
 ## 插件、路由与发行
 
-插件源码位于 `packages/adapters/workbuddy`，Manifest、Adapter、Session 和 Native Ref 都使用 `workbuddy` 身份。新 Thread 使用共享 `encodeHarnessPluginRoute` 路由，不新增 WorkBuddy 专用 Host codec 或回退分支。
+插件源码位于 `packages/adapters/workbuddy`（国际版 Manifest 与共用 Adapter）和 `packages/adapters/workbuddy-cn`（国内版 Manifest 与工厂入口）；各自的 Manifest、Adapter、Session 和 Native Ref 使用 `workbuddy` 或 `workbuddy-cn` 身份。新 Thread 使用共享 `encodeHarnessPluginRoute` 路由，不新增 WorkBuddy 专用 Host codec 或回退分支。
 
 插件通过 `scripts/release/harness-plugins.json` 预装。构建产物只包含 Adapter Bundle、Manifest 和资源，不包含 WorkBuddy AI 应用、CLI 二进制或登录态。macOS 与 Linux 用户安装 WorkBuddy App 即获得本集成使用的内置 CLI，但仍须按需完成该 CLI 配置根的首次认证；独立插件根目录也可通过自己的 `enabled.json` 显式启用，但不能与同 ID 的预装副本同时存在。
 
 受管 macOS Remote/SSH Host 与 CodeBuddy 一样必须先在目标 Mac 的 Aqua 登录会话安装并检查 Broker；插件不会退回 SSH 后台进程：
 
 ```sh
-codexhost broker install --harness workbuddy
+codexhost broker install --harness workbuddy      # 国内版使用 --harness workbuddy-cn
 codexhost broker status --harness workbuddy
 ```
+
+两个发行各自拥有独立的 Broker LaunchAgent、descriptor 与 socket，Broker 内同样按发行加载插件。
 
 本集成的产品身份不改变原生所有权：WorkBuddy 认证、数据保留、网络访问和计费仍由 WorkBuddy CLI 负责，codexhost 负责 Thread 映射、公共事件投影和插件生命周期。
 
@@ -198,3 +229,13 @@ codexhost broker status --harness workbuddy
 修复后的 Windows WorkBuddy 5.5.6（内置 CLI 2.137.1、Auto）通过真实 Adapter 验证了中间／末尾 checkpoint Fork、跨目录 Fork、修订最后一轮、单轮修订为空，以及首次 Prompt 前关闭恢复和续写后再次恢复。验收同时检查新增消息父节点、Turn 数量、终态身份、模型可见的保留／排除标记及源历史字节不变，而不只检查打开成功。取消后继续对话和递归 Fork 的首条续写也通过；但“取消 → 继续 → 递归 Fork → 关闭恢复原分支”的组合出现回复已落盘、Host Turn 仍未在 60 秒内结束的情况，该组合仍待定位，不宣称所有组合已稳定。修复后的 macOS 在线路径尚未复测。
 
 危险权限、真实跨 Harness 委派、压缩及子 Agent 的在线行为尚未在本轮验收。Fork、修订、命令、委派、Adapter、插件加载、发行 Bundle、Host 路由和 Desktop 的自动化验证使用受控 fixture；实际结果以对应验证报告为准，不能由本文替代。
+
+2026-11-14 在 macOS 27.2 上只做静态核对：本机安装的 WorkBuddy AI 5.7.6（内置 CLI 2.168.0）与 WorkBuddy 5.6.2（内置 CLI 2.147.0）的 `product.json` 分别声明各自发行，两个 Harness 的发现各自解析到对应应用、内置 CLI 与数据根；没有启动 CLI、创建会话或使用真实账号，国内版在线能力仍以前述未验证范围为限。
+
+2026-10-01 拆分国内版身份时，以受控 fixture 覆盖 macOS/Windows 仅装一版、两版同装、显式目录/Desktop/独立 CLI 的正确与错误发行、普通 CodeBuddy 拒绝、数据根在子进程/产品快照/历史间一致、跨身份 Native Ref 拒绝、插件加载与发行预装、Renderer 路由与按 Agent 的选择状态；同一批受控 fixture 另覆盖两版数据根覆盖同时或单独存在、继承的文件/内联产品配置与根下快照声明另一发行时拒绝、无身份字段的局部配置保留。国内版 5.6.2（内置 CLI 2.147.0）的真实对话、历史、Fork/修订与 Windows 安装布局尚未在线验收；受控 fixture 不代表真实产品验收。
+
+2026-11-15，`bc441fa0f` 已包含显式局部/空配置叠加错误数据根的拒绝断言；这些新增回归不属于 10 月 1 日的历史记录。在该 HEAD 上增加真实文件回归，确认独立 CLI 两种配置、快照 `0644`、根 `0775`、根/cache/快照符号链接仍可绕过，两版共 14 条失败。对应回归保存在 `packages/adapters/workbuddy/test/root-isolation.test.ts`，同时覆盖自动发现、显式应用目录/Desktop、各显式配置来源和有效对照；修订采用独立于转发资格的根身份校验。最终提交与逐项执行结果随交付记录，不作为国内版在线验收证据。
+
+2026-11-16，在 `0a673d3e8` 上通过真实插件工厂复现两版导入列表/解析、统计枚举/直接读取的外版根泄漏，以及持久化统计 source ID 越出所选根，共 10 条失败；FIFO 快照在有界子进程中超时。回归位于国内版 `test/data-consumers.test.ts` 与共用 WorkBuddy `test/nonregular-snapshot.test.ts`。修订将这些能力接到同一根校验，并在快照读取前确认普通文件；启动矩阵扩展到两版共 54 种，含 ephemeral、原生管理参数、独立 CLI 链接和同版不转发对照。上述均为受控文件验证，没有启动真实 CLI。
+
+2026-11-16，在 `3acf888f7` 上预热同一 observer 的父/子缓存，保持父历史不变，把根快照改为外版并追加子消息，两版的 `read` / `locate` 共 4 条拒绝断言失败。回归位于 `packages/adapters/codebuddy/test/workbuddy-root-cache.test.ts`；修订让缓存命中继续调用现有公共根解析，不增加身份规则、监听或缓存失效机制。该验证没有启动 CLI 或 Host。
