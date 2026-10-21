@@ -22,6 +22,11 @@ export interface RendererHarnessMessages {
   readonly codexUsageGateUnavailable: string;
   readonly modelSelectionRejected: string;
   readonly thinkingSelectionRejected: string;
+  readonly toolParameters: string;
+  readonly toolOutput: string;
+  readonly toolRunning: string;
+  readonly toolCompleted: string;
+  readonly toolFailed: string;
 }
 
 const ENGLISH_HARNESS_MESSAGES: RendererHarnessMessages = Object.freeze({
@@ -42,6 +47,11 @@ const ENGLISH_HARNESS_MESSAGES: RendererHarnessMessages = Object.freeze({
     "Could not separate this Harness from the Codex usage limit in this Desktop version. Codex usage limits still apply to sending.",
   modelSelectionRejected: "Couldn't switch Model",
   thinkingSelectionRejected: "Couldn't switch Thinking option",
+  toolParameters: "Parameters",
+  toolOutput: "Output",
+  toolRunning: "Running",
+  toolCompleted: "Completed",
+  toolFailed: "Failed",
 });
 
 const CHINESE_HARNESS_MESSAGES: RendererHarnessMessages = Object.freeze({
@@ -61,6 +71,11 @@ const CHINESE_HARNESS_MESSAGES: RendererHarnessMessages = Object.freeze({
     "当前 Desktop 版本无法将此 Harness 与 Codex 额度限制分离，发送仍受 Codex 额度限制",
   modelSelectionRejected: "无法切换模型",
   thinkingSelectionRejected: "无法切换思考选项",
+  toolParameters: "参数",
+  toolOutput: "输出",
+  toolRunning: "运行中",
+  toolCompleted: "已完成",
+  toolFailed: "失败",
 });
 
 export function rendererHarnessMessages(locale: RendererSettingsLocale): RendererHarnessMessages {
