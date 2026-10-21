@@ -29,13 +29,15 @@ const macSpec: HarnessDiscoverySpec = {
   },
 };
 
+type WorkBuddyBundle = { executable: string; cli: string };
+
 /** Resolve only within the selected installation; never search PATH or another installation. */
 export function resolveWorkBuddyInstallDirectory(
   directory: string,
   environment: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
   isExecutable: (candidate: string) => boolean,
-): { executable: string; cli: string } | undefined {
+): WorkBuddyBundle | undefined {
   const paths = targetPath(platform);
   const entries =
     platform === "win32"
@@ -49,19 +51,25 @@ export function resolveWorkBuddyInstallDirectory(
       platform,
       isExecutable,
       paths.join(directory, entry),
+      () => true,
     );
     if (bundle) return bundle;
   }
   return undefined;
 }
 
-/** Discover app-owned runtime/script pairs; an unrelated PATH CodeBuddy is never a candidate. */
+/**
+ * Discover app-owned runtime/script pairs; an unrelated PATH CodeBuddy is never a candidate.
+ * Both releases share these layouts, so automatic discovery keeps only bundles whose CLI
+ * `accept`s; an explicit executable is returned as found for the caller's identity check.
+ */
 export function resolveWorkBuddyBundle(
   environment: NodeJS.ProcessEnv,
   platform: NodeJS.Platform,
   isExecutable: (candidate: string) => boolean,
-  explicitExecutable?: string,
-): { executable: string; cli: string } | undefined {
+  explicitExecutable: string | undefined,
+  accept: (cli: string) => boolean,
+): WorkBuddyBundle | undefined {
   const specs: HarnessDiscoverySpec[] =
     platform === "darwin"
       ? [macSpec]
@@ -86,7 +94,7 @@ export function resolveWorkBuddyBundle(
         ? paths.resolve(paths.dirname(candidate), "..", "Resources")
         : paths.join(paths.dirname(candidate), "resources");
     const cli = paths.join(resources, "app.asar.unpacked", "cli", "bin", "codebuddy");
-    if (isExecutable(cli)) return { executable: candidate, cli };
+    if (isExecutable(cli) && accept(cli)) return { executable: candidate, cli };
   }
   return undefined;
 }
