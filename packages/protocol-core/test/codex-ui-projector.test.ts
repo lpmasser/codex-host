@@ -6,6 +6,7 @@ import type {
   HostSubagentDelegationItem,
   HostThreadSnapshot,
   HostToolExecutionItem,
+  HostToolActivity,
 } from "@codexhost/harness-adapter";
 import {
   hostInteractionIdSchema,
@@ -1292,6 +1293,123 @@ describe("Codex UI projector", () => {
       },
     ]);
   });
+
+  it.each<[HostToolActivity, string, Record<string, unknown>]>([
+    [
+      { type: "read", path: "/workspace/file.ts " },
+      "native-tool /workspace/file.ts ",
+      {
+        type: "read",
+        command: "native-tool /workspace/file.ts ",
+        name: "file.ts ",
+        path: "/workspace/file.ts ",
+      },
+    ],
+    [
+      { type: "read", path: "C:\\src\\file.ts" },
+      "native-tool C:\\src\\file.ts",
+      {
+        type: "read",
+        command: "native-tool C:\\src\\file.ts",
+        name: "file.ts",
+        path: "C:\\src\\file.ts",
+      },
+    ],
+    [
+      { type: "listFiles", path: "/workspace" },
+      "native-tool /workspace",
+      { type: "listFiles", command: "native-tool /workspace", path: "/workspace" },
+    ],
+    [
+      { type: "search", query: "needle", path: "/workspace" },
+      "native-tool needle /workspace",
+      {
+        type: "search",
+        command: "native-tool needle /workspace",
+        query: "needle",
+        path: "/workspace",
+      },
+    ],
+    [
+      { type: "search", query: " needle " },
+      "native-tool  needle ",
+      { type: "search", command: "native-tool  needle ", query: " needle ", path: null },
+    ],
+  ])(
+    "projects activity through live, output and history paths (%j)",
+    (activity, command, action) => {
+      const value = projector();
+      const toolId = itemId("native-activity");
+      const item: HostToolExecutionItem = {
+        type: "toolExecution",
+        itemId: toolId,
+        toolName: "native-tool",
+        arguments: {},
+        activity,
+      };
+      const expected = {
+        id: toolId,
+        type: "commandExecution",
+        command,
+        commandActions: [action],
+        processId: null,
+        exitCode: null,
+      };
+      value.project({ type: "turn.started", turnId });
+      expect(value.project({ type: "item.started", turnId, item }).messages).toMatchObject([
+        {
+          method: "item/started",
+          params: { item: { ...expected, status: "inProgress", aggregatedOutput: null } },
+        },
+      ]);
+      const output = { content: [{ type: "text" as const, text: "original output" }] };
+      expect(
+        value.project({
+          type: "item.updated",
+          turnId,
+          itemId: toolId,
+          update: { type: "output.replace", output },
+        }).messages,
+      ).toMatchObject([
+        {
+          method: "item/commandExecution/outputDelta",
+          params: { itemId: toolId, delta: "original output" },
+        },
+      ]);
+      const snapshot = { item: { ...item, output }, outcome: { status: "succeeded" as const } };
+      expect(value.project({ type: "item.completed", turnId, snapshot }).messages).toMatchObject([
+        { method: "item/completed", params: { item: { ...expected, status: "completed" } } },
+      ]);
+      expect(
+        projectHistoricalTurn({
+          turnId,
+          cwd: "/workspace",
+          snapshot: {
+            nativeTurnRef: nativeTurnRefSchema.parse({
+              harnessId: "antigravity",
+              nativeSessionId: "native",
+              nativeTurnKey: "turn:1",
+              formatVersion: 1,
+            }),
+            input: [],
+            items: [snapshot],
+            outcome: { status: "succeeded" },
+          },
+        }),
+      ).toMatchObject({
+        items: expect.arrayContaining([
+          {
+            ...expected,
+            status: "completed",
+            aggregatedOutput: "original output",
+            durationMs: null,
+            source: "agent",
+            cwd: "/workspace",
+          },
+        ]),
+      });
+    },
+  );
 
   it("shows a DSH pwsh command and output in the Command Execution card", () => {
     const value = projector();
