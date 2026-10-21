@@ -16,6 +16,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { HarnessDelegationCoordinator } from "../src/harness-delegation-coordinator.js";
+import type { DelegationPendingQuestion } from "../src/delegation-types.js";
 import { ExternalThreadRepository } from "../src/external-thread-repository.js";
 import { ExternalThreadRuntime, type ExternalThread } from "../src/external-thread-runtime.js";
 
@@ -34,6 +35,7 @@ async function fixture(
   ]);
   const registered: ReturnType<ExternalThreadRuntime["register"]>[] = [];
   const notifications: unknown[] = [];
+  const pending: DelegationPendingQuestion[] = [];
   const runtime = new ExternalThreadRuntime({
     adapters,
     environment,
@@ -73,12 +75,14 @@ async function fixture(
     officialThreadCwd,
     activeOfficialParents: () => [],
     externalThreadBusy,
+    pendingQuestions: () => [...pending],
   });
   return {
     adapter,
     coordinator,
     directory,
     notifications,
+    pending,
     registered,
     repository,
     runtime,
@@ -620,6 +624,45 @@ describe("HarnessDelegationCoordinator", () => {
       await expect(
         value.repository.getDelegationByChild(hostThreadIdSchema.parse(started.threadId)),
       ).resolves.toMatchObject({ status: "running" });
+    } finally {
+      await value.close();
+    }
+  });
+
+  it("reports pending Questions in read and returns from wait without waiting", async () => {
+    const value = await fixture();
+    try {
+      const started = await value.coordinator.start({
+        harnessId: "pi",
+        task: "work",
+        parentThreadId: "parent",
+      });
+      value.pending.push({
+        interactionId: "interaction-1",
+        turnId: started.turnId,
+        request: {
+          questions: [{ id: "decision", question: "Continue?", options: [{ label: "Continue" }] }],
+        },
+      });
+
+      await expect(
+        value.coordinator.read({ threadId: started.threadId, view: "result" }),
+      ).resolves.toMatchObject({
+        status: "running",
+        pendingQuestions: [{ interactionId: "interaction-1" }],
+      });
+      // A pending Question is a ready condition, not a timeout.
+      await expect(
+        value.coordinator.wait({ threadId: started.threadId, view: "result", timeoutMs: 30_000 }),
+      ).resolves.toMatchObject({
+        timedOut: false,
+        pendingQuestions: [{ interactionId: "interaction-1" }],
+      });
+
+      value.pending.length = 0;
+      await expect(
+        value.coordinator.wait({ threadId: started.threadId, view: "result", timeoutMs: 10 }),
+      ).resolves.toMatchObject({ timedOut: true, pendingQuestions: [] });
     } finally {
       await value.close();
     }
