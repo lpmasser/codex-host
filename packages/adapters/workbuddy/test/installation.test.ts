@@ -53,7 +53,7 @@ describe("WorkBuddy desktop application updates", () => {
         canUpdate: false,
         manualUpdateUrl: `${installerRoot}/${target}/WorkBuddy-${target}-5.8.4.41366630-73952edb.${extension}`,
       });
-      expect(mocks.resolve).toHaveBeenCalledWith(environment, { platform });
+      expect(mocks.resolve).toHaveBeenCalledWith(environment, { platform, distribution: "global" });
       expect(fetchText).toHaveBeenCalledWith(
         `https://www.workbuddy.ai/v2/update?platform=workbuddy-${target}`,
       );
@@ -237,10 +237,51 @@ describe("WorkBuddy desktop application updates", () => {
       await expect(adapter.installation("check")).rejects.toThrow("selected installation");
       expect(mocks.resolve).toHaveBeenCalledWith(
         { CODEXHOST_WORKBUDDY_COMMAND: "/saved/install" },
-        { platform: process.platform },
+        { platform: process.platform, distribution: "global" },
       );
     } finally {
       await adapter.close();
     }
+  });
+
+  it("checks the China release through its own launch override and update channel", async () => {
+    mocks.resolve.mockReturnValue({
+      executable: "/Applications/WorkBuddy.app/Contents/MacOS/Electron",
+      bundle: {
+        cli: "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+      },
+    });
+    const readProduct = vi.fn(async () => ({
+      applicationName: "workbuddy",
+      genieVersion: "5.6.2.39298511",
+      updateUrl: "https://www.workbuddy.cn",
+    }));
+    const fetchText = vi.fn(async () =>
+      feed("darwin-arm64", "5.6.2.39458645", "https://download.codebuddy.cn/workbuddy/saas"),
+    );
+    const environment = {
+      CODEXHOST_WORKBUDDY_COMMAND: "/international/install",
+      CODEXHOST_WORKBUDDYCN_COMMAND: "/china/install",
+    };
+    const installation = createWorkBuddyInstallation(environment, {
+      platform: "darwin",
+      arch: "arm64",
+      distribution: "cn",
+      readProduct,
+      fetchText,
+    });
+    await expect(installation("check")).resolves.toMatchObject({
+      currentVersion: "5.6.2",
+      latestVersion: "5.6.2",
+      versionKind: "application",
+      updateAvailable: false,
+    });
+    expect(mocks.resolve).toHaveBeenCalledWith(environment, {
+      platform: "darwin",
+      distribution: "cn",
+    });
+    expect(fetchText).toHaveBeenCalledWith(
+      "https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-arm64",
+    );
   });
 });
