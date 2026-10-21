@@ -830,6 +830,7 @@ describe("macOS Aqua Harness broker", () => {
         : path.join(root, "broker.sock");
     const native = new FakeHarnessAdapter(harnessIdSchema.parse("claude-code"));
     native.supportsSteer = true;
+    native.supportsNativeExecutionLifecycle = true;
     const server = await startHarnessBrokerServer({ descriptorPath, socketPath, adapter: native });
     const adapter = new BrokeredHarnessAdapter({ descriptorPath });
     try {
@@ -843,7 +844,7 @@ describe("macOS Aqua Harness broker", () => {
       })();
       const nativeSession = native.sessions[0];
       if (!nativeSession) throw new Error("No native Session");
-      nativeSession.steerInputProjection = "adapter";
+      expect(opened.value.capabilities.nativeExecutionLifecycle).toBe(true);
       nativeSession.publishActivity("running");
       await vi.waitFor(() =>
         expect(outputs).toContainEqual({
@@ -867,7 +868,16 @@ describe("macOS Aqua Harness broker", () => {
           input: [{ type: "text", text: "now" }],
           clientUserMessageId: "client-message",
         }),
-      ).resolves.toEqual({ ok: true, value: { accepted: true, inputProjection: "adapter" } });
+      ).resolves.toEqual({ ok: true, value: { accepted: true } });
+      const consumed = {
+        type: "input.consumed" as const,
+        consumingTurnId: hostTurnIdSchema.parse("next-native-turn"),
+        inputId: "native-steer-input",
+        input: [{ type: "text" as const, text: "now" }],
+        clientUserMessageId: "client-message",
+      };
+      nativeSession.emitEvent(consumed);
+      await vi.waitFor(() => expect(outputs).toContainEqual({ kind: "event", event: consumed }));
       expect(native.sessions[0]?.steers).toEqual([
         {
           type: "turn.steer",

@@ -161,7 +161,6 @@ export class FakeHarnessSession implements HarnessSession {
   commands?: HarnessCommandCapability;
   readonly interactionResponses: InteractionRespondCommand[] = [];
   readonly steers: TurnSteerCommand[] = [];
-  steerInputProjection?: "adapter";
   readonly outputs: AsyncIterable<HarnessOutput>;
   snapshotReads = 0;
   usageRefreshes = 0;
@@ -209,6 +208,7 @@ export class FakeHarnessSession implements HarnessSession {
     supportsRollbackLastTurn = false,
     permissionModeScope: HarnessPermissionModeScope = "live",
     supportsSteer = false,
+    supportsNativeExecutionLifecycle = false,
   ) {
     this.harnessId = harnessId;
     const availableThinkingOptions = thinkingOptionsForModel(catalog, initialModel);
@@ -231,6 +231,7 @@ export class FakeHarnessSession implements HarnessSession {
       },
       subagents: { observe: false, readTranscript: false },
       ...(supportsSteer ? { steer: true } : {}),
+      ...(supportsNativeExecutionLifecycle ? { nativeExecutionLifecycle: true } : {}),
     };
     this.cwd = cwd;
     this.#catalog = catalog;
@@ -490,7 +491,6 @@ export class FakeHarnessSession implements HarnessSession {
       ok: true,
       value: {
         accepted: true,
-        ...(this.steerInputProjection ? { inputProjection: this.steerInputProjection } : {}),
       },
     };
   }
@@ -1080,6 +1080,7 @@ export class FakeHarnessAdapter implements HarnessAdapter {
   readonly supportsRollbackLastTurn: boolean;
   /** Sessions opened after this is set declare native steering. */
   supportsSteer = false;
+  supportsNativeExecutionLifecycle = false;
   readonly permissionModeScope: HarnessPermissionModeScope;
   inspectionCalls = 0;
   #closePromise: Promise<void> | null = null;
@@ -1357,6 +1358,7 @@ export class FakeHarnessAdapter implements HarnessAdapter {
       this.supportsRollbackLastTurn,
       this.permissionModeScope,
       this.supportsSteer,
+      this.supportsNativeExecutionLifecycle,
     );
     this.sessions.push(session);
     this.#sessionsByNativeId.set(nativeRef.nativeSessionId, session);

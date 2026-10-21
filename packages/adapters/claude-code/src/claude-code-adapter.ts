@@ -554,6 +554,7 @@ class ClaudeHarnessSession implements HarnessSession {
     subagents: { observe: true, readTranscript: true },
     // Claude Code 2.1.280 folds `priority: "next"` into the running Turn. No earlier cutoff is known.
     steer: true,
+    nativeExecutionLifecycle: true,
   };
   readonly commands: HarnessCommandCapability;
   readonly initialState: HarnessSessionState;
@@ -957,7 +958,7 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       };
     }
-    return { ok: true, value: { accepted: true, inputProjection: "adapter" } };
+    return { ok: true, value: { accepted: true } };
   }
 
   /** Built-ins plus the live commands and skills of the started native Session. */
@@ -2149,17 +2150,12 @@ class ClaudeHarnessSession implements HarnessSession {
     if (!pending) return;
     this.#inputs.delete(messageId);
     if (pending.kind === "turn") return;
-    const item = {
-      type: "userMessage" as const,
-      itemId: hostItemIdSchema.parse(messageId),
+    this.#event({
+      type: "input.consumed",
+      consumingTurnId: active.command.turnId,
+      inputId: messageId,
       input: pending.command.input,
       ...(pending.clientUserMessageId ? { clientUserMessageId: pending.clientUserMessageId } : {}),
-    };
-    this.#event({ type: "item.started", turnId: active.command.turnId, item });
-    this.#event({
-      type: "item.completed",
-      turnId: active.command.turnId,
-      snapshot: { item, outcome: { status: "succeeded" } },
     });
   }
 

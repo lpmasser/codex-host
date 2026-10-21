@@ -146,9 +146,9 @@ export interface TurnStartCommand {
 /**
  * Native input, sent only when `capabilities.steer` is true. Acceptance transfers responsibility
  * for executing it once to the Harness, without cancelling the target Turn. Execution may join
- * that Turn or follow it in the next native Turn. The Host normally projects acceptance once;
- * an Adapter that reports inputProjection: "adapter" publishes its own userMessage Item when
- * the consuming Turn is known, including the supplied clientUserMessageId.
+ * that Turn or follow it in the next native Turn. The Host projects acceptance once unless
+ * nativeExecutionLifecycle is declared; those Sessions report input.consumed when the
+ * consuming Turn is known. Adapters do not project steered userMessage Items.
  */
 export interface TurnSteerCommand {
   type: "turn.steer";
@@ -289,8 +289,6 @@ export interface TurnStartAccepted {
 /** Native acceptance, not confirmation of execution in the requested Turn. */
 export interface TurnSteerAccepted {
   accepted: true;
-  /** The Adapter publishes the input Item once its actual native Turn is known. */
-  inputProjection?: "adapter";
 }
 
 export interface TurnCancelAccepted {
@@ -325,7 +323,7 @@ export interface HostAgentMessageItem {
   phase?: "commentary" | "final_answer";
 }
 
-/** Accepted native input, projected once by the Host or the owning Adapter. */
+/** Accepted native input, projected once by the Host. */
 export interface HostUserMessageItem {
   type: "userMessage";
   itemId: HostItemId;
@@ -518,6 +516,19 @@ export interface TurnStartedEvent {
   turnId: HostTurnId;
 }
 
+/**
+ * A nativeExecutionLifecycle Session consumed steered input. Emit after the consuming Turn
+ * starts and before it ends, even when consumption precedes the command receipt. inputId is
+ * unique within the Session and stable for this input; the Host owns its userMessage Item.
+ */
+export interface InputConsumedEvent {
+  type: "input.consumed";
+  consumingTurnId: HostTurnId;
+  inputId: string;
+  input: HostTextInput[];
+  clientUserMessageId?: string;
+}
+
 export interface AutonomousTurnStartedEvent {
   type: "turn.autonomous.started";
   turnId: HostTurnId;
@@ -583,6 +594,7 @@ export type HostEvent =
   | SubagentStateChangedEvent
   | SubagentTranscriptChangedEvent
   | TurnStartedEvent
+  | InputConsumedEvent
   | AutonomousTurnStartedEvent
   | ItemStartedEvent
   | ItemUpdatedEvent

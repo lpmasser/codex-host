@@ -16,6 +16,7 @@ import {
 describe("Native background interaction ownership", () => {
   it("answers a background approval while new work runs and cancels only its old task owner", async () => {
     const fixture = createFixture();
+    fixture.adapter.supportsNativeExecutionLifecycle = true;
     try {
       const threadId = await startPiThread(fixture);
       const first = hostTurnIdSchema.parse(await startPiTurn(fixture, threadId));

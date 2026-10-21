@@ -33,6 +33,7 @@ describe("Native steering", () => {
           api = value;
         },
       });
+      fixture.adapter.supportsNativeExecutionLifecycle = true;
       try {
         const threadId = await startPiThread(fixture);
         const firstTurn = await startPiTurn(fixture, threadId);

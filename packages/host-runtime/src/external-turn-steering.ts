@@ -7,12 +7,12 @@ import type {
   TurnOutcome,
 } from "@codexhost/harness-adapter";
 
+import type { ExternalThreadExecution } from "./external-thread-execution.js";
 import type { TurnProjectionGate } from "./external-thread-runtime.js";
 
 interface SteeringThread {
   id: string;
-  running: boolean;
-  activeTurnId: HostTurnId | null;
+  execution: Pick<ExternalThreadExecution, "running" | "activeTurnId" | "turnBusy">;
   persistenceError: Error | null;
   session: {
     readonly capabilities: Pick<HarnessSessionCapabilities, "steer">;
@@ -137,13 +137,13 @@ export class ExternalTurnSteering {
       }
       if (this.hasPending(thread.id))
         throw new ExternalSteerError(-32072, "External Thread is already changing direction");
-      if (!thread.running || thread.activeTurnId !== input.expectedTurnId) {
+      if (!thread.execution.running || thread.execution.activeTurnId !== input.expectedTurnId) {
         // Do not use Codex's mismatch wording: Desktop automatically retries it against another Turn.
         throw new ExternalSteerError(-32074, "External steering must reference the active Turn");
       }
       const result = thread.session.capabilities.steer
         ? insert({
-            turnId: thread.activeTurnId,
+            turnId: thread.execution.activeTurnId,
             text: input.text,
             ...(input.clientUserMessageId
               ? { clientUserMessageId: input.clientUserMessageId }
@@ -207,7 +207,7 @@ export class ExternalTurnSteering {
     input: SteeringInput,
     start: StartSteeredTurn,
   ): Promise<ExternalSteerStarted> {
-    const turnId = thread.activeTurnId;
+    const turnId = thread.execution.activeTurnId;
     if (!turnId)
       throw new ExternalSteerError(-32074, "External steering must reference the active Turn");
     const terminal = Promise.withResolvers<TurnOutcome>();
@@ -255,7 +255,7 @@ export class ExternalTurnSteering {
           -32074,
           "Previous External Turn identity could not be persisted",
         );
-      if (thread.running || thread.activeTurnId) {
+      if (thread.execution.turnBusy) {
         throw new ExternalSteerError(-32072, "Another External Turn started before replacement");
       }
       // Command discovery can await native data. Recheck cancellation after

@@ -116,6 +116,7 @@ export type {
   TurnStartAccepted,
   TurnStartCommand,
   TurnStartedEvent,
+  InputConsumedEvent,
 } from "./text-session.js";
 
 export const packageMetadata = {

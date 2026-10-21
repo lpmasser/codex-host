@@ -7,6 +7,8 @@ import type {
 
 import { hostTurnIdSchema } from "@codexhost/shared-contracts";
 
+import { ExternalThreadExecution } from "../src/external-thread-execution.js";
+
 import { ExternalTurnSteering } from "../src/external-turn-steering.js";
 
 type Cancel = (command: TurnCancelCommand) => Promise<HarnessResult<TurnCancelAccepted>>;
@@ -18,11 +20,11 @@ function fixture() {
     .mockResolvedValue({ ok: true, value: { cancellationRequested: true } });
   const thread = {
     id: "thread",
-    running: true,
-    activeTurnId: hostTurnIdSchema.parse("old") as ReturnType<typeof hostTurnIdSchema.parse> | null,
+    execution: new ExternalThreadExecution({}),
     persistenceError: null as Error | null,
     session: { capabilities: {} as { steer?: boolean }, execute },
   };
+  thread.execution.requestStarted(hostTurnIdSchema.parse("old"));
   const started = {
     turnId: hostTurnIdSchema.parse("new"),
     gate: { promise: Promise.resolve(), resolve: vi.fn() },
@@ -47,8 +49,7 @@ function fixture() {
     input: [{ type: "text", text: "new input" }],
   };
   const complete = () => {
-    thread.running = false;
-    thread.activeTurnId = null;
+    thread.execution.turnEnded(hostTurnIdSchema.parse("old"));
     coordinator.terminal("thread", "old", { status: "cancelled" });
   };
   return { coordinator, execute, thread, start, started, replaced, insert, params, complete };
@@ -176,8 +177,7 @@ describe("Host stop-then-start coordination", () => {
         f.complete();
         if (reason === "persistence") f.thread.persistenceError = new Error("disk failure");
         else {
-          f.thread.activeTurnId = hostTurnIdSchema.parse("autonomous");
-          f.thread.running = true;
+          f.thread.execution.turnStarted(hostTurnIdSchema.parse("autonomous"));
         }
       }
       await rejected;

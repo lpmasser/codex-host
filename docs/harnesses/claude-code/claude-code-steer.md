@@ -6,7 +6,7 @@ Claude Code 使用一个常驻 Agent SDK Query。输入的提交、原生接收�
 
 普通 start 在已观测到原生执行时返回 busy；尚未观测到先行自主段的窗口里，已提交输入以 `priority: "later"` 排队。Host 保留接纳中的请求，实际执行指针由 `turn.started` 更新。因此自主段 A 可以正常输出和结束，待执行输入 B 不会接收 A 的事件。
 
-steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifecycle queued` 确认原生已接收，Host 返回 `nativeAccepted`，不承诺同轮执行；`started` 可能在当前执行段内发生，也可能在下一段之前发生。Adapter 按真实消费位置发布 `userMessage` Item，保留 Desktop 的客户端消息 ID；Host 看到 `inputProjection: "adapter"` 后不重复投影；顺延到下一 Turn 时也只发布一次输入 Item。
+steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifecycle queued` 确认原生已接收，Host 返回 `nativeAccepted`，不承诺同轮执行；`started` 可能在当前执行段内发生，也可能在下一段之前发生。Claude Session 声明 `nativeExecutionLifecycle: true`，Adapter 在原生消费时上报 `input.consumed`，携带输入身份、内容、`consumingTurnId` 及 Desktop 的客户端消息 ID。Host 在该 Turn 上统一发布 `userMessage`，同一输入只发布一次；Adapter 不发布插话 Item。
 
 旧 Result 不撤销已提交输入，也不清除尚待到达的接受回执。10 秒未确认时报告“输入仍可能执行”，不自动重发。Result 中的输入 UUID 不用于重新归属已经交付的输出。
 
@@ -14,7 +14,7 @@ steer 使用 `priority: "next"` 和 `origin: { kind: "human" }`。`command_lifec
 
 每个原生主段只有一个 accumulator，工具开始与返回由它持续配对，Result 后释放。root init 建立段；嵌套 init 不启动主段。自主段的首个执行输出才建立可见 Turn；仅有 init 和成功 Result、没有用户输入或实际输出的空段不创建空 Turn。失败和交互仍正常呈现。
 
-开启 `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` 后，原生 `session_state_changed` 提供 running、requires_action、idle。Adapter 要求初始化提供 Session 活动状态，并在 init 上检查 `msg_lifecycle_v1` 能力；不再用 held 或静默计时器判断续跑结束。Host 分别维护待开始的请求、当前执行和原生活动状态。
+开启 `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1` 后，原生 `session_state_changed` 提供 running、requires_action、idle。Adapter 要求初始化提供 Session 活动状态，并在 init 上检查 `msg_lifecycle_v1` 能力；不再用 held 或静默计时器判断续跑结束。Host 的 `ExternalThreadExecution` 统一维护待开始请求、当前执行和原生活动，派生 running 与输入 busy。该路径仅为声明 `nativeExecutionLifecycle` 的 Session 启用；其他 Harness 仍在请求接纳时成为 active。
 
 后台 Agent/Bash 和 Workflow 运行的任务寿命独立于主段。后台 Agent 仍运行时，原生 Session 可在主段结束后继续报告 running；这用于活动状态和保活，不占用新输入入口。没有活动主段或待开始输入时，Desktop 和委派入口都可以接纳下一条输入。原生 idle 不意味着后台 Bash 已停止；后台事件和进程保活继续由任务事实驱动。Workflow 进度是会话级事实，已转入后台的运行在其回合结束后继续报告智能体状态。取消活动回合时，中断主段之外还显式停止本回合启动的后台 Agent 与 Workflow，并等原生确认任务结束；未确认时关闭进程。原生 Tool 调用 ID 同时用于实时和历史 Tool Item 身份，避免自主段尚未取得持久输入 ID 时生成不一致的工具标识。
 

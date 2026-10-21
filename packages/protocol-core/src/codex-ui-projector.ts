@@ -787,6 +787,10 @@ export class CodexTurnProjector {
     return this.#completed;
   }
 
+  hasItem(itemId: HostItemId): boolean {
+    return this.#items.has(itemId);
+  }
+
   /** A completed Turn still owns detached Items that have not settled. */
   get hasOpenDetachedItems(): boolean {
     return (

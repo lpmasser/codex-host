@@ -850,6 +850,7 @@ describe("Claude Code HarnessAdapter", () => {
       history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
       subagents: { observe: true, readTranscript: true },
       steer: true,
+      nativeExecutionLifecycle: true,
     });
     const iterator = session.outputs[Symbol.asyncIterator]();
     await expect(
@@ -886,13 +887,17 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
-  it("projects a steer in the Turn that consumes it", async () => {
+  it("reports the consuming Turn without publishing steered userMessage Items", async () => {
     const { adapter, transports } = fixture();
     const session = await openSession(adapter);
     const outputs: HarnessOutput[] = [];
     const consuming = (async () => {
       for await (const output of session.outputs) outputs.push(output);
     })();
+    const consumed = () =>
+      outputs.flatMap((output) =>
+        output.kind === "event" && output.event.type === "input.consumed" ? [output.event] : [],
+      );
     const started = session.execute(textTurn("turn-1"));
     await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
     await started;
@@ -900,6 +905,7 @@ describe("Claude Code HarnessAdapter", () => {
       type: "turn.steer",
       turnId: hostTurnIdSchema.parse("turn-1"),
       input: [{ type: "text", text: "steer this" }],
+      clientUserMessageId: "client-steer",
     });
     await vi.waitFor(() => expect(transports[0]?.steers).toHaveLength(1));
     expect(transports[0]?.steers).toEqual([
@@ -908,11 +914,16 @@ describe("Claude Code HarnessAdapter", () => {
     transports[0]?.recordSteer("claude-id-3");
     await expect(steer).resolves.toEqual({
       ok: true,
-      value: { accepted: true, inputProjection: "adapter" },
+      value: { accepted: true },
     });
     expect(outputs.filter(hasUserMessageItem)).toHaveLength(0);
     await transports[0]?.handler({ type: "input.started", segmentId: 1, messageId: "claude-id-3" });
-    await vi.waitFor(() => expect(outputs.filter(hasUserMessageItem)).toHaveLength(2));
+    await vi.waitFor(() => expect(consumed()).toHaveLength(1));
+    expect(consumed()[0]).toMatchObject({
+      consumingTurnId: "turn-1",
+      clientUserMessageId: "client-steer",
+      inputId: "claude-id-3",
+    });
     await expect(session.execute(textTurn("turn-2"))).resolves.toMatchObject({
       ok: false,
       error: { code: "sessionBusy" },
@@ -945,7 +956,7 @@ describe("Claude Code HarnessAdapter", () => {
     transports[0]?.recordSteer(lateId);
     await expect(missed).resolves.toMatchObject({
       ok: true,
-      value: { inputProjection: "adapter" },
+      value: { accepted: true },
     });
     const transport = transports[0];
     if (!transport) throw new Error("Missing transport");
@@ -976,27 +987,13 @@ describe("Claude Code HarnessAdapter", () => {
         input: [{ type: "text", text: "closed" }],
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
-    expect(outputs.filter(hasUserMessageItem)).toHaveLength(4);
-    const inputs = outputs.filter(
-      (o) =>
-        o.kind === "event" &&
-        o.event.type === "item.started" &&
-        o.event.item.type === "userMessage",
-    );
-    expect(
-      new Set(
-        inputs.map((o) => (o.kind === "event" && "turnId" in o.event ? o.event.turnId : null)),
-      ).size,
-    ).toBe(2);
-    expect(
-      inputs.flatMap((output) =>
-        output.kind === "event" &&
-        output.event.type === "item.started" &&
-        output.event.item.type === "userMessage"
-          ? output.event.item.input.map((input) => input.text)
-          : [],
-      ),
-    ).toEqual(["steer this", "late"]);
+    expect(outputs.filter(hasUserMessageItem)).toHaveLength(0);
+    expect(consumed()).toHaveLength(2);
+    expect(new Set(consumed().map((event) => event.consumingTurnId)).size).toBe(2);
+    expect(consumed().flatMap((event) => event.input.map((input) => input.text))).toEqual([
+      "steer this",
+      "late",
+    ]);
     await consuming;
     await adapter.close();
   });

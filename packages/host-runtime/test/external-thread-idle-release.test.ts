@@ -117,9 +117,9 @@ describe("external Thread idle release", () => {
       reason: "timeout",
       inactiveMs: 9 * MINUTE,
     });
-    f.thread.running = true;
+    f.thread.execution.subagentChanged(true);
     expect(f.idle.list()[0]).toMatchObject({ state: "running", reason: "operation" });
-    f.thread.running = false;
+    f.thread.execution.subagentChanged(false);
     f.canRelease.mockReturnValue(false);
     expect(f.idle.list()[0]).toMatchObject({ state: "busy", reason: "background" });
     f.canRelease.mockReturnValue(true);
@@ -184,8 +184,8 @@ describe("external Thread idle release", () => {
     "hostBusy",
   ])("does not release when blocked by %s", async (reason) => {
     const f = await fixture();
-    if (reason === "running") f.thread.running = true;
-    if (reason === "activeTurn") f.thread.activeTurnId = "turn" as typeof f.thread.activeTurnId;
+    if (reason === "running") f.thread.execution.subagentChanged(true);
+    if (reason === "activeTurn") f.thread.execution.turnStarted(hostTurnIdSchema.parse("turn"));
     if (reason === "creating") f.thread.record = { ...f.thread.record, state: "creating" };
     if (reason === "identity")
       f.thread.record = { ...f.thread.record, nativeSessionRef: undefined } as StoredThreadRecordV1;
