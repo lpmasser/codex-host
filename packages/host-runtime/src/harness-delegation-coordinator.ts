@@ -35,8 +35,6 @@ import {
   type HarnessInspectInput,
   type HarnessInspectResult,
   type HarnessListResult,
-  type ThreadAnswerInput,
-  type ThreadAnswerResult,
   type ThreadCancelInput,
   type ThreadCancelResult,
   type ThreadListInput,
@@ -136,7 +134,6 @@ export class HarnessDelegationCoordinator {
   readonly #activeOfficialParents: () => string[];
   readonly #externalThreadBusy: (thread: ExternalThread) => boolean;
   readonly #pendingQuestions: (threadId: string) => DelegationPendingQuestion[];
-  readonly #answerQuestion: (input: ThreadAnswerInput) => Promise<ThreadAnswerResult>;
 
   constructor(input: {
     adapters: Map<ExternalHarnessId, HarnessAdapter>;
@@ -167,7 +164,6 @@ export class HarnessDelegationCoordinator {
     activeOfficialParents(): string[];
     externalThreadBusy(thread: ExternalThread): boolean;
     pendingQuestions(threadId: string): DelegationPendingQuestion[];
-    answerQuestion(input: ThreadAnswerInput): Promise<ThreadAnswerResult>;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment;
@@ -186,7 +182,6 @@ export class HarnessDelegationCoordinator {
     this.#activeOfficialParents = input.activeOfficialParents;
     this.#externalThreadBusy = input.externalThreadBusy;
     this.#pendingQuestions = input.pendingQuestions;
-    this.#answerQuestion = input.answerQuestion;
   }
 
   async listHarnesses(): Promise<HarnessListResult> {
@@ -547,13 +542,6 @@ export class HarnessDelegationCoordinator {
     threadId: string,
   ): DelegationThreadSnapshot {
     return { ...snapshot, pendingQuestions: this.#pendingQuestions(threadId) };
-  }
-
-  async answer(input: ThreadAnswerInput): Promise<ThreadAnswerResult> {
-    if (typeof input.threadId !== "string" || !input.threadId.trim()) {
-      throw new DelegationControlError("INVALID_ARGUMENT", "Thread identifier is required");
-    }
-    return this.#answerQuestion(input);
   }
 
   async wait(input: ThreadWaitInput): Promise<DelegationThreadSnapshot & { timedOut: boolean }> {

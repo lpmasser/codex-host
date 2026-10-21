@@ -62,6 +62,9 @@ export class QuestionInteractions {
   }
 
   async answer(input: ThreadAnswerInput): Promise<ThreadAnswerResult> {
+    if (typeof input.threadId !== "string" || !input.threadId.trim()) {
+      throw new DelegationControlError("INVALID_ARGUMENT", "Thread identifier is required");
+    }
     if (typeof input.interactionId !== "string" || !input.interactionId.trim()) {
       throw new DelegationControlError("INVALID_ARGUMENT", "Interaction identifier is required");
     }

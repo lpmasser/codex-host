@@ -16,7 +16,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { HarnessDelegationCoordinator } from "../src/harness-delegation-coordinator.js";
-import type { DelegationPendingQuestion, ThreadAnswerInput } from "../src/delegation-types.js";
+import type { DelegationPendingQuestion } from "../src/delegation-types.js";
 import { ExternalThreadRepository } from "../src/external-thread-repository.js";
 import { ExternalThreadRuntime, type ExternalThread } from "../src/external-thread-runtime.js";
 
@@ -36,7 +36,6 @@ async function fixture(
   const registered: ReturnType<ExternalThreadRuntime["register"]>[] = [];
   const notifications: unknown[] = [];
   const pending: DelegationPendingQuestion[] = [];
-  const answers: ThreadAnswerInput[] = [];
   const runtime = new ExternalThreadRuntime({
     adapters,
     environment,
@@ -77,17 +76,6 @@ async function fixture(
     activeOfficialParents: () => [],
     externalThreadBusy,
     pendingQuestions: () => [...pending],
-    answerQuestion: async (input) => {
-      answers.push(input);
-      return {
-        threadId: input.threadId,
-        interactionId: input.interactionId,
-        turnId: "turn-answered",
-        harnessId: "pi",
-        status: "running",
-        next: { read: "read", wait: "wait" },
-      };
-    },
   });
   return {
     adapter,
@@ -95,7 +83,6 @@ async function fixture(
     directory,
     notifications,
     pending,
-    answers,
     registered,
     repository,
     runtime,
@@ -671,22 +658,6 @@ describe("HarnessDelegationCoordinator", () => {
         timedOut: false,
         pendingQuestions: [{ interactionId: "interaction-1" }],
       });
-
-      // The answer goes to the owning Host session with the normalized input.
-      await expect(
-        value.coordinator.answer({
-          threadId: started.threadId,
-          interactionId: "interaction-1",
-          result: { answers: { decision: { answers: ["continue"] } } },
-        }),
-      ).resolves.toMatchObject({ status: "running", interactionId: "interaction-1" });
-      expect(value.answers).toEqual([
-        {
-          threadId: started.threadId,
-          interactionId: "interaction-1",
-          result: { answers: { decision: { answers: ["continue"] } } },
-        },
-      ]);
 
       value.pending.length = 0;
       await expect(
