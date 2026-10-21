@@ -7,6 +7,7 @@ import {
   harnessModelCatalogSchema,
 } from "@codexhost/shared-contracts";
 import { workBuddyInvocation } from "./command.js";
+import type { WorkBuddyDistribution } from "./distribution.js";
 
 const MAX_PRODUCT_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 const PRODUCT_CONFIG_PATH_ENV = "ACC_PRODUCT_CONFIG_PATH";
@@ -73,15 +74,16 @@ async function readProductJson(file: string): Promise<unknown | undefined> {
 }
 
 function bundledFallbackProductPath(invocation: ReturnType<typeof workBuddyInvocation>) {
-  const cli = invocation.arguments[0];
-  if (!cli || cli.startsWith("-")) return;
+  const cli = invocation.bundledCliPath;
+  if (!cli) return;
   return path.join(path.dirname(path.dirname(cli)), "product.json");
 }
 
 export async function loadWorkBuddyProductModels(
   environment: NodeJS.ProcessEnv,
+  distribution: WorkBuddyDistribution,
 ): Promise<WorkBuddyProductModel[]> {
-  const invocation = workBuddyInvocation(environment, true);
+  const invocation = workBuddyInvocation(environment, true, { distribution });
   const productEnvironment = invocation.environment;
   const configuredPath = nonBlank(productEnvironment[PRODUCT_CONFIG_PATH_ENV]);
   if (configuredPath) {

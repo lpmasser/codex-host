@@ -25,6 +25,7 @@ const classes = {
   "kiro-cli": "KiroAdapter",
   codebuddy: "CodeBuddyAdapter",
   workbuddy: "WorkBuddyAdapter",
+  "workbuddy-cn": "WorkBuddyAdapter",
   "cursor-cli": "CursorAdapter",
   hermes: "HermesAdapter",
   qoder: "QoderAdapter",
@@ -103,6 +104,7 @@ describe("installed Harness composition", () => {
     const expected = {
       codebuddy: ["/compact", "/cost"],
       workbuddy: ["/compact", "/init"],
+      "workbuddy-cn": ["/compact", "/init"],
       "cursor-cli": ["/copy-request-id"],
       pi: ["/compact"],
       "claude-code": ["/compact", "/init", "/recap"],
@@ -160,6 +162,7 @@ describe("installed Harness composition", () => {
     ["kiro-cli", "CODEXHOST_KIRO_COMMAND"],
     ["codebuddy", "CODEXHOST_CODEBUDDY_COMMAND"],
     ["workbuddy", "CODEXHOST_WORKBUDDY_COMMAND"],
+    ["workbuddy-cn", "CODEXHOST_WORKBUDDYCN_COMMAND"],
     ["cursor-cli", "CODEXHOST_CURSOR_COMMAND"],
     ["hermes", "CODEXHOST_HERMES_COMMAND"],
     ["qoder", "CODEXHOST_QODER_COMMAND"],
