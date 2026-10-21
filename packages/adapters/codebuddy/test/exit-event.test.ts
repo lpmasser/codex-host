@@ -3,7 +3,12 @@ import { PassThrough } from "node:stream";
 import { describe, it, expect, vi } from "vitest";
 import { CodeBuddyAcpClient } from "../src/acp-client.js";
 const state = vi.hoisted(() => ({ child: undefined as unknown }));
-vi.mock("node:child_process", () => ({ spawn: () => state.child, execFile: vi.fn() }));
+vi.mock("node:child_process", () => ({
+  spawn: () => state.child,
+  execFile: vi.fn((_file, _args, _options, callback) =>
+    callback(new Error("Fixture has no product version"), "", ""),
+  ),
+}));
 vi.mock("../src/command.js", () => ({
   codeBuddyInvocation: () => ({ command: "fixture", arguments: [], environment: {} }),
 }));
@@ -36,6 +41,7 @@ describe("CodeBuddy independent process exit signal", () => {
       });
     try {
       await client.initialize();
+      expect(client.nativeVersion).toBeNull();
       await client.open(process.cwd());
       const rejected = vi.fn();
       const prompt = client.prompt("native", "pending").catch(rejected);

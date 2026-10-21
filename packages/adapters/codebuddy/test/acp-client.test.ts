@@ -17,6 +17,81 @@ const handlers = () => ({
   fault: vi.fn(),
 });
 describe("CodeBuddy ACP process retirement", () => {
+  it("sends session/steer without an underscore prefix", async () => {
+    const callbacks = handlers();
+    const client = new CodeBuddyAcpClient({
+      cwd: process.cwd(),
+      environment: process.env,
+      ephemeral: false,
+      handlers: callbacks,
+    });
+    try {
+      await client.initialize();
+      await client.open(process.cwd());
+      expect(client.nativeVersion).toBeNull();
+      await expect(client.steer("native", "now")).resolves.toEqual({ steered: true });
+      await expect(client.steer("other", "now")).resolves.toEqual({
+        steered: false,
+        reason: "idle",
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("probes the explicit bundled CLI behind an eval preload", async () => {
+    const bundledCliPath = path.resolve("packages/adapters/codebuddy/test/fixtures/acp.mjs");
+    const client = new CodeBuddyAcpClient(
+      { cwd: process.cwd(), environment: process.env, ephemeral: false, handlers: handlers() },
+      undefined,
+      () => ({
+        command: process.execPath,
+        arguments: [
+          "--eval",
+          "void import(require('node:url').pathToFileURL(process.argv[1]).href)",
+          bundledCliPath,
+          "--acp",
+        ],
+        environment: process.env,
+        windowsVerbatimArguments: false,
+        bundledCliPath,
+      }),
+    );
+    try {
+      await client.initialize();
+      expect(client.nativeVersion).toBe("2.147.0");
+      await client.open(process.cwd());
+      await expect(client.steer("native", "now")).resolves.toEqual({ steered: true });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects both prompt and steer when the native steer receipt is missing", async () => {
+    state.scenario = "missing-steer-receipt";
+    const callbacks = handlers();
+    const client = new CodeBuddyAcpClient(
+      { cwd: process.cwd(), environment: process.env, ephemeral: false, handlers: callbacks },
+      150,
+    );
+    try {
+      await client.initialize();
+      await client.open(process.cwd());
+      const prompt = client.prompt("native", "go");
+      const steering = client.steer("native", "now");
+      const settled = await Promise.allSettled([prompt, steering]);
+      expect(settled.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+      for (const result of settled) {
+        if (result.status !== "rejected") throw new Error("Expected native timeout");
+        expect(result.reason.message).toContain("ACP steer timed out");
+      }
+      expect(callbacks.fault).toHaveBeenCalledOnce();
+    } finally {
+      await client.close();
+      state.scenario = "normal";
+    }
+  });
+
   it("settles an accepted prompt on exit even while descendants retain native pipes", async () => {
     state.scenario = "exit-open-pipes";
     const callbacks = handlers();
