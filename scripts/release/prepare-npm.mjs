@@ -764,7 +764,13 @@ if (consoleArguments !== null) {
   // those plugin factories; Claude Code keeps the legacy unlabelled invocation.
   // Install only registers them: the remote Host starts a broker on demand for an
   // installed Harness and the broker exits when idle.
-  const nativeBrokerHarnessIds = ["claude-code", "codebuddy", "workbuddy", "cursor-cli"];
+  const nativeBrokerHarnessIds = [
+    "claude-code",
+    "codebuddy",
+    "workbuddy",
+    "workbuddy-cn",
+    "cursor-cli",
+  ];
   const runNativeBroker = (command) => {
     let index = 0;
     let firstFailure = 0;
