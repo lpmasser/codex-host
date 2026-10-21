@@ -474,7 +474,7 @@ export class HarnessDelegationCoordinator {
     if (thread.record.subagent) {
       throw new DelegationControlError("DELEGATION_FAILED", "Thread is read-only");
     }
-    const turnId = thread.activeTurnId;
+    const turnId = thread.activeTurnId ?? thread.pendingTurnId;
     if (!thread.running || !turnId) {
       let cancelled = false;
       const backgroundTurnIds = [...thread.projectedTurns]

@@ -448,6 +448,36 @@ describe("HarnessDelegationCoordinator", () => {
     }
   });
 
+  it("cancels an accepted Turn before its execution starts", async () => {
+    const value = await fixture();
+    try {
+      const started = await value.coordinator.start({
+        harnessId: "pi",
+        task: "queued input",
+        cwd: "/synthetic",
+        parentThreadId: "parent-thread",
+      });
+      const thread = value.runtime.get(started.threadId);
+      const session = value.adapter.sessions[0];
+      if (!thread || !session) throw new Error("Missing delegated Session");
+      // The Host has accepted the request, but has not received turn.started yet.
+      thread.pendingTurnId = hostTurnIdSchema.parse(started.turnId);
+      thread.activeTurnId = null;
+      const execute = vi.spyOn(session, "execute");
+
+      await expect(value.coordinator.cancel({ threadId: started.threadId })).resolves.toEqual({
+        threadId: started.threadId,
+        turnId: started.turnId,
+        harnessId: "pi",
+        cancelled: true,
+      });
+      expect(execute).toHaveBeenCalledWith({ type: "turn.cancel", turnId: started.turnId });
+      session.completeCancellation();
+    } finally {
+      await value.close();
+    }
+  });
+
   it("rolls back Session, Thread, and Delegation when initial task delivery fails", async () => {
     const value = await fixture(new FailingTurnAdapter(harnessIdSchema.parse("pi")));
     try {

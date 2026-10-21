@@ -118,6 +118,7 @@ import { ClaudeTaskTracker } from "./task-tracker.js";
 import { ClaudeBackgroundCommandItems } from "./background-command-items.js";
 import { ClaudeToolLifecycle } from "./tool-lifecycle.js";
 import { estimateClaudeRequestCostUsd } from "./usage-estimate.js";
+import { claudeInputTerminationReasons } from "./transport.js";
 import type {
   ClaudeAdapterDependencies,
   ClaudeApprovalRequest,
@@ -1407,7 +1408,11 @@ class ClaudeHarnessSession implements HarnessSession {
     if (pendingEntry && transport) {
       try {
         if (await transport.cancelInput(pendingEntry[0])) {
-          await this.#handleNativeEvent({ type: "input.cancelled", messageId: pendingEntry[0] });
+          await this.#handleNativeEvent({
+            type: "input.terminated",
+            messageId: pendingEntry[0],
+            state: "cancelled",
+          });
           return { ok: true, value: { cancellationRequested: true } };
         }
       } catch (error) {
@@ -1681,8 +1686,6 @@ class ClaudeHarnessSession implements HarnessSession {
     if (this.#active !== active || this.#phase === "closed" || this.#phase === "faulted") return;
     switch (event.type) {
       case "segment.started":
-        return;
-      case "subagents.live":
         return;
       case "compaction.started":
         this.#startCompaction(active);
@@ -2216,14 +2219,24 @@ class ClaudeHarnessSession implements HarnessSession {
           throw new Error("Claude input references another execution");
         this.#applyInput(this.#activateExecution(), event.messageId);
         return;
-      case "input.cancelled": {
+      case "input.terminated": {
         const pending = this.#inputs.get(event.messageId);
         this.#inputs.delete(event.messageId);
         if (pending?.kind === "turn")
           this.#event({
             type: "turn.completed",
             turnId: pending.command.turnId,
-            outcome: { status: "cancelled", reason: "Input withdrawn before execution" },
+            outcome:
+              event.state === "refused"
+                ? {
+                    status: "failed",
+                    error: {
+                      code: "nativeFailure",
+                      message: claudeInputTerminationReasons[event.state],
+                      retryable: false,
+                    },
+                  }
+                : { status: "cancelled", reason: claudeInputTerminationReasons[event.state] },
           });
         return;
       }

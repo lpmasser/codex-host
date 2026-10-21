@@ -15,6 +15,8 @@ const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 /** Claude persists each conversation message to the transcript as it emits it. */
 class PersistingQuery extends FakeQuery {
   readonly transcript: Record<string, unknown>[] = [];
+  readonly inputs: SDKUserMessage[] = [];
+  startInputs = true;
   /** Off lets a test model a transcript that lags the live stream. */
   persist = true;
 
@@ -28,6 +30,8 @@ class PersistingQuery extends FakeQuery {
   /** Claude queues, persists and starts each input in its own Segment while no Segment runs. */
   async accept(prompt: AsyncIterable<SDKUserMessage>): Promise<void> {
     for await (const input of prompt) {
+      this.inputs.push(input);
+      if (!this.startInputs) continue;
       this.push({
         type: "command_lifecycle",
         state: "queued",
@@ -468,6 +472,106 @@ describe("Claude live autonomous continuation (issue #495)", () => {
       expect(live.events.some((event) => event.type === "session.faulted")).toBe(false);
     } finally {
       await live.close();
+    }
+  });
+});
+
+describe("Claude native input terminals", () => {
+  it.each([
+    { state: "refused", queued: false, status: "failed" },
+    { state: "discarded", queued: true, status: "cancelled" },
+    { state: "discarded", queued: false, status: "cancelled" },
+  ] as const)(
+    "settles $state input (queued=$queued) without starting a Turn",
+    async ({ state, queued, status }) => {
+      const value = await liveSession();
+      value.fakeQuery.startInputs = false;
+      try {
+        await expect(value.session.execute(textTurn("pending-input"))).resolves.toMatchObject({
+          ok: true,
+        });
+        await vi.waitFor(() => expect(value.fakeQuery.inputs).toHaveLength(1));
+        const command_uuid = value.fakeQuery.inputs[0]?.uuid;
+        if (queued)
+          push(value.fakeQuery, { type: "command_lifecycle", state: "queued", command_uuid });
+        push(value.fakeQuery, { type: "command_lifecycle", state, command_uuid });
+        await vi.waitFor(() =>
+          expect(completion(value.events, "pending-input")).toMatchObject({ outcome: { status } }),
+        );
+        expect(value.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+        expect(
+          value.events.some(
+            (event) =>
+              event.type === "turn.started" ||
+              event.type === "turn.autonomous.started" ||
+              event.type === "session.faulted",
+          ),
+        ).toBe(false);
+        if (state === "refused") {
+          expect(completion(value.events, "pending-input")).toMatchObject({
+            outcome: { error: { code: "nativeFailure", retryable: false } },
+          });
+          value.fakeQuery.startInputs = true;
+          await expect(value.session.execute(textTurn("next-input"))).resolves.toMatchObject({
+            ok: true,
+          });
+          await vi.waitFor(() =>
+            expect(value.events).toContainEqual({ type: "turn.started", turnId: "next-input" }),
+          );
+          result(value.fakeQuery);
+          await vi.waitFor(() =>
+            expect(completion(value.events, "next-input")).toMatchObject({
+              outcome: { status: "succeeded" },
+            }),
+          );
+        }
+      } finally {
+        await value.close();
+      }
+    },
+  );
+
+  it("refuses a steer without completing or duplicating its active Turn", async () => {
+    const value = await liveSession();
+    try {
+      await value.session.execute(textTurn("active"));
+      await vi.waitFor(() =>
+        expect(value.events).toContainEqual({ type: "turn.started", turnId: "active" }),
+      );
+      value.fakeQuery.startInputs = false;
+      const steered = value.session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("active"),
+        input: [{ type: "text", text: "declined input" }],
+      });
+      await vi.waitFor(() => expect(value.fakeQuery.inputs).toHaveLength(2));
+      push(value.fakeQuery, {
+        type: "command_lifecycle",
+        state: "refused",
+        command_uuid: value.fakeQuery.inputs[1]?.uuid,
+      });
+      await expect(steered).resolves.toMatchObject({
+        ok: false,
+        error: {
+          code: "nativeFailure",
+          message: "Claude input was refused by the native receive policy",
+        },
+      });
+      expect(completion(value.events, "active")).toBeUndefined();
+      expect(
+        value.events.some(
+          (event) => event.type === "item.started" && event.item.type === "userMessage",
+        ),
+      ).toBe(false);
+      result(value.fakeQuery);
+      await vi.waitFor(() =>
+        expect(completion(value.events, "active")).toMatchObject({
+          outcome: { status: "succeeded" },
+        }),
+      );
+      expect(value.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    } finally {
+      await value.close();
     }
   });
 });

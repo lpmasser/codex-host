@@ -44,6 +44,7 @@ import {
   claudeUltracodeUnavailableReason,
 } from "./ultracode.js";
 import {
+  claudeInputTerminationReasons,
   type ClaudeApprovalRequest,
   type ClaudeApprovalSuggestionScope,
   type ClaudeSessionEvent,
@@ -1159,11 +1160,15 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       segment.inputIds.push(messageId);
       if (segment.started)
         await this.#emit({ type: "input.started", segmentId: segment.id, messageId });
-    } else if (message.state === "cancelled") {
+    } else if (
+      message.state === "cancelled" ||
+      message.state === "discarded" ||
+      message.state === "refused"
+    ) {
       this.#pendingInputs
         .get(messageId)
-        ?.reject(new Error("Claude input was cancelled before acceptance"));
-      await this.#emit({ type: "input.cancelled", messageId });
+        ?.reject(new Error(claudeInputTerminationReasons[message.state]));
+      await this.#emit({ type: "input.terminated", messageId, state: message.state });
     }
   }
 
@@ -1301,10 +1306,9 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
             nativeEvent.type === "subagent.completed"
               ? this.#sendOutcome(segment, nativeEvent)
               : nativeEvent;
-          // Task levels, settlements, Workflow run progress and model request usage belong to
+          // Task settlements, Workflow run progress and model request usage belong to
           // the Session, not a Segment: a launched run keeps reporting after its Root Segment.
           if (
-            event.type === "subagents.live" ||
             event.type === "subagent.settled" ||
             event.type === "workflow.updated" ||
             event.type === "workflow.activity" ||

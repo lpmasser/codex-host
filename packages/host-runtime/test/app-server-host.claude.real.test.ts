@@ -177,7 +177,7 @@ describe("AppServerHost hermetic Claude projection", () => {
             nativeHandler = handler;
           },
           cancelInput: async (messageId) => {
-            await handler({ type: "input.cancelled", messageId });
+            await handler({ type: "input.terminated", messageId, state: "cancelled" });
             return true;
           },
           hasBackgroundTasks: () => false,

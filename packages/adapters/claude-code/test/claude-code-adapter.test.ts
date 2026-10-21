@@ -64,7 +64,7 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   readonly close = vi.fn(async () => undefined);
   readonly start = vi.fn(async () => undefined);
   readonly cancelInput = vi.fn(async (messageId: string) => {
-    await this.handler({ type: "input.cancelled", messageId });
+    await this.handler({ type: "input.terminated", messageId, state: "cancelled" });
     return true;
   });
   contextUsage: ClaudeTransportContextUsage | null = null;
@@ -136,35 +136,7 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
     if (!pending) throw new Error("No queued steer");
     this.pendingSteers.delete(messageId);
     pending.resolve();
-    if (this.activeSegment === undefined) this.begin([messageId]);
-    else void this.handler({ type: "input.started", segmentId: this.activeSegment, messageId });
   }
-  beginContinuation = (nativeTurnKey?: string) => {
-    const id = this.begin(nativeTurnKey ? [nativeTurnKey] : []);
-    return {
-      onEvent: (event: ClaudeTurnEvent) => this.event(event),
-      onTerminal: async (result: ClaudeTransportTurnResult) => {
-        this.activeSegment = undefined;
-        await this.handler({ type: "segment.completed", segmentId: id, result });
-      },
-    };
-  };
-  async emitAutonomousTurn(turn: {
-    nativeTurnKey?: string;
-    events: ClaudeTurnEvent[];
-    result: ClaudeTransportTurnResult;
-  }): Promise<void> {
-    const observer = this.beginContinuation(turn.nativeTurnKey);
-    for (const event of turn.events) this.event(event);
-    await observer.onTerminal(turn.result);
-  }
-  autonomousTurnHandler = (turn: {
-    nativeTurnKey?: string;
-    events: ClaudeTurnEvent[];
-    result: ClaudeTransportTurnResult;
-  }): void => {
-    void this.emitAutonomousTurn(turn);
-  };
   readonly backgroundRequests = new Set<string>();
   readonly rootRequests = new Map<string, number>();
   event(event: ClaudeTurnEvent): void {
@@ -186,7 +158,6 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
     }
     if (
       event.type === "subagent.settled" ||
-      event.type === "subagents.live" ||
       event.type === "workflow.updated" ||
       event.type === "workflow.activity" ||
       event.type === "usage.request"
@@ -939,6 +910,8 @@ describe("Claude Code HarnessAdapter", () => {
       ok: true,
       value: { accepted: true, inputProjection: "adapter" },
     });
+    expect(outputs.filter(hasUserMessageItem)).toHaveLength(0);
+    await transports[0]?.handler({ type: "input.started", segmentId: 1, messageId: "claude-id-3" });
     await vi.waitFor(() => expect(outputs.filter(hasUserMessageItem)).toHaveLength(2));
     await expect(session.execute(textTurn("turn-2"))).resolves.toMatchObject({
       ok: false,
@@ -974,7 +947,15 @@ describe("Claude Code HarnessAdapter", () => {
       ok: true,
       value: { inputProjection: "adapter" },
     });
-    transports[0]?.finish({ status: "succeeded" });
+    const transport = transports[0];
+    if (!transport) throw new Error("Missing transport");
+    const segmentId = transport.begin([lateId]);
+    transport.activeSegment = undefined;
+    await transport.handler({
+      type: "segment.completed",
+      segmentId,
+      result: { status: "succeeded" },
+    });
     await vi.waitFor(() =>
       expect(
         outputs.some((output) => output.kind === "event" && output.event.type === "turn.completed"),
@@ -1007,6 +988,15 @@ describe("Claude Code HarnessAdapter", () => {
         inputs.map((o) => (o.kind === "event" && "turnId" in o.event ? o.event.turnId : null)),
       ).size,
     ).toBe(2);
+    expect(
+      inputs.flatMap((output) =>
+        output.kind === "event" &&
+        output.event.type === "item.started" &&
+        output.event.item.type === "userMessage"
+          ? output.event.item.input.map((input) => input.text)
+          : [],
+      ),
+    ).toEqual(["steer this", "late"]);
     await consuming;
     await adapter.close();
   });
@@ -2745,28 +2735,42 @@ describe("Claude Code HarnessAdapter", () => {
     transport.finish({ status: "succeeded" });
     expect(await nextEvent(iterator)).toMatchObject({ type: "item.completed" });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.completed" });
-    transport.autonomousTurnHandler?.({
-      nativeTurnKey: "task-notification-1",
-      events: [
-        {
+    {
+      const segmentId = transport.begin(["task-notification-1"]);
+      await transport.handler({
+        type: "thread.event",
+        event: {
           type: "subagent.settled",
           nativeSubagentId: "native-agent-1",
           status: "completed",
           resultSummary: "Inspection complete",
         },
-        {
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
           type: "text.delta",
           messageId: "continuation-assistant",
           delta: "Inspection complete",
         },
-        {
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
           type: "message.completed",
           messageId: "continuation-assistant",
           checkpointId: "continuation-checkpoint",
         },
-      ],
-      result: { status: "succeeded" },
-    });
+      });
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
+    }
     expect(await nextEvent(iterator)).toMatchObject({
       type: "item.completed",
       snapshot: {
@@ -2851,24 +2855,38 @@ describe("Claude Code HarnessAdapter", () => {
     });
     expect(await nextEvent(iterator)).toMatchObject({ type: "turn.completed" });
     transport.running = true;
-    transport.autonomousTurnHandler?.({
-      nativeTurnKey: "task-notification-send",
-      events: [
-        {
+    {
+      const segmentId = transport.begin(["task-notification-send"]);
+      await transport.handler({
+        type: "thread.event",
+        event: {
           type: "subagent.settled",
           nativeSubagentId: "native-agent-1",
           status: "completed",
           resultSummary: "Directory analyzed",
         },
-        {
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
           type: "text.delta",
           messageId: "send-continuation",
           delta: "Directory analyzed",
         },
-        { type: "message.completed", messageId: "send-continuation" },
-      ],
-      result: { status: "succeeded" },
-    });
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: { type: "message.completed", messageId: "send-continuation" },
+      });
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
+    }
     expect(await nextEvent(iterator)).toMatchObject({
       type: "item.completed",
       snapshot: { item: { type: "subagentDelegation" }, outcome: { status: "succeeded" } },
@@ -2909,28 +2927,42 @@ describe("Claude Code HarnessAdapter", () => {
     await nextEvent(iterator);
     await nextEvent(iterator);
 
-    transport.autonomousTurnHandler?.({
-      nativeTurnKey: "task-notification-1",
-      events: [
-        {
+    {
+      const segmentId = transport.begin(["task-notification-1"]);
+      await transport.handler({
+        type: "thread.event",
+        event: {
           type: "subagent.settled",
           nativeSubagentId: "native-agent-1",
           status: "completed",
           resultSummary: "Analysis complete",
         },
-        {
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
           type: "text.delta",
           messageId: "autonomous-assistant",
           delta: "Background analysis result",
         },
-        {
+      });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
           type: "message.completed",
           messageId: "autonomous-assistant",
           checkpointId: "autonomous-checkpoint",
         },
-      ],
-      result: { status: "succeeded" },
-    });
+      });
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
+    }
     expect(await nextEvent(iterator)).toMatchObject({
       type: "subagent.state.changed",
       nativeSubagentId: "native-agent-1",
@@ -3110,13 +3142,22 @@ describe("Claude Code HarnessAdapter", () => {
                 turnId: hostTurnIdSchema.parse("racing-request"),
                 commandId: "claude.compact",
               });
-        const continuation = transport.beginContinuation("racing-continuation");
+        const segmentId = transport.begin(["racing-continuation"]);
         await expect(admission).resolves.toMatchObject({
           ok: false,
           error: { code: "sessionBusy", retryable: true },
         });
-        continuation.onEvent({ type: "text.delta", messageId: "continuation", delta: "PRESERVED" });
-        await continuation.onTerminal({ status: "succeeded" });
+        await transport.handler({
+          type: "segment.event",
+          segmentId,
+          event: { type: "text.delta", messageId: "continuation", delta: "PRESERVED" },
+        });
+        transport.activeSegment = undefined;
+        await transport.handler({
+          type: "segment.completed",
+          segmentId,
+          result: { status: "succeeded" },
+        });
         await vi.waitFor(() =>
           expect(events.some((event) => event.type === "turn.completed")).toBe(true),
         );
@@ -3170,32 +3211,46 @@ describe("Claude Code HarnessAdapter", () => {
           expect(events.some((event) => event.type === "turn.completed")).toBe(true),
         );
         events.length = 0;
-        transport.autonomousTurnHandler?.({
-          nativeTurnKey: "continuation-with-child",
-          events: [
-            {
+        {
+          const segmentId = transport.begin(["continuation-with-child"]);
+          await transport.handler({
+            type: "segment.event",
+            segmentId,
+            event: {
               type: "subagent.started",
               operation: "spawn",
               callId: "spawn-child",
               description: "Inspect",
               background: true,
             },
-            {
+          });
+          await transport.handler({
+            type: "segment.event",
+            segmentId,
+            event: {
               type: "subagent.completed",
               callId: "spawn-child",
               isError: false,
               continuesInBackground: true,
               nativeSubagentId: "fast-child",
             },
-            {
+          });
+          await transport.handler({
+            type: "thread.event",
+            event: {
               type: "subagent.settled",
               nativeSubagentId: "fast-child",
               status,
               resultSummary: "Child finished",
             },
-          ],
-          result: { status: "succeeded" },
-        });
+          });
+          transport.activeSegment = undefined;
+          await transport.handler({
+            type: "segment.completed",
+            segmentId,
+            result: { status: "succeeded" },
+          });
+        }
         await vi.waitFor(() =>
           expect(events.some((event) => event.type === "turn.completed")).toBe(true),
         );
@@ -3296,11 +3351,20 @@ describe("Claude Code HarnessAdapter", () => {
       nativeSubagentId: "native-child",
       status: "completed",
     });
-    await transport.emitAutonomousTurn({
-      nativeTurnKey: "notification",
-      events: [{ type: "text.delta", messageId: "reply", delta: "done" }],
-      result: { status: "succeeded" },
-    });
+    {
+      const segmentId = transport.begin(["notification"]);
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: { type: "text.delta", messageId: "reply", delta: "done" },
+      });
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
+    }
     await transport.handler({ type: "activity.changed", activity: "idle" });
     await vi.waitFor(() => expect(terminals()).toHaveLength(2));
     expect(
@@ -3330,19 +3394,37 @@ describe("Claude Code HarnessAdapter", () => {
     const transport = transports[0];
     if (!transport) throw new Error("Missing transport");
     transport.finish({ status: "succeeded" });
-    await transport.emitAutonomousTurn({ events: [], result: { status: "succeeded" } });
+    {
+      const segmentId = transport.begin();
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
+    }
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(
       outputs.filter((o) => o.kind === "event" && o.event.type === "turn.autonomous.started"),
     ).toHaveLength(0);
-    await transport.emitAutonomousTurn({
-      events: [],
-      result: { status: "failed", kind: "native" },
-    });
+    {
+      const segmentId = transport.begin();
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "failed", kind: "native" },
+      });
+    }
     await vi.waitFor(() =>
       expect(
         outputs.filter((o) => o.kind === "event" && o.event.type === "turn.autonomous.started"),
       ).toHaveLength(1),
+    );
+    await vi.waitFor(() =>
+      expect(
+        outputs.filter((o) => o.kind === "event" && o.event.type === "turn.completed"),
+      ).toHaveLength(2),
     );
     expect(
       outputs.filter((o) => o.kind === "event" && o.event.type === "turn.completed").at(-1),
@@ -5570,15 +5652,27 @@ describe("Claude Code HarnessAdapter", () => {
             ]
           : [],
       );
-      const handler = transport.beginContinuation?.();
-      if (!handler) throw new Error("Handler missing");
-      handler.onEvent({ type: "text.delta", messageId: "reply", delta: "continued" });
-      handler.onEvent({
-        type: "message.completed",
-        messageId: "reply",
-        checkpointId: "checkpoint",
+      const segmentId = transport.begin();
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: { type: "text.delta", messageId: "reply", delta: "continued" },
       });
-      await handler.onTerminal({ status: "succeeded" });
+      await transport.handler({
+        type: "segment.event",
+        segmentId,
+        event: {
+          type: "message.completed",
+          messageId: "reply",
+          checkpointId: "checkpoint",
+        },
+      });
+      transport.activeSegment = undefined;
+      await transport.handler({
+        type: "segment.completed",
+        segmentId,
+        result: { status: "succeeded" },
+      });
       await vi.waitFor(() => expect(terminals()).toHaveLength(2));
       expect(terminals().at(-1)).toMatchObject({
         event: available

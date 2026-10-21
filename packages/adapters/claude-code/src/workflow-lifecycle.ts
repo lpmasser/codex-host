@@ -22,8 +22,6 @@ interface WorkflowRun {
   /** Opens with the first native task frame, which names the run. */
   item: HostSubagentDelegationItem | null;
   agents: Map<number, HostSubagentState>;
-  /** The Workflow tool returned and the run keeps working in the background. */
-  launched: boolean;
   /** The delegation Item stays open independently of its Root Turn. */
   detached: boolean;
 }
@@ -111,14 +109,14 @@ export class ClaudeWorkflowLifecycle {
   /** Runs whose Workflow tool has not returned yet. */
   get pendingCount(): number {
     let count = 0;
-    for (const run of this.#runs.values()) if (!run.launched) count += 1;
+    for (const run of this.#runs.values()) if (!run.detached) count += 1;
     return count;
   }
 
   /** Native task IDs of the Turn's launched runs still open. */
   taskIds(turnId?: HostTurnId): string[] {
     return [...this.#runs.values()].flatMap((run) =>
-      (turnId === undefined || run.turnId === turnId) && run.launched && run.taskId
+      (turnId === undefined || run.turnId === turnId) && run.detached && run.taskId
         ? [run.taskId]
         : [],
     );
@@ -143,7 +141,6 @@ export class ClaudeWorkflowLifecycle {
       ...(event.name ? { name: event.name } : {}),
       item: null,
       agents: new Map(),
-      launched: false,
       detached: false,
     });
   }
@@ -189,7 +186,6 @@ export class ClaudeWorkflowLifecycle {
     if (event.taskId) run.taskId = event.taskId;
     const item = run.item ?? this.#open(run);
     if (event.background && !event.isError) {
-      run.launched = true;
       run.detached = true;
       this.#emit({ type: "item.detached", turnId: run.turnId, itemId: item.itemId });
       return { callId: run.callId, ...(run.taskId ? { taskId: run.taskId } : {}) };

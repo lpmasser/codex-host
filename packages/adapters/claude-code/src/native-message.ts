@@ -608,23 +608,13 @@ export class ClaudeNativeTurnAccumulator {
     });
   }
 
-  /**
-   * Claude opens one native Segment per Root execution and reports its live
-   * background tasks as a level whose membership replaces the previous set.
-   */
+  /** Claude opens one native Segment per Root execution. */
   #consumeSegmentLevel(message: Record<string, unknown>, events: ClaudeNativeEvent[]): void {
     if (message.type !== "system" || parentToolUseId(message) !== null) return;
     if (message.subtype === "init") {
       events.push({ type: "segment.started" });
       return;
     }
-    if (message.subtype !== "background_tasks_changed" || !Array.isArray(message.tasks)) return;
-    const nativeSubagentIds = message.tasks.flatMap((task) => {
-      if (!isRecord(task)) return [];
-      const taskId = boundedString(task.task_id, SUBAGENT_DESCRIPTION_LIMIT);
-      return taskId ? [taskId] : [];
-    });
-    events.push({ type: "subagents.live", nativeSubagentIds });
   }
 
   #consumeTaskLifecycle(message: Record<string, unknown>, events: ClaudeNativeEvent[]): void {

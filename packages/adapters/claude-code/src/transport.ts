@@ -92,7 +92,6 @@ export interface ClaudeLastRequestUsage {
 
 export type ClaudeTurnEvent =
   | { type: "segment.started" }
-  | { type: "subagents.live"; nativeSubagentIds: string[] }
   | { type: "compaction.started" }
   | { type: "compaction.completed"; outcome: "succeeded" | "failed" }
   | { type: "text.delta"; messageId: string; delta: string }
@@ -225,6 +224,13 @@ export interface ClaudePlanLimitEvent {
   sevenDay?: ClaudePlanLimitWindow;
 }
 
+/** Native input terminals that do not promise execution. */
+export const claudeInputTerminationReasons = {
+  cancelled: "Input withdrawn before execution",
+  discarded: "Claude Session ended before input execution",
+  refused: "Claude input was refused by the native receive policy",
+} as const;
+
 /** Native facts are independent of the input submission that observes them. */
 export type ClaudeSessionEvent =
   | { type: "activity.changed"; activity: "idle" | "running" | "requires_action" }
@@ -232,7 +238,11 @@ export type ClaudeSessionEvent =
   | { type: "segment.event"; segmentId: number; event: ClaudeTurnEvent }
   | { type: "segment.completed"; segmentId: number; result: ClaudeTransportTurnResult }
   | { type: "input.started"; segmentId: number; messageId: string }
-  | { type: "input.cancelled"; messageId: string }
+  | {
+      type: "input.terminated";
+      messageId: string;
+      state: keyof typeof claudeInputTerminationReasons;
+    }
   | { type: "thread.event"; event: ClaudeTurnEvent };
 
 export interface ClaudeTurnTransport {
