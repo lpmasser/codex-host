@@ -10,6 +10,7 @@
     "packages/adapters/kiro-cli",
     "packages/adapters/codebuddy",
     "packages/adapters/workbuddy",
+    "packages/adapters/workbuddy-cn",
     "packages/adapters/cursor-cli",
     "packages/adapters/hermes",
     "packages/adapters/qoder",

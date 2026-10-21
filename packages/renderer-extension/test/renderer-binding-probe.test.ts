@@ -56,7 +56,7 @@ import {
 } from "../src/renderer-usage-control.js";
 
 describe("Renderer connection diagnostics", () => {
-  it.each(["kiro-cli", "codebuddy", "workbuddy"] as const)(
+  it.each(["kiro-cli", "codebuddy", "workbuddy", "workbuddy-cn"] as const)(
     "round trips %s effort without reviving a choice cleared by the native model",
     (agent) => {
       const model = harnessModelRefSchema.parse({ id: "adjustable" });
