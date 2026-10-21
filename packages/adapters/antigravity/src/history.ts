@@ -19,6 +19,8 @@ import {
 } from "@codexhost/shared-contracts";
 import { z } from "zod";
 
+import { classifyAntigravityToolActivity } from "./tool-projection.js";
+
 const HISTORY_VERSION = 1;
 const THREAD_ID_ENV = "CODEXHOST_THREAD_ID";
 
@@ -44,6 +46,15 @@ const imageContentSchema = z.strictObject({
   mimeType: z.string(),
   base64Data: z.string(),
 });
+const hostToolActivitySchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("read"), path: z.string() }),
+  z.strictObject({ type: z.literal("listFiles"), path: z.string() }),
+  z.strictObject({
+    type: z.literal("search"),
+    query: z.string(),
+    path: z.string().optional(),
+  }),
+]);
 const hostItemSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("agentMessage"), itemId: hostItemIdSchema, text: z.string() }),
   z.strictObject({ type: z.literal("reasoning"), itemId: hostItemIdSchema, text: z.string() }),
@@ -64,6 +75,7 @@ const hostItemSchema = z.discriminatedUnion("type", [
     toolName: z.string(),
     namespace: z.string().optional(),
     arguments: jsonValueSchema,
+    activity: hostToolActivitySchema.optional(),
     output: z
       .strictObject({
         content: z.array(z.union([textContentSchema, imageContentSchema])),
@@ -165,6 +177,20 @@ function jsonTurn(turn: AntigravityTurn): JsonValue {
   return JSON.parse(JSON.stringify(turn)) as JsonValue;
 }
 
+function enrichHistoryTurns(turns: AntigravityTurn[]): AntigravityTurn[] {
+  return turns.map((turn) => ({
+    ...turn,
+    items: turn.items.map((snapshot) => {
+      if (snapshot.item.type !== "toolExecution") return snapshot;
+      const item = { ...snapshot.item };
+      const activity = classifyAntigravityToolActivity(item.toolName, item.arguments);
+      if (activity) item.activity = activity;
+      else delete item.activity;
+      return { ...snapshot, item };
+    }),
+  }));
+}
+
 export class AntigravityHistory {
   readonly #file: string | null;
   #nativeSessionId: string | null;
@@ -201,7 +227,7 @@ export class AntigravityHistory {
       try {
         const parsed = historySchema.safeParse(JSON.parse(await readFile(file, "utf8")));
         if (parsed.success && parsed.data.nativeSessionId === nativeSessionId) {
-          turns = parsed.data.turns as AntigravityTurn[];
+          turns = enrichHistoryTurns(parsed.data.turns as AntigravityTurn[]);
           model = parsed.data.model;
           thinkingOptionId = parsed.data.thinkingOptionId;
         }
@@ -269,7 +295,7 @@ export class AntigravityHistory {
           return new AntigravityHistory({
             file,
             nativeSessionId: parsed.data.nativeSessionId,
-            turns: parsed.data.turns as AntigravityTurn[],
+            turns: enrichHistoryTurns(parsed.data.turns as AntigravityTurn[]),
             ...(parsed.data.model ? { model: parsed.data.model } : {}),
             ...(parsed.data.thinkingOptionId
               ? { thinkingOptionId: parsed.data.thinkingOptionId }

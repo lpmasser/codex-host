@@ -3,6 +3,7 @@ import path from "node:path";
 import type {
   HostCommandExecutionItem,
   HostItem,
+  HostToolActivity,
   HostToolExecutionItem,
 } from "@codexhost/harness-adapter";
 import type { HostItemId, JsonValue } from "@codexhost/shared-contracts";
@@ -212,6 +213,46 @@ export function synthesizeAntigravityCommand(
   return null;
 }
 
+export function classifyAntigravityToolActivity(
+  toolName: string,
+  params: unknown,
+): HostToolActivity | undefined {
+  const record = unwrapParameters(params);
+  if (!record) return undefined;
+  const compact = compactToolName(toolName);
+
+  if (compact === "viewfile") {
+    const filePath = extractString(record, ["AbsolutePath"]);
+    if (filePath && filePath.trim().length > 0) {
+      return { type: "read", path: filePath };
+    }
+    return undefined;
+  }
+
+  if (compact === "listdir") {
+    const dirPath = extractString(record, ["DirectoryPath"]);
+    if (dirPath && dirPath.trim().length > 0) {
+      return { type: "listFiles", path: dirPath };
+    }
+    return undefined;
+  }
+
+  if (compact === "grepsearch") {
+    const query = typeof record.Query === "string" ? record.Query : undefined;
+    if (query && query.length > 0) {
+      const searchPath = extractString(record, ["SearchPath"]);
+      return {
+        type: "search",
+        query,
+        ...(searchPath && searchPath.trim().length > 0 ? { path: searchPath } : {}),
+      };
+    }
+    return undefined;
+  }
+
+  return undefined;
+}
+
 export function startAntigravityToolItem(
   newItemId: HostItemId,
   step: AntigravityStepUpdateEvent["step_update"],
@@ -231,11 +272,14 @@ export function startAntigravityToolItem(
     return item;
   }
 
+  const activity = classifyAntigravityToolActivity(toolName, parameters);
+
   const item: HostToolExecutionItem = {
     type: "toolExecution",
     itemId: newItemId,
     toolName,
     arguments: jsonValue(parameters),
+    ...(activity ? { activity } : {}),
   };
   return item;
 }
@@ -273,10 +317,13 @@ export function completeAntigravityToolItem(
   if (item.type === "fileChange") return item;
 
   if (item.type === "toolExecution") {
-    const parameters = step.tool_info?.parameters;
+    const parameters = step.tool_info?.parameters ?? item.arguments;
+    const activity = classifyAntigravityToolActivity(item.toolName, parameters);
     const completed: HostToolExecutionItem = {
       ...item,
-      ...(parameters !== undefined ? { arguments: jsonValue(parameters) } : {}),
+      ...(step.tool_info?.parameters !== undefined
+        ? { arguments: jsonValue(step.tool_info.parameters) }
+        : {}),
       ...(output
         ? {
             output: {
@@ -287,6 +334,8 @@ export function completeAntigravityToolItem(
         : {}),
       ...(durationMs !== undefined ? { durationMs } : {}),
     };
+    if (activity) completed.activity = activity;
+    else delete completed.activity;
     return completed;
   }
 

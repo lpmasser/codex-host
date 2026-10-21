@@ -17,6 +17,7 @@ import { installRendererExternalSteering } from "./renderer-external-steering.js
 import { createRemoteAttachmentSender } from "./renderer-remote-attachments.js";
 import { restoreThreadReferenceCapability } from "./renderer-thread-reference-capability.js";
 import { createThreadReferenceContext } from "./renderer-thread-reference-context.js";
+import { installRendererToolDetails } from "./renderer-tool-details.js";
 import {
   installRendererManualCompaction,
   type RendererMessageTarget,
@@ -28,6 +29,7 @@ import {
 export function createRendererHostClients(
   readRouting: () => RendererHostRouting | undefined,
   messages: RendererMessageTarget | null = null,
+  transcript: Document | null = null,
 ) {
   let disposed = false;
   const entries = new Map<
@@ -156,6 +158,7 @@ export function createRendererHostClients(
             ),
           ),
         () => installRendererManualCompaction(target, route.hostId, messages),
+        () => installRendererToolDetails(target, transcript),
       ]) {
         const cleanup = install();
         if (cleanup) cleanups.add(cleanup);
