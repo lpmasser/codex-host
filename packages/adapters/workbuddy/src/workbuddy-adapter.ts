@@ -1,7 +1,7 @@
 import {
-  CodeBuddyAcpClient,
   CodeBuddyAdapter,
   type CodeBuddyAdapterOptions,
+  type CodeBuddyInvocationFactory,
 } from "@codexhost/adapter-codebuddy";
 import type {
   HarnessInspection,
@@ -12,7 +12,8 @@ import type {
 } from "@codexhost/harness-adapter";
 import { harnessInspectionSchema } from "@codexhost/shared-contracts";
 import { workBuddyInvocation } from "./command.js";
-import { WORKBUDDY_RUNTIME_PROFILE } from "./common.js";
+import { workBuddyRuntimeProfile } from "./common.js";
+import type { WorkBuddyDistribution } from "./distribution.js";
 import {
   loadWorkBuddyProductModels,
   mergeWorkBuddyProductModels,
@@ -25,31 +26,39 @@ export type WorkBuddyAdapterOptions = Omit<
 > & {
   productModels?: () => Promise<readonly WorkBuddyProductModel[]>;
   platform?: NodeJS.Platform;
+  /** The existing `workbuddy` identity is the international release. */
+  distribution?: WorkBuddyDistribution;
 };
 
 export class WorkBuddyAdapter extends CodeBuddyAdapter {
   readonly #productModels: () => Promise<readonly WorkBuddyProductModel[]>;
 
   constructor(options: WorkBuddyAdapterOptions = {}) {
-    const { productModels, platform = process.platform, ...codeBuddyOptions } = options;
+    const {
+      productModels,
+      platform = process.platform,
+      distribution = "global",
+      ...codeBuddyOptions
+    } = options;
     const environment = { ...(codeBuddyOptions.environment ?? process.env) };
+    const baseProfile = workBuddyRuntimeProfile(distribution);
     const profile =
       platform === "win32"
-        ? { ...WORKBUDDY_RUNTIME_PROFILE, allowUnlistedModelSelection: true }
+        ? { ...baseProfile, allowUnlistedModelSelection: true }
         : platform === "linux"
-          ? { ...WORKBUDDY_RUNTIME_PROFILE, defaultConfigDirectoryName: ".workbuddy" }
-          : WORKBUDDY_RUNTIME_PROFILE;
+          ? { ...baseProfile, defaultConfigDirectoryName: ".workbuddy" }
+          : baseProfile;
+    // Session, history copy, Fork and native child processes all start this release only.
+    const invocation: CodeBuddyInvocationFactory = (invocationEnvironment, ephemeral, args) =>
+      workBuddyInvocation(invocationEnvironment, ephemeral, { distribution, platform }, args);
     super({
       ...codeBuddyOptions,
       profile,
-      invocationFactory: workBuddyInvocation,
-      clientFactory:
-        codeBuddyOptions.clientFactory ??
-        ((clientOptions) => new CodeBuddyAcpClient(clientOptions, undefined, workBuddyInvocation)),
+      invocationFactory: invocation,
     });
     this.#productModels =
       platform === "win32"
-        ? (productModels ?? (() => loadWorkBuddyProductModels(environment)))
+        ? (productModels ?? (() => loadWorkBuddyProductModels(environment, distribution)))
         : async () => [];
   }
 
