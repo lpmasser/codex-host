@@ -138,7 +138,7 @@ DeepSeek 的 endpoint 校验、Host 启动、就绪等待和 HTTP/WebSocket 生�
 - 命令明确区分 macOS/Linux 终端与 Windows PowerShell；npm 安装提示 Node.js 前置依赖。页面列出系统选项，不根据本机系统推断远程 Host 的系统。
 - 远程 Host 必须在目标机器操作；Windows 原生 Host 不会自动使用 WSL 中的安装。
 - DeepSeek 安装指引与连接页的“更新 CLI”跟随 npm `latest`；已验证版本列表不是连接白名单。更新验证结果时应同步维护设置页的支持版本说明、插件 notice，以及 Adapter `generation-selector.ts` 中的已验证版本列表（低版本提示使用此列表，升级命令跟随 npm `latest`），参见[版本验证记录](../harnesses/deepseek/dsh-version-validation.md)。通常无需手动运行 `dsh web`。`dsh --version` 成功不代表 Web 插件可启动；诊断报插件加载错误时应核对实际依赖树，放开版本范围不能修复 DSH CLI 自身的启动故障。
-- WorkBuddy 提供 macOS/Windows 官方下载与安装指南，不冒充 CLI npm 包、不提供未经确认的 Linux 安装命令。桌面登录态与内置 CLI 认证不能混为一谈。
+- WorkBuddy 与 WorkBuddy CN 分别引导从 workbuddy.ai / workbuddy.cn 官网下载桌面应用，不冒充 CLI npm 包、不提供未经确认的 Linux 安装命令。桌面登录态与内置 CLI 认证不能混为一谈。
 - Qoder 与 Qoder CN 使用各自安装源和启动命令。
 - 完成安装及原生认证/配置后，用户手动重新检测。复制失败显示反馈；诊断失败仍沿用现有连接错误详情。自定义 WorkBuddy 路径和环境变量变更可能需要重启 codexhost。
 

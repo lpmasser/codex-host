@@ -1375,6 +1375,7 @@ describe("Renderer Connections page", () => {
     ["kiro-cli", "https://kiro.dev/"],
     ["codebuddy", "https://www.codebuddy.ai/"],
     ["workbuddy", "https://www.workbuddy.ai/"],
+    ["workbuddy-cn", "https://www.workbuddy.cn/"],
     ["cursor-cli", "https://cursor.com/"],
     ["devin", "https://devin.ai/"],
     ["hermes", "https://hermes-agent.nousresearch.com/"],
@@ -1451,7 +1452,7 @@ describe("Renderer Connections page", () => {
         descendants(content).some(({ className }) => className === "settings-harness-installation"),
       ).toBe(true);
       const guides = descendants(panel).filter(({ tagName }) => tagName === "a");
-      const desktopApp = agent === "workbuddy" || agent === "zcode";
+      const desktopApp = agent === "workbuddy" || agent === "workbuddy-cn" || agent === "zcode";
       expect(guides).toHaveLength(desktopApp ? 1 : 0);
       if (desktopApp) {
         expect(guides).toMatchObject([
@@ -1466,6 +1467,9 @@ describe("Renderer Connections page", () => {
       if (agent === "workbuddy") {
         expect(visibleText(panel)).toContain("请下载并安装 WorkBuddy 桌面应用。");
         expect(visibleText(panel)).not.toContain("下载与安装指南");
+      }
+      if (agent === "workbuddy-cn") {
+        expect(visibleText(panel)).toContain("不能用 WorkBuddy AI 或 CodeBuddy CLI 代替");
       }
       if (agent === "zcode") expect(visibleText(panel)).toContain("请安装 ZCode Desktop");
       expect(
@@ -1727,7 +1731,7 @@ describe("Renderer Connections page", () => {
     },
   );
 
-  it.each(["workbuddy", "zcode"] as const)(
+  it.each(["workbuddy", "workbuddy-cn", "zcode"] as const)(
     "edits %s launch settings in the local right-side inspector",
     async (agent) => {
       const messages = rendererSettingsMessages("zh-CN");

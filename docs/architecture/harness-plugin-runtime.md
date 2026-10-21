@@ -143,11 +143,11 @@ Codex 的会话用量解析已从公共协议层迁入 `codex-usage`，账户配
 
 `codexhost/harness/launch-settings/get` 接受 `{ harnessId }`，`codexhost/harness/launch-settings/set` 接受 `{ harnessId, path }`；`path: null` 清除设置。返回 `{ path, restartRequired }`。只允许已加载目录中声明该设置的本地插件。保存时校验绝对路径及安装目录存在性，兼容已保存的文件入口，不执行文件，不把保存成功等同于原生协议或认证可用。路径不包含命令行参数或包裹引号。
 
-配置按插件保存到 `${CODEXHOST_DATA_DIR}/harness-launch-settings/<id>.json`，未设置数据目录时使用 `~/.codexhost`；采用临时文件加原子替换，不写 Renderer localStorage，不改进程全局环境。下次 Host 构造插件时，经公共 `HarnessPluginContext.launchCommand` 传给声明支持的工厂。WorkBuddy 工厂将其映射到原生启动配置，优先于继承的命令环境变量；清除设置后恢复环境变量或自动发现。
+配置按插件保存到 `${CODEXHOST_DATA_DIR}/harness-launch-settings/<id>.json`，未设置数据目录时使用 `~/.codexhost`；采用临时文件加原子替换，不写 Renderer localStorage，不改进程全局环境。下次 Host 构造插件时，经公共 `HarnessPluginContext.launchCommand` 传给声明支持的工厂。WorkBuddy 工厂将其映射到所选发行自己的启动配置（`CODEXHOST_WORKBUDDY_COMMAND` / `CODEXHOST_WORKBUDDYCN_COMMAND`），优先于继承的命令环境变量；清除设置后恢复环境变量或自动发现。
 
 设置文件无法读取（非 JSON、不是字符串或不是绝对路径）时，读取错误包含文件路径；Host 不回退到自动发现，而以 `launchSettingsUnreadable` 诊断将该插件标为不可用。保存或清除设置不读取旧文件，直接替换或删除它，因此损坏的文件可在连接设置页或控制台中修复，重启 codexhost 后生效。读取失败不会被永久缓存。
 
-**修改需要重启 codexhost。** 已创建的 Adapter 与 Session 不热替换；`restartRequired` 比较当前持久化值与此 Host 构造时的值。仅刷新连接状态不会应用新路径。设置页填写应用安装目录，例如 `D:\program\WorkBuddy`，不要求用户定位 `.exe` 或脚本。WorkBuddy Adapter 定位 `WorkBuddy.exe` / `WorkBuddy AI.exe` / `WorkBuddyAI.exe` 及同目录内置脚本。目录布局不完整时检查失败，不借用其他安装的文件，也不回退到 PATH 或默认安装。底层保留原有文件入口覆盖兼容能力。注册表自动发现不在本功能范围内。
+**修改需要重启 codexhost。** 已创建的 Adapter 与 Session 不热替换；`restartRequired` 比较当前持久化值与此 Host 构造时的值。仅刷新连接状态不会应用新路径。设置页填写应用安装目录，例如 `D:\program\WorkBuddy`，不要求用户定位 `.exe` 或脚本。WorkBuddy Adapter 定位 `WorkBuddy.exe` / `WorkBuddy AI.exe` / `WorkBuddyAI.exe` 及同目录内置脚本。目录布局不完整或属于另一发行时检查失败，不借用其他安装的文件，也不回退到 PATH 或默认安装。底层保留原有文件入口覆盖兼容能力。注册表自动发现不在本功能范围内。
 
 ## Harness CLI 版本与更新
 
@@ -250,7 +250,7 @@ Qoder 的启动认证失败或消息流意外结束会终结活动 Turn、发布
 
 Qoder 沿用现有公共 Model Catalog 和工具投影契约，不增加专用分组、禁用状态或文件全文字段。模型目录保留 SDK 返回的模型及顺序，不因 `isEnabled` 字段过滤模型；模型选择是否成功由原生接口决定。两版 Adapter 均按工作目录缓存成功目录，不设时间有效期，显式 `refresh` 清除对应缓存；被替代的旧检查不能覆盖新缓存。未指定 `cwd` 的检查使用 Host 当前目录启动探测，但其缓存与显式项目目录分开；`open()` 始终读取或检查 `input.cwd` 对应的目录，不借用 Host 或其他项目的结果。首次检查和显式刷新均先等待 SDK Query 初始化完成，再通过一次 `fetchStrategy: "live"` 获取原生模型目录，不轮询或重试。初始化与模型查询共用 10 秒预算；超时返回不可用，不缓存失败结果，取消并释放探测资源。关闭 Adapter 会取消并等待全部在途检查（包括被刷新替代的旧检查），随后不会发布或缓存迟到结果。普通读取命中 Adapter 缓存时不启动 SDK 查询。不显式选择 Model 时，Session 的 `effectiveModel` 取项目目录的原生默认 Model，目录无默认值时才回落到 `auto`；启动 CLI 时仍省略 `model`，由 CLI 自己决定实际默认配置。Write/Edit 沿用 Pi/OMP 已使用的公共工具投影兼容路径，不增加 namespace 开关或原生 patch 门槛，也不改变其他 Harness 的历史状态投影。
 
-WorkBuddy 以独立的 `workbuddy` 预装插件接入 WorkBuddy AI 随应用分发的 CLI，普通 Session 使用该 CLI 公开的标准 `--acp` stdio 接口；精确 Fork 与修订组合公开 CLI 管理参数、原生命令和公开 rollback 扩展，跨目录时使用受来源与目标校验的临时历史桥接。它可以复用 CodeBuddy ACP 的协议实现，但拥有独立的 Harness ID 和固定安全命令目录；未显式配置时主动注入 `~/.workbuddy-ai`，避免内置 CLI 回退到 `~/.codebuddy`。插件不会自动改用 PATH 中的独立 CodeBuddy。它不连接 WorkBuddy Desktop 私有 owner runtime，不调用私有激活、admission 或 grant 接口，也不能接管 Desktop 已有任务、连接器或登录态。macOS App 已包含所需 CLI；首次 ACP 认证仍按需在 Host 外通过该内置 CLI 完成。详细能力和验证边界见 [WorkBuddy Harness 集成](../harnesses/workbuddy/workbuddy-harness-integration.md)。
+WorkBuddy 以两个独立预装插件接入应用随附的 CLI：`workbuddy`（国际版 WorkBuddy AI，保留原 ID 与设置含义）和 `workbuddy-cn`（国内版 WorkBuddy）。两者共用 `packages/adapters/workbuddy` 的 Adapter，国内版包只提供 Manifest 与工厂入口；发现、显式路径校验、数据根、产品快照、模型目录、历史与 Native Ref 均按发行区分，跨发行 Resume/Fork/Rollback 被拒绝。普通 Session 使用该 CLI 公开的标准 `--acp` stdio 接口；精确 Fork 与修订组合公开 CLI 管理参数、原生命令和公开 rollback 扩展，跨目录时使用受来源与目标校验的临时历史桥接。它可以复用 CodeBuddy ACP 的协议实现，但拥有独立的 Harness ID 和固定安全命令目录；数据根覆盖分别为 `WORKBUDDY_CONFIG_DIR` / `WORKBUDDYCN_CONFIG_DIR`，未配置时分别注入 `~/.workbuddy-ai` / `~/.workbuddy`，启动时再映射为原生单产品变量；声明另一发行的继承产品配置在启动前被拒绝，避免内置 CLI 回退到 `~/.codebuddy`。插件不会自动改用 PATH 中的独立 CodeBuddy。它不连接 WorkBuddy Desktop 私有 owner runtime，不调用私有激活、admission 或 grant 接口，也不能接管 Desktop 已有任务、连接器或登录态。macOS App 已包含所需 CLI；首次 ACP 认证仍按需在 Host 外通过该内置 CLI 完成。详细能力和验证边界见 [WorkBuddy Harness 集成](../harnesses/workbuddy/workbuddy-harness-integration.md)。
 
 ## 公共查询和路由
 
