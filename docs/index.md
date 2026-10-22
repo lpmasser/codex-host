@@ -22,6 +22,7 @@
 | [`architecture/harness-session-import.md`](architecture/harness-session-import.md) | Claude Code、Pi、Hermes、DSH 与 Cursor ACP 本地会话导入契约和恢复边界；扩展导入能力时阅读。 |
 | [`architecture/external-thread-steering.md`](architecture/external-thread-steering.md) | 外部 Thread 按 Session 能力选择原生同轮插入或停止后重发；修改 steering 时阅读。 |
 | [`architecture/delegation-titles.md`](architecture/delegation-titles.md) | 委派子会话标题、子任务显示名、创建快照与重试边界。 |
+| [`architecture/delegation-context.md`](architecture/delegation-context.md) | 可选父会话、实际发送者链接与进行中用户消息读取。 |
 | [`architecture/thread-watch.md`](architecture/thread-watch.md) | 一次性 Thread 停下通知（`thread watch`）的模型、结果、送达与边界；修改委派跟进或通知时阅读。 |
 | [`architecture/official-traffic-ownership.md`](architecture/official-traffic-ownership.md) | Host 只截获自身流量、其余原样转发官方的归属判别与例外；修改请求路由或参数校验时阅读。 |
 | [`architecture/app-server-transport.md`](architecture/app-server-transport.md) | 原生大历史响应的 WebSocket 与 JSONL 传输边界；排查任务加载、消息大小和转发性能时阅读。 |
