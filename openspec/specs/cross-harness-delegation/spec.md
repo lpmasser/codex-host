@@ -107,7 +107,7 @@ codexhost SHALL 从同一权威模板向 `~/.agents/skills/codexhost-delegation/
 - **AND** MUST NOT 因委派默认策略而强制提升普通 Thread 权限
 
 ### Requirement: 委派关系独立持久化且重复请求幂等
-Host SHALL 独立于 Thread 记录持久化 Delegation 关系，包含 Delegation 标识、父子 Thread 标识、父与目标 Harness、状态与可选 Request ID。调用方 SHALL 可以省略 Request ID；省略时 Host SHALL 在一个有界时间窗内依据父 Thread 与任务文本判定重复。Host MUST NOT 依据委派层级拒绝委派。
+Host SHALL 独立于 Thread 记录持久化 Delegation 关系，包含 Delegation 标识、目标 Thread、目标 Harness、状态与可选 Request ID；父 Thread 与来源 Harness SHALL 可省略。调用方 SHALL 可以省略 Request ID；有父时 Host SHALL 在有界时间窗内依据父 Thread 与任务文本判定重复，无父时 SHALL 只按显式 Request ID 去重。Host MUST NOT 依据委派层级拒绝委派。
 
 #### Scenario: 调用方提供重复的 Request ID
 - **WHEN** 调用方以一个已经成功使用过的 Request ID 再次发起委派
@@ -135,7 +135,7 @@ Host SHALL 独立于 Thread 记录持久化 Delegation 关系，包含 Delegatio
 - **AND** 关系记录 MUST NOT 包含会话内容
 
 ### Requirement: 委派 CLI 的运行时连接与调用方身份由 Host 解析
-Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runtime 端点与令牌，并 SHALL 通过显式白名单将这些连接参数放行给官方 App Server 进程。除该白名单外，Host MUST NOT 向官方 App Server 泄漏其他内部环境变量。CLI SHALL 仅使用被提供的连接参数，MUST NOT 自行发现 Runtime、在多个 Runtime 之间选择，或从 PATH 猜测替代 CLI。调用方身份 SHALL 优先取自显式父 Thread 参数，其次取自被提供的 Host Thread 标识，再次由 Host 依据当前活跃 Turn 推断。
+Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runtime 端点与令牌，并 SHALL 通过显式白名单将这些连接参数放行给官方 App Server 进程。除该白名单外，Host MUST NOT 向官方 App Server 泄漏其他内部环境变量。CLI SHALL 仅使用被提供的连接参数，MUST NOT 自行发现 Runtime、在多个 Runtime 之间选择，或从 PATH 猜测替代 CLI。CLI SHALL 从 `CODEXHOST_THREAD_ID` 或原生 `CODEX_THREAD_ID` 读取实际调用方；显式父参数只控制创建关系。没有调用方或显式父参数时 SHALL 创建无父任务，不从活跃 Turn 或 Host 进程环境推断来源。
 
 #### Scenario: 外部 Harness 进程中调用
 - **WHEN** CLI 在 Host 拉起的外部 Harness 进程中被调用且未提供显式父 Thread 参数
@@ -143,7 +143,7 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 
 #### Scenario: 原生 Codex 的工具调用中使用
 - **WHEN** CLI 在允许本地 Runtime 连接的原生 Codex 工具调用中被启动且未提供显式父 Thread 参数
-- **THEN** Host SHALL 将调用方解析为当前唯一存在活跃 Turn 的原生 Thread
+- **THEN** CLI SHALL 从原生 `CODEX_THREAD_ID` 读取调用方
 - **AND** 它 SHALL 通过白名单放行的连接参数连接同一 Runtime
 
 #### Scenario: 原生 Codex 默认沙箱阻止本地连接
@@ -152,10 +152,17 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 - **AND** 错误 SHALL 指示调用方改用允许本地连接的会话沙箱或由用户显式执行命令
 - **AND** MUST NOT 回退到 PATH、另一个 Runtime 或隐式 Host 请求注入
 
-#### Scenario: 调用方身份无法唯一确定
-- **WHEN** 多个原生 Thread 同时存在活跃 Turn 且未提供显式父 Thread 参数
-- **THEN** 命令 SHALL 以可辨识的歧义错误失败
-- **AND** 错误信息 SHALL 指示调用方补充显式父 Thread 参数
+#### Scenario: 普通终端发起独立任务
+- **WHEN** CLI 已能连接 Runtime，但没有调用方线程且没有显式父参数
+- **THEN** SHALL 创建无父任务，不受活跃任务数量影响，不附加发送者链接
+- **AND** Runtime SHALL 使用唯一会话或外部 Harness 的明确 shared owner 承接；承接会话不唯一时明确失败，不猜父任务或任意选择 Host
+- **AND** 无父的 `--watch true` SHALL 报告 `notRegistered` 而不撤销创建
+
+#### Scenario: 发送者与父关系不同
+- **WHEN** 当前调用方通过 `delegate start` 或 `thread send` 交付任务或消息
+- **THEN** CLI SHALL 在正文末尾附带实际调用方的线程链接；缺少调用方时正文不变
+- **AND** 显式父参数和既有父关系 MUST NOT 替代实际发送者
+- **AND** 接收方 SHALL 自行决定是否读取来源对话
 
 #### Scenario: 官方进程环境被检查
 - **WHEN** 传递给官方 App Server 的环境被构造
@@ -183,7 +190,7 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 - **AND** 失败输出 SHALL 携带可辨识的错误代码
 
 ### Requirement: 委派创建与结果观察解耦且不主动注入父 Session
-`codexhost delegate start --harness <harnessId> --task <text> [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>]` SHALL 在创建目标 Session/Thread 并投递任务后立即返回。`--harness` 与 `--task` SHALL 为必填参数；`--parent-thread` SHALL 显式覆盖 Host 推断的调用方 Thread；`--request-id` SHALL 承载调用方提供的幂等标识。发起方 Agent SHALL 可以自主选择通过 `thread read` 读取、通过有界 `thread wait` 等待、通过 `thread watch` 或 `--watch true` 注册一次性停下通知、稍后再次观察，或不再跟踪。除调用方显式注册的 watch 外，Host MUST NOT 在子任务完成后向父 Session 注入结果、唤醒父 Agent 或为此创建自主 Turn。
+`codexhost delegate start --harness <harnessId> --task <text> [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>]` SHALL 在创建目标 Session/Thread 并投递任务后立即返回。`--harness` 与 `--task` SHALL 为必填参数；`--parent-thread` SHALL 显式指定父关系，不改变消息发送者身份；`--request-id` SHALL 承载调用方提供的幂等标识。发起方 Agent SHALL 可以自主选择通过 `thread read` 读取、通过有界 `thread wait` 等待、通过 `thread watch` 或 `--watch true` 注册一次性停下通知、稍后再次观察，或不再跟踪。除调用方显式注册的 watch 外，Host MUST NOT 在子任务完成后向父 Session 注入结果、唤醒父 Agent 或为此创建自主 Turn。
 
 #### Scenario: 委派创建成功返回
 - **WHEN** 调用方执行有效的 `codexhost delegate start --harness <harnessId> --task <text>`
@@ -327,6 +334,12 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 - **AND** 每条消息 SHALL 包含稳定消息标识、所属 `turnId`、`role` 与文本
 - **AND** Agent 消息在 Harness 已投影阶段信息时 MAY 包含 `phase: "commentary"` 或 `phase: "final"`
 - **AND** `messages` SHALL 只包含用户可见输入、Agent 可见中间消息和 Agent 最终消息
+
+#### Scenario: 读取普通 Desktop 会话正在进行的用户输入
+- **WHEN** 普通 Desktop 发起的 Turn 尚未结束，调用方读取 messages 视图
+- **THEN** SHALL 包含本轮已提交的可见用户输入，无需等待原生历史落盘
+- **AND** Turn 完成后的内存快照及历史刷新 SHALL 保留该用户消息，不因输入暂时缺失造成分页漏读或重读
+- **AND** MUST NOT 为读取快照而重复发布 Desktop 已显示的初始用户输入
 
 #### Scenario: 读取增量消息
 - **WHEN** 调用方使用前一次响应的 `nextCursor` 再次执行 `thread read --view messages --cursor <cursor>`

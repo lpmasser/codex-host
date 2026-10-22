@@ -7,17 +7,19 @@ List Harnesses available in the active Runtime.`,
 Read available Models, native defaults, Thinking options, and configuration capabilities.
 Use the returned Model and Thinking IDs for explicit selections.`,
   "delegate start": `codexhost delegate start --harness <id> --task <text> [--task-name <name>] [--cwd <path>] [--model <opaque-ref>] [--thinking <option-id>] [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>] [--format json|compact]
-Create an independent child Thread, submit the task, and return immediately.
+Create an independent Thread, submit the task, and return immediately. A parent is optional.
 --task-name supplies a short subtask name (1-120 characters); otherwise the first task line is used.
-The child title is "subtask name · parent title", fixed at creation; renaming the parent does not rename existing children.
+With a parent, the title is "subtask name · parent title"; without one it is just the subtask name. Titles are fixed at creation.
 Omit --model and --thinking to use the Harness native defaults.
 --cwd overrides the child workspace; a relative path resolves against the caller process cwd. Otherwise use the resolved parent Thread workspace, then the Host Runtime process cwd.
---parent-thread overrides caller inference. PARENT_THREAD_AMBIGUOUS requires an explicit parent.
-Reuse --request-id for an idempotent retry. Identical recent parent/target/task/configuration requests are also deduplicated briefly.
---watch true also registers thread watch on the child with the resolved parent as the notified Thread; the response's watch field reports whether it was registered.
-The response confirms cwd and parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
+--parent-thread sets the creation relationship; otherwise the known caller Thread is used. No caller means no parent. Active Threads and the Host process environment are never used to guess a caller.
+The CLI appends the actual caller's Thread link to the task when known, independently of --parent-thread. It never reads that Thread automatically.
+Reuse --request-id for an idempotent retry with the same parent, sender, task, target and configuration. With a parent, identical recent requests are also deduplicated briefly; without one, only an explicit request ID deduplicates creation.
+--watch true registers notification to the parent. Without a parent the task still starts, but watch reports notRegistered; use thread watch --notify to select a recipient.
+The response confirms cwd and any parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
   "thread send": `codexhost thread send <thread> --message <text> [--format json|compact]
 Start a new Turn in an idle writable Thread and return immediately.
+The CLI appends the actual caller's Thread link when known. A later sender is identified independently of the task's original parent; without caller context the message is unchanged.
 THREAD_BUSY means the current Turn is still active: wait or cancel before sending. Messages are not queued.
 To be notified when that Turn ends, run thread watch after sending.`,
   "thread cancel": `codexhost thread cancel <thread> [--format json|compact]
@@ -26,7 +28,7 @@ cancelled=true (compact: cancelRequested=true) means the cancellation request wa
   "thread read": `codexhost thread read <thread> [--host <hostId>] [--view result|messages] [--cursor <cursor>] [--limit <n>] [--format json|compact]
 Read immediately without starting a Turn. Accepts thread://<id>?hostId=<encoded-host-id> or --host with a bare ID. Explicit remote Hosts use the existing Desktop connection, never local fallback. Requires updated local and remote codexhost; remote send/wait/watch are not supported.
 The default result view reports the latest Turn's status and result.
-The messages view pages visible user/Agent messages, oldest first. Default limit 25, maximum 100; --cursor and --limit require --view messages.
+The messages view includes the current Turn's user input and visible Agent messages, oldest first. Default limit 25, maximum 100; --cursor and --limit require --view messages.
 hasMore describes remaining messages now. Save nextCursor for later incremental reads even when hasMore=false.
 Compact messages output contains only the message page and status; compact result output includes the latest nonempty progress while running.
 Full JSON retains the complete snapshot. Tool calls/output, file activity, and reasoning are not included in either format.`,
@@ -36,7 +38,7 @@ timedOut=true is a running checkpoint: the child keeps running. The response alr
 Message pagination uses --view messages, default limit 25, maximum 100. hasMore is for current pages; nextCursor also supports future incremental reads.`,
   "thread watch": `codexhost thread watch <thread> [--notify <thread>] [--timeout-ms <n>] [--format json|compact]
 Ask the Host to notify one Thread, once, when the watched Thread stops. Returns immediately; no waiting or polling by the caller is needed, and the caller may end its Turn.
---notify defaults to the calling Thread when it is identified (CODEXHOST_THREAD_ID, or CODEX_THREAD_ID in native Codex); otherwise it is required. delegate start reports the caller as its parent.
+--notify defaults to the calling Thread when it is identified (CODEXHOST_THREAD_ID, or CODEX_THREAD_ID in native Codex); otherwise it is required. A task's creation parent can differ from the caller.
 The notification starts a new Turn in the notified Thread with the watched Thread's link and outcome: completed, failed, interrupted, timedOut, unreadable, or notFound; a terminal outcome names the Turn it came from. It reports execution state only; read the Thread to judge the work.
 --timeout-ms defaults to 1740000 (29 min). timedOut means the Thread had not reached a terminal state, which also covers a Harness that stopped without reporting it; watch again to keep waiting. unreadable means reads failed for 60 s, so the state is unknown.
 state=watching means registered. state=alreadyTerminal means the Thread was not running: nothing was registered and nothing will be sent.

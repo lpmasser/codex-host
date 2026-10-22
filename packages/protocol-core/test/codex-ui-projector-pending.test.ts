@@ -7,6 +7,41 @@ const turnId = hostTurnIdSchema.parse("turn-1");
 const itemId = hostItemIdSchema.parse("item-1");
 
 describe("CodexTurnProjector pending Turn", () => {
+  it("retains Desktop-owned input in read and terminal snapshots without publishing it twice", () => {
+    const projector = new CodexTurnProjector({
+      threadId: "thread-1",
+      turnId,
+      cwd: "/synthetic",
+      startedAtMs: 1_000,
+      initialInput: [{ type: "text", text: "Current user request" }],
+      clientUserMessageId: "desktop-message",
+      publishInitialInput: false,
+    });
+    const started = projector.project({ type: "turn.started", turnId });
+    expect(started.messages).toHaveLength(1);
+    expect(started.messages[0]).toMatchObject({
+      method: "turn/started",
+      params: { turn: { items: [] } },
+    });
+    expect(projector.pendingTurn()).toMatchObject({ items: [] });
+    const snapshot = projector.pendingTurn(null, { includeInput: true });
+    expect(snapshot).toMatchObject({
+      items: [
+        { id: `${turnId}-user`, type: "userMessage", content: [{ text: "Current user request" }] },
+      ],
+    });
+    const completed = projector.project({
+      type: "turn.completed",
+      turnId,
+      outcome: { status: "succeeded" },
+    });
+    expect(completed.completedTurn?.items).toEqual(snapshot.items);
+    expect(completed.messages).toHaveLength(1);
+    expect(completed.messages[0]).toMatchObject({
+      method: "turn/completed",
+      params: { turn: { items: [] } },
+    });
+  });
   it("includes explicitly projected input for an externally started Turn", () => {
     const projector = new CodexTurnProjector({
       threadId: "thread-1",

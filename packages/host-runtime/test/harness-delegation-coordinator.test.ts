@@ -81,7 +81,6 @@ async function fixture(
       const metadata = await officialThreadCwd(threadId);
       return typeof metadata === "string" ? { cwd: metadata } : (metadata ?? {});
     },
-    activeOfficialParents: () => [],
     externalThreadBusy,
   });
   return {
@@ -127,6 +126,44 @@ class FailingTurnAdapter extends FakeHarnessAdapter {
 }
 
 describe("HarnessDelegationCoordinator", () => {
+  it("creates independent tasks without inferring an active parent or deduplicating unrelated callers", async () => {
+    const value = await fixture(undefined, undefined, {
+      CODEXHOST_THREAD_ID: "host-process-parent",
+    });
+    try {
+      const ids = new Set<string>();
+      for (let active = 0; active < 3; active++) {
+        const result = await value.coordinator.start({
+          harnessId: "pi",
+          task: "independent task",
+          cwd: "/synthetic",
+        });
+        ids.add(result.threadId);
+        expect(result).not.toHaveProperty("parentThreadId");
+        const record = await value.repository.getDelegationByChild(
+          hostThreadIdSchema.parse(result.threadId),
+        );
+        expect(record).not.toHaveProperty("parentHostThreadId");
+        expect(record).not.toHaveProperty("sourceHarnessId");
+        expect(await value.repository.find(result.threadId)).toMatchObject({
+          title: "independent task",
+        });
+      }
+      expect(ids.size).toBe(3);
+      const request = {
+        harnessId: "pi" as const,
+        task: "retryable task",
+        requestId: "independent-retry",
+      };
+      const first = await value.coordinator.start(request);
+      expect(await value.coordinator.start(request)).toMatchObject({ threadId: first.threadId });
+      await expect(
+        value.coordinator.start({ ...request, parentThreadId: "different-parent" }),
+      ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    } finally {
+      await value.close();
+    }
+  });
   it("carries the display name through the real CLI HTTP endpoint and persists it separately from the task", async () => {
     const value = await fixture(undefined, async () => ({ title: "Main project" }));
     const server = await startDelegationControlServer({
@@ -692,7 +729,6 @@ describe("HarnessDelegationCoordinator", () => {
       });
       const thread = value.registered[0];
       if (!thread) throw new Error("delegated Thread was not registered");
-      expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
       // The Adapter completed the Turn as failed, then its process died.
       thread.running = false;
       thread.activeTurnId = null;
@@ -750,8 +786,6 @@ describe("HarnessDelegationCoordinator", () => {
       thread.running = false;
       thread.activeTurnId = null;
       thread.turns = [{ id: started.turnId, status: "interrupted", items: [] }];
-      // Parent inference must still see the Thread as the active caller.
-      expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
 
       await expect(
         value.coordinator.read({ threadId: started.threadId, view: "result" }),
