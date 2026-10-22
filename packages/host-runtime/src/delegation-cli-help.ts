@@ -16,9 +16,11 @@ Omit --model and --thinking to use the Harness native defaults.
 Reuse --request-id for an idempotent retry. Identical recent parent/target/task/configuration requests are also deduplicated briefly.
 --watch true also registers thread watch on the child with the resolved parent as the notified Thread; the response's watch field reports whether it was registered.
 The response confirms cwd and parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
-  "thread send": `codexhost thread send <thread> --message <text> [--format json|compact]
+  "thread send": `codexhost thread send <thread> --message <text> [--steer true|false] [--format json|compact]
 Start a new Turn in an idle writable Thread and return immediately.
 THREAD_BUSY means the current Turn is still active: wait or cancel before sending. Messages are not queued.
+--steer true instead uses the same adjustment operation as Desktop: native steering where supported, otherwise stop and resend. An idle Thread starts a new Turn. Omitted or false keeps the busy rejection above.
+Success confirms acceptance, not execution in the current Turn or task completion. The CLI reply does not distinguish native acceptance from a replacement Turn; use read/wait to observe the result.
 To be notified when that Turn ends, run thread watch after sending.`,
   "thread cancel": `codexhost thread cancel <thread> [--format json|compact]
 Request cancellation of the active Turn while preserving the Thread and history.
@@ -64,7 +66,7 @@ export const DELEGATION_HELP = `usage:
   codexhost harness list
   codexhost harness inspect <harness>
   codexhost delegate start --harness <id> --task <text>
-  codexhost thread send <thread> --message <text>
+  codexhost thread send <thread> --message <text> [--steer true|false]
   codexhost thread cancel <thread>
   codexhost thread read <thread>
   codexhost thread wait <thread>
