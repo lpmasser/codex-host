@@ -21,6 +21,50 @@ function successfulFetch(body: unknown): typeof fetch {
 }
 
 describe("delegation CLI", () => {
+  it.each([undefined, DELEGATION_THREAD_ID_ENV, NATIVE_CODEX_THREAD_ID_ENV])(
+    "attributes messages to the actual caller (%s), separately from the parent",
+    async (callerVariable) => {
+      const fetchImpl = successfulFetch({ threadId: "child" });
+      const environment = {
+        [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+        [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        ...(callerVariable ? { [callerVariable]: "actual-sender" } : {}),
+      };
+      for (const arguments_ of [
+        [
+          "delegate",
+          "start",
+          "--harness",
+          "pi",
+          "--task",
+          "Task\nDetails",
+          "--task-name",
+          "Short title",
+          "--parent-thread",
+          "relation-parent",
+        ],
+        ["thread", "send", "child", "--message", "Follow-up"],
+      ])
+        expect(
+          await runDelegationCli({
+            arguments: arguments_,
+            environment,
+            output: new PassThrough(),
+            fetchImpl,
+          }),
+        ).toBe(0);
+      const bodies = vi
+        .mocked(fetchImpl)
+        .mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+      const suffix = callerVariable ? "\n\nSender: codex://threads/actual-sender" : "";
+      expect(bodies[0]).toMatchObject({
+        task: `Task\nDetails${suffix}`,
+        taskName: "Short title",
+        parentThreadId: "relation-parent",
+      });
+      expect(bodies[1]).toEqual({ threadId: "child", message: `Follow-up${suffix}` });
+    },
+  );
   it.each([
     ["harness", "list", "--help"],
     ["harness", "inspect", "--help"],
@@ -239,6 +283,7 @@ describe("delegation CLI", () => {
     const body = JSON.parse(String(call[1]?.body));
     expect(body).toMatchObject({
       parentThreadId: "parent-from-environment",
+      task: "review\n\nSender: codex://threads/parent-from-environment",
     });
     expect(body).not.toHaveProperty("cwd");
     expect(body).not.toHaveProperty("model");
@@ -594,6 +639,7 @@ describe("delegation CLI", () => {
       ["thread", "read", "thread-1", "--view", "messages", "--limit", "101"],
     ],
     ["missing send message", ["thread", "send", "thread-1"]],
+    ["blank delegated task", ["delegate", "start", "--harness", "pi", "--task", "  "]],
     ["cancel option", ["thread", "cancel", "thread-1", "--message", "no"]],
     ["invalid list limit", ["thread", "list", "--limit", "101"]],
     ["invalid sort", ["thread", "list", "--sort", "newest"]],
