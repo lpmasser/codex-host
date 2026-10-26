@@ -80,12 +80,14 @@
 | [`harnesses/pi/pi-edit-recovery.md`](harnesses/pi/pi-edit-recovery.md) | Pi 空历史编辑、原生文件发布和生命周期 Gate；修改 Pi 恢复时阅读。 |
 | [`harnesses/pi/pi-subagents.md`](harnesses/pi/pi-subagents.md) | Pi 的 pi-subagents 异步状态、同步 workflow 子任务、记录读取与适配边界。 |
 | [`harnesses/pi/pi-fast.md`](harnesses/pi/pi-fast.md) | Pi Codex Fast 闪电开关、别名 Provider 能力判定、自动加载和 priority 请求边界。 |
+| [`harnesses/pi/pi-steer.md`](harnesses/pi/pi-steer.md) | Pi 原生插话窗口、拒绝与未知回执、历史和实机 Gate。 |
 
 ### OMP
 
 | 文档 | 内容与阅读时机 |
 | --- | --- |
 | [`harnesses/omp/omp-interactions.md`](harnesses/omp/omp-interactions.md) | OMP 原生提问、审批、选项说明和超时语义；维护 OMP 交互时阅读。 |
+| [`harnesses/omp/omp-steer.md`](harnesses/omp/omp-steer.md) | OMP 原生插话窗口、拒绝与未知回执、历史和实机 Gate。 |
 
 ### Grok
 
