@@ -241,6 +241,7 @@ import type {
 import { projectDelegationThreadSnapshot } from "./delegation-snapshot.js";
 import { rememberNativeListSeconds } from "./delegation-thread-list-merge.js";
 import { QuestionInteractions } from "./question-interactions.js";
+import { CodexAsyncQuestions } from "./codex-async-questions.js";
 import {
   canonicalizeOfficialCodexModelRef,
   decodeOfficialCodexModelRef,
@@ -677,6 +678,11 @@ export class AppServerHost {
       this.#writer.json({ method: "serverRequest/resolved", params: { threadId, requestId } }),
     diagnose: (error) => this.#diagnose(error),
   });
+  readonly #asyncQuestions = new CodexAsyncQuestions({
+    questions: this.#questions,
+    activeTurn: (threadId) => this.#activeOfficialTurns.get(threadId),
+    request: (method, params) => this.#requestOfficial(method, params),
+  });
   #nextApprovalRequestId = HOST_APPROVAL_REQUEST_ID_MAX;
   #nextQuestionRequestId = HOST_QUESTION_REQUEST_ID_MAX;
   #delegationCoordinator: HarnessDelegationCoordinator;
@@ -788,6 +794,7 @@ export class AppServerHost {
         this.#signalActiveWorkChanged();
         // A retired process can neither answer nor resolve its server requests.
         this.#officialServerRequests.clear();
+        this.#asyncQuestions.clear();
         void this.#questions.closeWhere((request) => request.harnessId === "codex");
       },
       output: async (output) =>
@@ -926,6 +933,7 @@ export class AppServerHost {
   }
 
   async #closeOfficialRuntime(): Promise<void> {
+    this.#asyncQuestions.clear();
     this.#nativeAccountObserver?.close();
     if (this.#ownsOfficialRuntimeScope) await this.#officialRuntimeScope.close();
     await this.#officialRuntime.close();
@@ -2279,6 +2287,7 @@ export class AppServerHost {
       return;
     }
     try {
+      this.#asyncQuestions.claimDesktop(request);
       // Optional plugin-owned notification subscription options. Never wait for plugin startup
       // here: enhancement must not delay native commands or interrupt handling.
       const options = isRecord(request.params)
@@ -2294,13 +2303,16 @@ export class AppServerHost {
       }
       await this.#officialRuntime.sendFrame(frame);
       this.#markDesktopRequestAnswered(request.id);
-    } catch {
+    } catch (error) {
+      this.#asyncQuestions.forgetDesktopReply(request.id);
       if (request.method === "turn/start") {
         this.#pendingOfficialTurnStarts.delete(request.id);
         this.#signalActiveWorkChanged();
       }
       await this.#writer.json(
-        rpcError(request, -32001, "Official request failed; retry explicitly"),
+        error instanceof DelegationControlError
+          ? rpcError(request, -32602, errorMessage(error))
+          : rpcError(request, -32001, "Official request failed; retry explicitly"),
       );
     }
   }
@@ -2310,10 +2322,12 @@ export class AppServerHost {
     frame: Buffer<ArrayBufferLike>;
     value: JsonValue;
   }): Promise<void> {
+    this.#asyncQuestions.observe(input.value);
     if (this.#options.externalOnly) {
       // Native children created through Delegation still have a native owner
       // and lifecycle. Their rendering stays on the GUI's native connection.
       await this.#observeOfficialTurnLifecycle(input.value);
+      this.#finishOfficialTurn(input.value);
       return;
     }
     const parsed = input.value;
@@ -2372,19 +2386,7 @@ export class AppServerHost {
     } finally {
       // A start response settles only its own request, after the response reaches Desktop.
       this.#observeOfficialTurnStartResponse(parsed);
-      if (
-        isRecord(parsed) &&
-        parsed.method === "turn/completed" &&
-        isRecord(parsed.params) &&
-        typeof parsed.params.threadId === "string"
-      ) {
-        const turn = isRecord(parsed.params.turn) ? parsed.params.turn : null;
-        // An older terminal must not clear a later active Turn or any pending start request.
-        if (turn && this.#activeOfficialTurns.get(parsed.params.threadId) === turn.id) {
-          this.#activeOfficialTurns.delete(parsed.params.threadId);
-        }
-        this.#signalActiveWorkChanged();
-      }
+      this.#finishOfficialTurn(parsed);
     }
     this.#nativeAccountObserver?.observe(parsed);
     const deletedProjectId = observeDeletedProject(parsed);
@@ -2393,6 +2395,17 @@ export class AppServerHost {
         this.#diagnose(error),
       );
     }
+  }
+
+  #finishOfficialTurn(value: JsonValue): void {
+    if (!isRecord(value) || value.method !== "turn/completed" || !isRecord(value.params)) return;
+    const { threadId, turn } = value.params;
+    if (typeof threadId !== "string" || !isRecord(turn)) return;
+    // Run after output is flushed (or immediately for the non-rendering owner).
+    // An old terminal must never clear a newer active Turn.
+    if (this.#activeOfficialTurns.get(threadId) === turn.id)
+      this.#activeOfficialTurns.delete(threadId);
+    this.#signalActiveWorkChanged();
   }
 
   async #requestOfficial(method: string, params: JsonObject): Promise<JsonObject> {

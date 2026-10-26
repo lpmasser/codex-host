@@ -47,10 +47,11 @@ export interface DelegationProgress {
 export interface DelegationPendingQuestion {
   /** Opaque Host request identity accepted by `thread answer --interaction`, not an Adapter ID. */
   interactionId: string;
-  /** Turn that is waiting for this answer. */
+  kind: "requestUserInput" | "requestUserInputAsync";
+  /** Turn that asked the question; asynchronous questions do not pause it. */
   turnId: string;
   expiresAt?: string;
-  /** Unchanged params of the existing requestUserInput request shown to Desktop. */
+  /** Original request params, or one native async question with its source identity. */
   request: JsonObject;
 }
 
@@ -69,7 +70,7 @@ export interface DelegationThreadSnapshot {
   messages?: DelegationMessage[];
   hasMore?: boolean;
   nextCursor: string | null;
-  /** Empty when the Thread is not waiting for an answer. */
+  /** Empty when the Thread has no unanswered questions. */
   pendingQuestions?: DelegationPendingQuestion[];
 }
 
@@ -166,7 +167,7 @@ export interface ThreadAnswerInput {
   threadId: string;
   /** Interaction ID reported by `thread read` in `pendingQuestions`. */
   interactionId: string;
-  /** The existing requestUserInput reply result, passed to its original handler. */
+  /** Existing requestUserInput result, or { answer: string } for a native async question. */
   result: JsonValue;
 }
 

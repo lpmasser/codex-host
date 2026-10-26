@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JsonObject } from "@codexhost/protocol-core";
 import { QuestionInteractions } from "../src/question-interactions.js";
 
-function fixture(options: { expiresAt?: string; gate?: Promise<void> } = {}) {
+function fixture(
+  options: { expiresAt?: string; gate?: Promise<void>; asyncQuestion?: boolean } = {},
+) {
   const effects = {
     run: async <T>(_threadId: string, action: () => Promise<T>): Promise<T> => {
       if (options.gate) await options.gate;
@@ -15,7 +17,8 @@ function fixture(options: { expiresAt?: string; gate?: Promise<void> } = {}) {
   const respond = vi.fn<(reply: JsonObject) => Promise<void>>(async () => undefined);
   const request = { questions: [{ id: "value", question: "Value?", options: null }] };
   questions.register({
-    requestId: -1,
+    requestId: options.asyncQuestion ? "async-question" : -1,
+    kind: options.asyncQuestion ? "requestUserInputAsync" : "requestUserInput",
     threadId: "thread",
     turnId: "turn",
     harnessId: "pi",
@@ -82,6 +85,45 @@ describe("Pending Question ownership", () => {
     await expect(f.answer()).rejects.toMatchObject({ code: "QUESTION_NOT_PENDING" });
     expect(f.respond).toHaveBeenCalledOnce();
     expect(f.effects.resolved).toHaveBeenCalledOnce();
+  });
+
+  it("does not reuse a public credential when a native item identity is registered again", async () => {
+    const f = fixture();
+    const native = {
+      requestId: "native-item",
+      threadId: "thread",
+      turnId: "turn",
+      harnessId: "codex" as const,
+      kind: "requestUserInputAsync" as const,
+      request: { title: "Choose?" },
+      respond: f.respond,
+    };
+    f.questions.register(native);
+    const previous = f.questions
+      .read("thread")
+      .find((question) => question.kind === "requestUserInputAsync");
+    if (!previous) throw new Error("Missing native Question");
+    await f.questions.close(native.requestId);
+    f.questions.register(native);
+    await expect(
+      f.questions.answer({
+        threadId: "thread",
+        interactionId: previous.interactionId,
+        result: { answer: "Yes" },
+      }),
+    ).rejects.toMatchObject({ code: "QUESTION_NOT_PENDING" });
+    expect(f.respond).not.toHaveBeenCalled();
+  });
+
+  it("keeps an async reply claimed when delivery is unknown", async () => {
+    const f = fixture({ asyncQuestion: true });
+    f.respond.mockRejectedValueOnce(new Error("lost native acknowledgement"));
+    await expect(f.answer()).rejects.toThrow("lost native acknowledgement");
+    expect(f.questions.read("thread")).toEqual([]);
+    await expect(f.answer()).rejects.toMatchObject({ code: "QUESTION_NOT_PENDING" });
+    expect(() => f.questions.claimAsync(["async-question"])).toThrow("no longer pending");
+    expect(f.respond).toHaveBeenCalledOnce();
+    expect(f.effects.resolved).not.toHaveBeenCalled();
   });
 
   it("dismisses a Desktop reply in other clients only when clients share Threads", async () => {

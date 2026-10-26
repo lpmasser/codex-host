@@ -782,6 +782,7 @@ describe("HarnessDelegationCoordinator", () => {
         parentThreadId: "parent",
       });
       value.pending.push({
+        kind: "requestUserInput",
         interactionId: "interaction-1",
         turnId: started.turnId,
         request: {

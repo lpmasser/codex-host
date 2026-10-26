@@ -3,12 +3,14 @@ import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const SKILL_VERSION = 10;
+const SKILL_VERSION = 11;
 export const DELEGATION_SKILL_NAME = "codexhost-delegation";
 const SKILL_RELATIVE_PATH = path.join("skills", DELEGATION_SKILL_NAME, "SKILL.md");
 const PREVIOUS_MANAGED_DIGESTS: readonly string[] = [
   // Upstream v10, with child-session naming guidance.
   "242a07e7521949e5d651102f6b353c48e7575a679e3403c5c5db295abad9896b",
+  // v10, which only exposed requestUserInput server requests.
+  "fb3b555c90030b7c9e506ba0eb7e4a584efc1e7b369c552bf1d93daaffa9a310",
   "a6e753ed092239429ebc0dcba8090fb9425fa65292b7810ba990c13a531816a6",
   "9d2f491850fb0b4084a31ba9b5e4a550b5e833747af322090d8ed0ff80b88c30",
   "2bb0aebb9b06febbc6c0c0bcdb0b32506c7cdbf8dc3b734cc6b2a86621270e4e",
@@ -80,15 +82,17 @@ user’s request and the task:
   or waits for an answer, and no waiting or polling is needed meanwhile;
 - leave it running in the background.
 
-A delegated Thread may ask a Question while its Turn is still running, and that
-Turn cannot finish until it is answered. \`thread read\` reports those requests in
-\`pendingQuestions\` with an opaque interaction ID, the Turn, and the original
-Desktop request parameters in \`request\`; an empty list means none. Reading and
-answering need no watch.
+A delegated Thread may ask a Question while its Turn is still running. Native
+asynchronous questions let the Agent keep working. \`thread read\` reports
+\`pendingQuestions\` with an opaque interaction ID, the Turn, \`kind\`, and native
+question data in \`request\`; an empty list means none. Reading and answering need no watch.
 
 Answer with \`thread answer <thread> --interaction <id> --answers-file <file>\`.
-The file contains the existing reply result, for example
-\`{"answers":{"decision":{"answers":["Continue"]}}}\`. Use the prompts and option
+For \`kind: requestUserInput\` (also the default for older Runtimes), the file contains
+the existing reply result, for example \`{"answers":{"decision":{"answers":["Continue"]}}}\`.
+For \`kind: requestUserInputAsync\`, each entry is one question: read \`request.title\`
+and \`request.options\`, then submit \`{"answer":"Continue"}\`. Other questions remain
+pending; an ended Turn cannot receive a late answer. Use the prompts and option
 labels in the reported request. The existing handler owns reply interpretation,
 cancellation, and invalid-input behavior. Read again before retrying a failed
 reply. After answering, watch again or read for the outcome; submission does not

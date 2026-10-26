@@ -488,7 +488,7 @@ Thread 观察命令 SHALL 接受裸 Thread 标识与 Codex 深度链接两种形
 - **AND** send/cancel MUST 仅由对应的显式命令触发
 
 ### Requirement: 委派侧可读取并回答待处理的问题请求
-系统 SHALL 提供 `codexhost thread answer <thread> --interaction <id> --answers-file <file>`，把答复交给该问题的已有处理入口。Host SHALL 维护一份挂起请求，Desktop 与委派 CLI SHALL 共用请求身份与一次性结算。答案文件 SHALL 包含原有 `requestUserInput` 回复的 result 对象，例如 `{"answers":{"decision":{"answers":["Continue"]}}}`。新增委派层 MUST NOT 重新解释选项、必填或答案数量，MUST NOT 改变 Desktop 原有答复、取消或非法输入行为；这些语义 SHALL 由现有协议处理者负责。请求一旦交给答复处理者，其他回答 SHALL 被拒绝，发送失败或结果不明 MUST NOT 触发重复提交。CLI 提交后 SHALL 同步关闭 Desktop 中的同一问题。取消、过期、Turn 结束、原生自行解决或 Runtime 关闭后，旧凭证 MUST NOT 再被接受。问题 MUST NOT 进入 `approval` 通道，也 MUST NOT 改变权限策略。
+系统 SHALL 提供 `codexhost thread answer <thread> --interaction <id> --answers-file <file>`，把答复交给该问题的已有处理入口。Host SHALL 维护一份挂起请求，Desktop 与委派 CLI SHALL 共用请求身份与一次性结算。同步问题的答案文件 SHALL 包含原有 `requestUserInput` 回复的 result 对象，例如 `{"answers":{"decision":{"answers":["Continue"]}}}`。新增委派层 MUST NOT 重新解释选项、必填或答案数量，MUST NOT 改变 Desktop 原有答复、取消或非法输入行为；这些语义 SHALL 由现有协议处理者负责。请求一旦交给答复处理者，其他回答 SHALL 被拒绝，发送失败或结果不明 MUST NOT 触发重复提交。CLI 提交后 SHALL 同步关闭 Desktop 中的同一问题。取消、过期、Turn 结束、原生自行解决或 Runtime 关闭后，旧凭证 MUST NOT 再被接受。问题 MUST NOT 进入 `approval` 通道，也 MUST NOT 改变权限策略。
 
 #### Scenario: 回答待处理的问题
 - **WHEN** 调用方对 `thread read` 报告的交互 ID 执行 `thread answer`，答案满足该请求的约束
@@ -500,7 +500,7 @@ Thread 观察命令 SHALL 接受裸 Thread 标识与 Codex 深度链接两种形
 - **WHEN** 委派方提交解析成功的答复结果
 - **THEN** 该结果 SHALL 交给与 Desktop 相同的既有处理函数
 - **AND** 外部 Harness 的选项映射与非法输入取消行为 SHALL 沿用原解析器
-- **AND** 原生 Codex 的答复内容 SHALL 原样沿既有服务端请求映射转发
+- **AND** 原生 Codex 同步问题的答复内容 SHALL 原样沿既有服务端请求映射转发
 - **AND** 新增委派层 MUST NOT 另行承诺统一的非法答案重试语义
 
 #### Scenario: 答案文件不是 JSON
@@ -536,3 +536,23 @@ Thread 观察命令 SHALL 接受裸 Thread 标识与 Codex 深度链接两种形
 - **WHEN** Host Runtime 未观察到某个旧问题请求（例如重启之前）
 - **THEN** 该请求 MUST NOT 从历史文本、工具输出或屏幕内容重建为可回答请求
 - **AND** 待回答请求 SHALL 只存在于当前 Runtime 内存中
+
+
+### Requirement: 原生异步委派问题
+
+原生 Codex 在当前活动 Turn 的 `agentMessage.questions` 中提供的结构化问题 SHALL 通过既有 `pendingQuestions`、`thread answer`、wait 和一次性 watch 暴露。每题 SHALL 有独立凭证和 `kind: "requestUserInputAsync"`，`request` SHALL 保留题目的 `title`、`options` 与原生来源身份。异步问题 MUST NOT 把原生 Turn 强制改为阻塞状态。同步请求 SHALL 使用 `kind: "requestUserInput"` 并保留原答复格式。
+
+答案文件 SHALL 使用 `{"answer":"选择或自由文本"}`；原生协议边界 SHALL 生成 Desktop 的原有答复消息，经 `turn/steer` 发送到提问的 `expectedTurnId`。迟到答案 MUST NOT 自动启动新 Turn，异步题 MUST NOT 伪造服务端请求的 resolved 通知。
+
+#### Scenario: Partial answers and competing clients
+
+- **WHEN** 一条原生消息提出多道异步题，委派方或 Desktop 提交其中一题
+- **THEN** Host SHALL 预占该题的唯一凭证，避免同一 Host 的并发首次答复重复发送
+- **AND** 原生明确拒绝 Desktop 或 CLI 提交时 SHALL 恢复该凭证，结果不明时 MUST NOT 自动重发
+- **AND** 原生已接收的答复 SHALL 结算该题，其他题仍 SHALL 保持待答
+- **AND** 重复 item 通知 MUST NOT 重新打开已结算题目；Desktop 后续消息仍 SHALL 沿原生路径处理
+
+#### Scenario: Turn ends before an asynchronous answer
+
+- **WHEN** 提问的 Turn 结束、取消或原生 Runtime 关闭
+- **THEN** 对应凭证 SHALL 失效，旧答案 MUST NOT 进入后续 Turn
