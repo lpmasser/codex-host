@@ -252,8 +252,8 @@ export class DelegationWatchService {
       }
       const pending = snapshot.pendingQuestions?.[0];
       if (pending) {
-        // A Question outranks the deadline: the Turn is alive but cannot finish
-        // without an answer, and the request names the Turn it belongs to.
+        // A Question outranks the deadline even when its native Turn can keep
+        // working; the request names the Turn that can receive the answer.
         return {
           outcome: "needsInput",
           interactionId: pending.interactionId,

@@ -8,27 +8,39 @@ import type {
   ThreadAnswerResult,
 } from "./delegation-types.js";
 
+/** The protocol owner has an explicit rejection, rather than unknown delivery. */
+export class QuestionReplyRejected extends DelegationControlError {
+  constructor(message: string) {
+    super("DELEGATION_FAILED", message);
+  }
+}
+
 interface QuestionRequest {
   requestId: string | number;
   threadId: string;
   turnId: string;
   harnessId: RoutedHarnessId;
-  /** The existing requestUserInput params, without interpreting its Questions. */
+  kind?: DelegationPendingQuestion["kind"];
+  /** Native question data; its protocol owner interprets and validates replies. */
   request: JsonObject;
   nativeInteractionId?: string;
   expiresAt?: string;
+  validate?(reply: JsonObject): void;
   respond(reply: JsonObject): Promise<void>;
   retire?(): void;
 }
 
 interface PendingQuestion extends QuestionRequest {
+  interactionId: string;
   timer?: NodeJS.Timeout;
+  state?: "claimed" | "answered";
 }
 
 /** One pending request shared by Desktop and delegation; reply semantics stay with its owner. */
 export class QuestionInteractions {
   readonly #pending = new Map<string | number, PendingQuestion>();
   readonly #identityPrefix = randomUUID();
+  #nextIdentity = 0;
 
   constructor(
     readonly effects: {
@@ -39,7 +51,13 @@ export class QuestionInteractions {
   ) {}
 
   register(request: QuestionRequest): void {
-    const pending: PendingQuestion = { ...request };
+    // Async items may appear in both started and completed notifications. Keep
+    // their settled identity until the Turn closes, so replay cannot reopen it.
+    if (this.#pending.has(request.requestId)) return;
+    const pending: PendingQuestion = {
+      ...request,
+      interactionId: `${this.#identityPrefix}:${++this.#nextIdentity}`,
+    };
     this.#pending.set(request.requestId, pending);
     const deadline = Date.parse(request.expiresAt ?? "");
     if (Number.isFinite(deadline)) {
@@ -52,9 +70,10 @@ export class QuestionInteractions {
 
   read(threadId: string): DelegationPendingQuestion[] {
     return [...this.#pending.values()]
-      .filter((request) => request.threadId === threadId)
-      .map(({ requestId, turnId, expiresAt, request }) => ({
-        interactionId: this.#publicId(requestId),
+      .filter((request) => request.threadId === threadId && !request.state)
+      .map(({ interactionId, turnId, expiresAt, request, kind }) => ({
+        interactionId,
+        kind: kind ?? "requestUserInput",
         turnId,
         ...(expiresAt ? { expiresAt } : {}),
         request,
@@ -69,9 +88,9 @@ export class QuestionInteractions {
       throw new DelegationControlError("INVALID_ARGUMENT", "Interaction identifier is required");
     }
     const request = [...this.#pending.values()].find(
-      ({ requestId }) => this.#publicId(requestId) === input.interactionId,
+      ({ interactionId }) => interactionId === input.interactionId,
     );
-    if (!request) throw this.#notPending();
+    if (!request || request.state) throw this.#notPending();
     if (request.threadId !== input.threadId) {
       throw new DelegationControlError("INVALID_ARGUMENT", "Question belongs to another Thread");
     }
@@ -84,7 +103,7 @@ export class QuestionInteractions {
     return {
       threadId: request.threadId,
       turnId: request.turnId,
-      interactionId: this.#publicId(request.requestId),
+      interactionId: request.interactionId,
       harnessId: request.harnessId,
       status: "running",
       next: {
@@ -100,7 +119,7 @@ export class QuestionInteractions {
       return false;
     if (typeof value.id !== "string" && typeof value.id !== "number") return false;
     const request = this.#pending.get(value.id);
-    if (!request) return false;
+    if (!request || request.kind === "requestUserInputAsync") return false;
     try {
       await this.effects.run(request.threadId, () => this.#send(request, value, sharedClients));
     } catch (error) {
@@ -118,19 +137,51 @@ export class QuestionInteractions {
   async close(requestId: string | number, notify = true): Promise<void> {
     const request = this.#pending.get(requestId);
     if (!request) return;
-    this.#take(request);
+    this.#pending.delete(requestId);
+    if (request.timer) clearTimeout(request.timer);
+    if (request.state) return;
     await this.#retire(request, notify);
   }
 
+  /** Reserve a native Desktop submission before it can race a CLI answer. */
+  claimAsync(requestIds: string[]): ((accepted: boolean) => void) | undefined {
+    const requests = [...new Set(requestIds)]
+      .map((id) => this.#pending.get(id))
+      .filter(
+        (request): request is PendingQuestion =>
+          request?.kind === "requestUserInputAsync" && request.state !== "answered",
+      );
+    if (!requests.length) return undefined;
+    if (requests.some((request) => request.state)) throw this.#notPending();
+    for (const request of requests) this.#take(request);
+    // Only an explicit native rejection releases the reservation. Unknown
+    // delivery and accepted user-message events must not invite a second send.
+    return (accepted) => {
+      for (const request of requests) this.#settleAsync(request, accepted);
+    };
+  }
+
+  #settleAsync(request: PendingQuestion, accepted: boolean): void {
+    if (this.#pending.get(request.requestId) !== request || request.state !== "claimed") return;
+    if (accepted) request.state = "answered";
+    else delete request.state;
+  }
+
+  observeAsyncAnswer(requestId: string): void {
+    const request = this.#pending.get(requestId);
+    if (request?.kind === "requestUserInputAsync") request.state = "answered";
+  }
+
   #take(request: PendingQuestion): void {
-    if (this.#pending.get(request.requestId) !== request) throw this.#notPending();
-    this.#pending.delete(request.requestId);
+    if (this.#pending.get(request.requestId) !== request || request.state) throw this.#notPending();
+    if (request.kind === "requestUserInputAsync") request.state = "claimed";
+    else this.#pending.delete(request.requestId);
     if (request.timer) clearTimeout(request.timer);
   }
 
   async #retire(request: PendingQuestion, notify: boolean): Promise<void> {
     request.retire?.();
-    if (notify)
+    if (notify && request.kind !== "requestUserInputAsync")
       await this.effects.resolved(request.threadId, request.requestId).catch(this.effects.diagnose);
   }
 
@@ -139,12 +190,20 @@ export class QuestionInteractions {
       await this.#expire(request);
       throw this.#notPending();
     }
+    request.validate?.(reply);
     // Claim before calling the existing reply handler; failures cannot invite a duplicate send.
     this.#take(request);
     try {
       await request.respond(reply);
+      this.#settleAsync(request, true);
+    } catch (error) {
+      if (error instanceof QuestionReplyRejected && request.kind === "requestUserInputAsync")
+        this.#settleAsync(request, false);
+      throw error;
     } finally {
-      await this.#retire(request, notify);
+      // An explicitly rejected async reply still belongs to both input surfaces.
+      if (request.kind !== "requestUserInputAsync" || request.state)
+        await this.#retire(request, notify);
     }
   }
 
@@ -160,10 +219,6 @@ export class QuestionInteractions {
     } finally {
       request.retire?.();
     }
-  }
-
-  #publicId(requestId: string | number): string {
-    return `${this.#identityPrefix}:${requestId}`;
   }
 
   #notPending(): DelegationControlError {

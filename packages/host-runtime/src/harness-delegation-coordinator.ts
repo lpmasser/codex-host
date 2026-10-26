@@ -582,8 +582,8 @@ export class HarnessDelegationCoordinator {
     const deadline = Date.now() + input.timeoutMs;
     while (true) {
       const snapshot = await this.read(input);
-      // A pending Question is a ready condition: waiting for the Turn to end
-      // would deadlock the caller that is expected to answer it.
+      // Questions are ready conditions even when an async question lets the
+      // native Turn continue working without its answer.
       if (terminal(snapshot.status) || snapshot.pendingQuestions?.length) {
         return { ...snapshot, timedOut: false };
       }

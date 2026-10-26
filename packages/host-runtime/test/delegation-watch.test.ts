@@ -122,6 +122,7 @@ describe("DelegationWatchService", () => {
 
   it("reports an existing Question immediately instead of registering a watch", async () => {
     const question: DelegationPendingQuestion = {
+      kind: "requestUserInput",
       interactionId: "interaction-1",
       turnId: "turn-child",
       request: {
@@ -148,37 +149,49 @@ describe("DelegationWatchService", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("notifies needsInput once with the request and Turn identity", async () => {
-    const pending: Record<string, DelegationPendingQuestion[]> = { child: [] };
-    const fake = runtime({ child: { status: "running" }, parent: { status: "running" } }, pending);
-    const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
-    await expect(
-      service.watch({ threadId: "child", notifyThreadId: "parent", timeoutMs: 60_000 }),
-    ).resolves.toMatchObject({ state: "watching" });
-    await vi.advanceTimersByTimeAsync(POLL_MS);
-    expect(fake.sent).toEqual([]);
+  it.each(["requestUserInput", "requestUserInputAsync"] as const)(
+    "notifies %s once with the request and Turn identity",
+    async (kind) => {
+      const pending: Record<string, DelegationPendingQuestion[]> = { child: [] };
+      const fake = runtime(
+        { child: { status: "running" }, parent: { status: "running" } },
+        pending,
+      );
+      const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
+      await expect(
+        service.watch({ threadId: "child", notifyThreadId: "parent", timeoutMs: 60_000 }),
+      ).resolves.toMatchObject({ state: "watching" });
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+      expect(fake.sent).toEqual([]);
 
-    // The Question arrives while the watch is already registered.
-    pending.child = [
-      {
-        interactionId: "interaction-1",
-        turnId: "turn-child",
-        request: {
-          questions: [{ id: "decision", question: "Continue?", options: [{ label: "Continue" }] }],
+      // The Question arrives while the watch is already registered.
+      pending.child = [
+        {
+          kind,
+          interactionId: "interaction-1",
+          turnId: "turn-child",
+          request:
+            kind === "requestUserInputAsync"
+              ? { title: "Continue?", options: ["Continue"] }
+              : {
+                  questions: [
+                    { id: "decision", question: "Continue?", options: [{ label: "Continue" }] },
+                  ],
+                },
         },
-      },
-    ];
-    await vi.advanceTimersByTimeAsync(POLL_MS);
-    expect(fake.sent).toHaveLength(1);
-    expect(fake.sent[0]?.message).toContain("request interaction-1, Turn turn-child");
-    expect(fake.sent[0]?.message).toContain("codexhost thread answer");
-    await expect(service.watches()).resolves.toEqual({ watches: [] });
+      ];
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+      expect(fake.sent).toHaveLength(1);
+      expect(fake.sent[0]?.message).toContain("request interaction-1, Turn turn-child");
+      expect(fake.sent[0]?.message).toContain("codexhost thread answer");
+      await expect(service.watches()).resolves.toEqual({ watches: [] });
 
-    // One-shot: the same Question does not notify twice.
-    await vi.advanceTimersByTimeAsync(POLL_MS * 5);
-    expect(fake.sent).toHaveLength(1);
-    expect(vi.getTimerCount()).toBe(0);
-  });
+      // One-shot: the same Question does not notify twice.
+      await vi.advanceTimersByTimeAsync(POLL_MS * 5);
+      expect(fake.sent).toHaveLength(1);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 
   it("reports timedOut when the Thread never reaches a terminal state", async () => {
     const fake = runtime({ child: { status: "running" }, parent: { status: "completed" } });
