@@ -432,6 +432,7 @@ function isRootOutput(event: ClaudeTurnEvent): boolean {
     case "text.delta":
     case "reasoning.delta":
     case "reasoning.completed":
+    case "narration.completed":
     case "message.completed":
     case "tool.started":
     case "tool.progress":
@@ -1448,8 +1449,15 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           handler.onTerminal(interpreted.terminal);
         }
       }
+      this.#flushPendingThinking();
       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
     } catch (error) {
+      try {
+        this.#flushPendingThinking();
+      } catch {
+        // A failed consumer cannot accept the summary; the original fault still
+        // owns cleanup of requests, pending inputs and the Turn below.
+      }
       const active = this.#active;
       if (!this.#closePromise) this.#onFault(error);
       this.#closeInteractions("all", "cancelled");
@@ -1457,6 +1465,25 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       this.#rootToolCalls.clear();
       this.#active = null;
       active?.reject(error);
+    }
+  }
+
+  /** A stream that ends without a native Result still delivers its unconfirmed thinking. */
+  #flushPendingThinking(): void {
+    const active = this.#active;
+    if (active) {
+      for (const event of active.accumulator.flushPendingThinking()) active.onEvent(event);
+      return;
+    }
+    const idle = this.#idleLive ? this.#idleHandler : null;
+    if (idle && this.#idleAccumulator) {
+      for (const event of this.#idleAccumulator.flushPendingThinking()) idle.onEvent(event);
+      return;
+    }
+    const autonomous = this.#autonomous;
+    const handler = this.#autonomousTurnHandler;
+    if (autonomous?.live && handler) {
+      for (const event of autonomous.accumulator.flushPendingThinking()) handler.onEvent(event);
     }
   }
 
