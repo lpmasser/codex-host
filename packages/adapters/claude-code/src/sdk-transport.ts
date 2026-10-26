@@ -629,9 +629,14 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
    * `priority: "next"` joins after the current tool call, and a tool result is always followed by
    * another model request. So a steer written while a root tool call runs folds into this Turn;
    * one written while Claude streams its final text may instead run as the next Turn.
+   *
+   * A held Turn's continuation steers as well: while its idle stream is live, the pushed input
+   * runs as that Turn's next Segment, and the background work the Turn waits on keeps running.
    */
   canSteerActiveTurn(): boolean {
-    return this.#nativeSteer && this.#active !== null && this.#rootToolCalls.size > 0;
+    if (!this.#nativeSteer) return false;
+    if (this.#active !== null) return this.#rootToolCalls.size > 0;
+    return this.#idleLive && this.#idleHandler !== null;
   }
 
   #observeRootToolCalls(message: unknown): void {

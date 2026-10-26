@@ -203,11 +203,13 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   }
 
   canSteerActiveTurn(): boolean {
-    return this.nativeSteer && this.#active !== undefined && this.rootToolRunning;
+    if (!this.nativeSteer) return false;
+    if (this.#active !== undefined) return this.rootToolRunning;
+    return this.idleLive && this.idleHandler !== null;
   }
 
   steer(text: string, messageId: string): Promise<void> {
-    if (!this.#active) return Promise.reject(new ClaudeSteerMissedTurnError());
+    if (!this.canSteerActiveTurn()) return Promise.reject(new ClaudeSteerMissedTurnError());
     this.steers.push({ text, messageId, priority: "next" });
     return new Promise((resolve, reject) => {
       this.#pendingSteers.set(messageId, { resolve, reject });
@@ -3187,6 +3189,69 @@ describe("Claude Code HarnessAdapter", () => {
     );
     expect(transport.autonomousTurnHandler).not.toBeNull();
     expect(transport.idleLive).toBe(false);
+    await session.close();
+  });
+
+  it("steers a held Turn's continuation without stopping its background Subagent", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent();
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    // The Turn is held on the background Subagent; its continuation is idle-live.
+    expect(transport.idleLive).toBe(true);
+    expect(session.capabilities.steer).toBe(true);
+
+    const steered = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("delegate in background"),
+      input: [{ type: "text", text: "status update please" }],
+    });
+    await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+    expect(transport.steers).toEqual([
+      {
+        text: "status update please",
+        messageId: expect.any(String),
+        priority: "next",
+      },
+    ]);
+    transport.recordSteer(transport.steers[0]?.messageId ?? "");
+    await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+    // Message delivery must not take the cancellation path that stops background work.
+    expect(transport.stopTasks).not.toHaveBeenCalled();
+    expect(transport.abort).not.toHaveBeenCalled();
+    expect(transport.abortContinuation).not.toHaveBeenCalled();
+
+    // The answer arrives as the held Turn's next Segment; the Turn keeps waiting.
+    transport.event({ type: "segment.started" });
+    transport.delta("The background Agent is still running.", "steer-answer");
+    transport.finish({ status: "succeeded" });
+    await nextOutputMatching(
+      iterator,
+      (output) =>
+        output.kind === "event" &&
+        output.event.type === "item.completed" &&
+        output.event.snapshot.item.type === "agentMessage" &&
+        output.event.snapshot.item.text.includes("still running"),
+    );
+    expect(transport.idleLive).toBe(true);
+    expect(transport.stopTasks).not.toHaveBeenCalled();
+
+    // Once the background Subagent settles, the steered Turn completes successfully.
+    transport.threadEvent({
+      type: "subagent.settled",
+      nativeSubagentId: "native-agent-1",
+      status: "completed",
+      resultSummary: "Agent finished",
+    });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
     await session.close();
   });
 
