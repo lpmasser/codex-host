@@ -936,13 +936,7 @@ describe("Claude native Turn interpretation", () => {
   it("uses only streamed thinking when the complete wrapper contains more thinking", () => {
     const turn = new ClaudeNativeTurnAccumulator();
 
-    expect(turn.consume(thinkingPartial("visible ", "assistant-thinking")).events).toEqual([
-      {
-        type: "reasoning.delta",
-        messageId: "assistant-thinking",
-        delta: "visible ",
-      },
-    ]);
+    expect(turn.consume(thinkingPartial("visible ", "assistant-thinking")).events).toEqual([]);
     expect(
       turn.consume(
         assistantBlocks(
@@ -954,7 +948,8 @@ describe("Claude native Turn interpretation", () => {
         ),
       ).events,
     ).toEqual([
-      { type: "reasoning.completed", messageId: "assistant-thinking" },
+      { type: "reasoning.delta", messageId: "assistant-thinking:thinking:0", delta: "visible " },
+      { type: "reasoning.completed", messageId: "assistant-thinking:thinking:0" },
       { type: "text.delta", messageId: "assistant-thinking", delta: "answer" },
       {
         type: "message.completed",
@@ -1001,7 +996,8 @@ describe("Claude native Turn interpretation", () => {
         ),
       ).events,
     ).toEqual([
-      { type: "reasoning.completed", messageId: "reasoning-conflict" },
+      { type: "reasoning.delta", messageId: "reasoning-conflict:thinking:0", delta: "streamed" },
+      { type: "reasoning.completed", messageId: "reasoning-conflict:thinking:0" },
       {
         type: "message.completed",
         messageId: "reasoning-conflict",
