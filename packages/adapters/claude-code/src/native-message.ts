@@ -2,6 +2,7 @@ import { claudeUsageRecord, isClaudeModelRequest } from "./claude-usage.js";
 import { jsonValueSchema } from "@codexhost/shared-contracts";
 
 import { parseClaudeNativeFileChange } from "./file-change.js";
+import { isClaudeNarrationSignature } from "./thinking-signature.js";
 import type {
   ClaudePlanLimitEvent,
   ClaudeTransportFailureKind,
@@ -30,7 +31,7 @@ type ClaudeNativeEvent = Exclude<
 
 interface AssistantMessageState {
   completed: boolean;
-  reasoning: string;
+  reasoning: Map<number, string>;
   text: string;
   usagePublished: boolean;
 }
@@ -493,6 +494,7 @@ export class ClaudeNativeTurnAccumulator {
   #completedToolIds = new Set<string>();
   #messageOrdinal = 0;
   #messages = new Map<string, AssistantMessageState>();
+  #completedThinkingBlocks = new Set<string>();
   #protocolConflict = false;
   #textConflict = false;
   #tools = new Map<string, ActiveNativeTool>();
@@ -503,6 +505,15 @@ export class ClaudeNativeTurnAccumulator {
 
   requestCancel(): void {
     this.#cancelRequested = true;
+  }
+
+  /** A stream can end without a native Result; unconfirmed prose remains Reasoning. */
+  flushPendingThinking(): ClaudeNativeEvent[] {
+    const events: ClaudeNativeEvent[] = [];
+    for (const [messageId, state] of this.#messages) {
+      this.#flushThinking(messageId, state, events, false);
+    }
+    return events;
   }
 
   #usageRequest: {
@@ -555,6 +566,9 @@ export class ClaudeNativeTurnAccumulator {
     }
 
     if (message.type !== "result") return { events };
+    // An interrupted block may never receive its signature or Assistant wrapper.
+    // Preserve its streamed summary as Reasoning; no narration was confirmed.
+    events.push(...this.flushPendingThinking());
     if (this.#usageRequest) {
       // Cancellation/failure can end a request without message_stop. Its final usage is
       // unknown: invalidate metering rather than silently publish a partial Session total.
@@ -834,8 +848,10 @@ export class ClaudeNativeTurnAccumulator {
     }
     if (event.delta.type === "thinking_delta" && typeof event.delta.thinking === "string") {
       if (event.delta.thinking.length === 0) return;
-      state.reasoning += event.delta.thinking;
-      events.push({ type: "reasoning.delta", messageId, delta: event.delta.thinking });
+      // The signature arrives after the prose. Keep the block boundary until the
+      // complete native block confirms whether this is narration or reasoning.
+      const index = typeof event.index === "number" ? event.index : 0;
+      state.reasoning.set(index, (state.reasoning.get(index) ?? "") + event.delta.thinking);
     }
   }
 
@@ -845,6 +861,29 @@ export class ClaudeNativeTurnAccumulator {
     const messageId =
       this.#activeRootStreamMessageId ?? nativeMessageId ?? checkpointId ?? this.#nextMessageId();
     const state = this.#messageState(messageId);
+    const content = assistantContent(message) ?? [];
+    for (const [index, block] of content.entries()) {
+      if (!isRecord(block) || block.type !== "thinking") continue;
+      let streamedIndex = index;
+      if (content.length === 1 && state.reasoning.size === 1) {
+        for (const candidate of state.reasoning.keys()) streamedIndex = candidate;
+      }
+      const streamed = state.reasoning.get(streamedIndex);
+      state.reasoning.delete(streamedIndex);
+      const identity = `${checkpointId ?? nativeMessageId ?? messageId}:${index}`;
+      if (this.#completedThinkingBlocks.has(identity)) continue;
+      this.#completedThinkingBlocks.add(identity);
+      const blockId = `${messageId}:thinking:${streamedIndex}`;
+      if (isClaudeNarrationSignature(block.signature)) {
+        const complete = typeof block.thinking === "string" ? block.thinking : "";
+        const text = streamed === undefined || complete.startsWith(streamed) ? complete : streamed;
+        if (text.length > 0) events.push({ type: "narration.completed", messageId: blockId, text });
+      } else if (streamed) {
+        events.push({ type: "reasoning.delta", messageId: blockId, delta: streamed });
+        events.push({ type: "reasoning.completed", messageId: blockId });
+      }
+    }
+    this.#flushThinking(messageId, state, events, true);
     if (state.completed) {
       this.#consumeToolUseBlocks(message, events, true);
       const usage = assistantRequestUsage(message, this.#provider);
@@ -858,10 +897,6 @@ export class ClaudeNativeTurnAccumulator {
         });
       }
       return;
-    }
-
-    if (state.reasoning.length > 0) {
-      events.push({ type: "reasoning.completed", messageId });
     }
 
     const completeText = assistantText(message);
@@ -891,6 +926,20 @@ export class ClaudeNativeTurnAccumulator {
     }
     state.completed = true;
     if (this.#activeRootStreamMessageId === messageId) this.#activeRootStreamMessageId = null;
+  }
+
+  #flushThinking(
+    messageId: string,
+    state: AssistantMessageState,
+    events: ClaudeNativeEvent[],
+    complete: boolean,
+  ): void {
+    for (const [index, text] of state.reasoning) {
+      const blockId = `${messageId}:thinking:${index}`;
+      events.push({ type: "reasoning.delta", messageId: blockId, delta: text });
+      if (complete) events.push({ type: "reasoning.completed", messageId: blockId });
+    }
+    state.reasoning.clear();
   }
 
   #consumeToolUseBlocks(
@@ -1072,7 +1121,12 @@ export class ClaudeNativeTurnAccumulator {
   #messageState(messageId: string): AssistantMessageState {
     const existing = this.#messages.get(messageId);
     if (existing) return existing;
-    const created = { completed: false, reasoning: "", text: "", usagePublished: false };
+    const created = {
+      completed: false,
+      reasoning: new Map<number, string>(),
+      text: "",
+      usagePublished: false,
+    };
     this.#messages.set(messageId, created);
     return created;
   }
