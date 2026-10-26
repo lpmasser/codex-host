@@ -1,12 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 import type { JsonObject } from "@codexhost/protocol-core";
+import type { HostCommand } from "@codexhost/harness-adapter";
 import type { DelegationControlApi, DelegationThreadSnapshot } from "../src/delegation-types.js";
 import { DelegationWatchService } from "../src/delegation-watch.js";
 import {
   bindOfficialThread,
   createFixture,
   readJsonLine,
+  startExternalThread,
+  startPiThread,
+  startPiTurn,
   stopFixture,
+  turnEvent,
 } from "./app-server-host-fixture.js";
 
 async function watchFixture() {
@@ -161,6 +166,99 @@ describe("watch delivery through native Codex resume", () => {
       await new Promise((resolve) => setTimeout(resolve, 30));
       expect(value.send).toHaveBeenCalledOnce();
       expect(value.fixture.official.stdin.read()).toBeNull();
+    } finally {
+      value.service.close();
+      await stopFixture(value.fixture);
+    }
+  });
+});
+
+async function externalWatchFixture() {
+  let api: DelegationControlApi | undefined;
+  const fixture = createFixture({
+    onDelegationApi: (value) => {
+      api = value;
+      return undefined;
+    },
+  });
+  fixture.adapter.supportsSteer = true;
+  const parentId = await startPiThread(fixture);
+  const parentTurnId = await startPiTurn(fixture, parentId);
+  const childId = await startExternalThread(fixture, "codexhost/pi-native", 3);
+  await startPiTurn(fixture, childId, 4);
+  const [parent, child] = fixture.adapter.sessions;
+  if (!api || !parent || !child) throw new Error("Missing external watch fixture");
+  const send = vi.spyOn(api, "send");
+  const service = new DelegationWatchService(api, { pollIntervalMs: 10 });
+  await service.watch({ threadId: childId, notifyThreadId: parentId, timeoutMs: 60_000 });
+  return { fixture, parent, parentTurnId, child, send, service };
+}
+
+describe("watch delivery to an external parent", () => {
+  it("retries an ended target after capability read without losing or duplicating the notification", async () => {
+    const value = await externalWatchFixture();
+    const read = Promise.withResolvers<typeof value.parent.capabilities>();
+    const readCapabilities = vi.fn(() => read.promise);
+    Object.assign(value.parent, { readCapabilities });
+    const execute = vi.spyOn(value.parent, "execute");
+    try {
+      value.child.succeedTurn();
+      await vi.waitFor(() => expect(readCapabilities).toHaveBeenCalledOnce());
+      value.parent.succeedTurn();
+      await value.fixture.collector.waitFor((message) =>
+        turnEvent(message, "turn/completed", value.parentTurnId),
+      );
+      read.resolve(value.parent.capabilities);
+      await vi.waitFor(async () => expect((await value.service.watches()).watches).toEqual([]));
+      expect(value.send).toHaveBeenCalledTimes(2);
+      expect(value.parent.steers).toEqual([]);
+      expect(execute.mock.calls.map(([command]) => command)).toEqual([
+        expect.objectContaining({
+          type: "turn.start",
+          input: [{ type: "text", text: expect.stringContaining("[codexhost thread watch]") }],
+        }),
+      ]);
+    } finally {
+      read.resolve(value.parent.capabilities);
+      value.service.close();
+      await stopFixture(value.fixture);
+    }
+  });
+
+  it.each(["native reply lost", "cancel failed"])("does not retry after %s", async (failure) => {
+    const value = await externalWatchFixture();
+    const originalExecute = value.parent.execute.bind(value.parent);
+    if (failure === "cancel failed") {
+      Object.assign(value.parent, {
+        readCapabilities: async () => ({ ...value.parent.capabilities, steer: false }),
+      });
+    }
+    const execute = vi
+      .spyOn(value.parent, "execute")
+      .mockImplementation(async (command: HostCommand) => {
+        if (command.type === "turn.cancel" && failure === "cancel failed") {
+          return {
+            ok: false,
+            error: { code: "nativeFailure", message: "cancel failed", retryable: false },
+          };
+        }
+        if (command.type === "turn.steer") {
+          await originalExecute(command);
+          throw new Error("native reply lost");
+        }
+        throw new Error(`Unexpected command: ${command.type}`);
+      });
+    try {
+      value.child.succeedTurn();
+      await vi.waitFor(async () =>
+        expect((await value.service.watches()).watches).toMatchObject([
+          { state: "undeliverable", reason: expect.stringContaining("Delivery outcome unknown") },
+        ]),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(value.send).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(value.parent.steers).toHaveLength(failure === "native reply lost" ? 1 : 0);
     } finally {
       value.service.close();
       await stopFixture(value.fixture);
