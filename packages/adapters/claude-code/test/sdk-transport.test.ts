@@ -1497,10 +1497,39 @@ describe("ClaudeSdkTransport Question callbacks", () => {
 
     await expect(turn).resolves.toEqual({ status: "succeeded" });
     expect(events).toEqual([
-      { type: "reasoning.delta", messageId: assistantId, delta: "visible" },
-      { type: "reasoning.completed", messageId: assistantId },
+      { type: "reasoning.delta", messageId: `${assistantId}:thinking:0`, delta: "visible" },
+      { type: "reasoning.completed", messageId: `${assistantId}:thinking:0` },
       { type: "text.delta", messageId: assistantId, delta: "answer" },
       { type: "message.completed", messageId: assistantId, checkpointId: assistantId },
+    ]);
+    await value.transport.close();
+  });
+
+  it("delivers streamed thinking when the native stream ends without a Result", async () => {
+    const value = fixture();
+    await value.transport.start();
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.transport.runTurn(
+      "synthetic",
+      "00000000-0000-4000-8000-000000000002",
+      (event) => events.push(event),
+    );
+    const assistantId = "00000000-0000-4000-8000-000000000003";
+    value.fakeQuery.push({
+      type: "stream_event",
+      uuid: assistantId,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "unfinished" },
+      },
+    } as unknown as SDKMessage);
+    value.fakeQuery.close();
+
+    await expect(turn).rejects.toThrow("Claude SDK Query ended unexpectedly");
+    // No signature confirmed narration, so the summary stays Reasoning.
+    expect(events).toEqual([
+      { type: "reasoning.delta", messageId: `${assistantId}:thinking:0`, delta: "unfinished" },
     ]);
     await value.transport.close();
   });
@@ -3261,6 +3290,68 @@ describe("ClaudeSdkTransport steer", () => {
     const input = prompt[Symbol.asyncIterator]();
     await expect(input.next()).resolves.toMatchObject({ value: { message: { content: "hello" } } });
     await expect(input.next()).resolves.toMatchObject({ done: true });
+  });
+
+  it("steers a held Turn's continuation while its idle stream is live", async () => {
+    const value = fixture();
+    const idleEvents: ClaudeTurnEvent[] = [];
+    const idleTerminals: ClaudeTransportTurnResult[] = [];
+    await value.transport.start();
+    value.fakeQuery.push({
+      type: "system",
+      subtype: "init",
+      capabilities: ["msg_lifecycle_v1"],
+    } as unknown as SDKMessage);
+    await vi.waitFor(() => expect(value.transport.supportsNativeSteer()).toBe(true));
+    expect(value.transport.canSteerActiveTurn()).toBe(false);
+    value.transport.setIdleTurnHandler({
+      onEvent: (event) => idleEvents.push(event),
+      onTerminal: (result) => idleTerminals.push(result),
+    });
+    value.transport.setIdleLive(true);
+    expect(value.transport.canSteerActiveTurn()).toBe(true);
+
+    const steerId = "00000000-0000-4000-8000-000000000060";
+    const steered = value.transport.steer("background status?", steerId);
+    const prompt = value.queryInput().prompt;
+    if (typeof prompt === "string" || !prompt) throw new Error("expected streaming input");
+    const input = prompt[Symbol.asyncIterator]();
+    await expect(input.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        type: "user",
+        priority: "next",
+        uuid: steerId,
+        origin: { kind: "human" },
+        message: { role: "user", content: "background status?" },
+      },
+    });
+    value.fakeQuery.push({
+      type: "command_lifecycle",
+      state: "queued",
+      command_uuid: steerId,
+      uuid: "00000000-0000-4000-8000-000000000061",
+      session_id: "00000000-0000-4000-8000-000000000001",
+    } as unknown as SDKMessage);
+    await steered;
+
+    // The answer runs as the held Turn's next Segment through the idle handler.
+    pushAssistantText(
+      value.fakeQuery,
+      "The background Agent is still running.",
+      "00000000-0000-4000-8000-000000000062",
+    );
+    completeTurn(value.fakeQuery);
+    await vi.waitFor(() => expect(idleTerminals).toEqual([{ status: "succeeded" }]));
+    expect(idleEvents.some(({ type }) => type === "text.delta")).toBe(true);
+    expect(value.transport.canSteerActiveTurn()).toBe(true);
+
+    value.transport.setIdleLive(false);
+    expect(value.transport.canSteerActiveTurn()).toBe(false);
+    await expect(
+      value.transport.steer("too late", "00000000-0000-4000-8000-000000000063"),
+    ).rejects.toBeInstanceOf(ClaudeSteerMissedTurnError);
+    await value.transport.close();
   });
 
   it("supports native steering only after init reports msg_lifecycle_v1", async () => {

@@ -432,6 +432,7 @@ function isRootOutput(event: ClaudeTurnEvent): boolean {
     case "text.delta":
     case "reasoning.delta":
     case "reasoning.completed":
+    case "narration.completed":
     case "message.completed":
     case "tool.started":
     case "tool.progress":
@@ -629,9 +630,14 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
    * `priority: "next"` joins after the current tool call, and a tool result is always followed by
    * another model request. So a steer written while a root tool call runs folds into this Turn;
    * one written while Claude streams its final text may instead run as the next Turn.
+   *
+   * A held Turn's continuation steers as well: while its idle stream is live, the pushed input
+   * runs as that Turn's next Segment, and the background work the Turn waits on keeps running.
    */
   canSteerActiveTurn(): boolean {
-    return this.#nativeSteer && this.#active !== null && this.#rootToolCalls.size > 0;
+    if (!this.#nativeSteer) return false;
+    if (this.#active !== null) return this.#rootToolCalls.size > 0;
+    return this.#idleLive && this.#idleHandler !== null;
   }
 
   #observeRootToolCalls(message: unknown): void {
@@ -1409,8 +1415,15 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
           handler.onTerminal(interpreted.terminal);
         }
       }
+      this.#flushPendingThinking();
       if (!this.#closePromise) throw new Error("Claude SDK Query ended unexpectedly");
     } catch (error) {
+      try {
+        this.#flushPendingThinking();
+      } catch {
+        // A failed consumer cannot accept the summary; the original fault still
+        // owns cleanup of requests, pending inputs and the Turn below.
+      }
       const active = this.#active;
       this.#closeInteractions("all", "cancelled");
       this.#rejectPendingSteers();
@@ -1418,6 +1431,25 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
       this.#active = null;
       active?.reject(error);
       if (!this.#closePromise) this.#onFault(error);
+    }
+  }
+
+  /** A stream that ends without a native Result still delivers its unconfirmed thinking. */
+  #flushPendingThinking(): void {
+    const active = this.#active;
+    if (active) {
+      for (const event of active.accumulator.flushPendingThinking()) active.onEvent(event);
+      return;
+    }
+    const idle = this.#idleLive ? this.#idleHandler : null;
+    if (idle && this.#idleAccumulator) {
+      for (const event of this.#idleAccumulator.flushPendingThinking()) idle.onEvent(event);
+      return;
+    }
+    const autonomous = this.#autonomous;
+    const handler = this.#autonomousTurnHandler;
+    if (autonomous?.live && handler) {
+      for (const event of autonomous.accumulator.flushPendingThinking()) handler.onEvent(event);
     }
   }
 
