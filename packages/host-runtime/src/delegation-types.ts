@@ -64,8 +64,8 @@ export interface DelegationStartInput {
   cwd?: string;
   parentThreadId?: string;
   requestId?: string;
-  model?: HarnessModelRef;
-  thinkingOptionId?: HarnessThinkingOptionId;
+  model?: string;
+  thinking?: string;
 }
 
 export interface HarnessInspectInput {
