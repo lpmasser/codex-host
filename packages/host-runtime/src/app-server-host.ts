@@ -4994,6 +4994,11 @@ export class AppServerHost {
       );
       started.gate.resolve();
       return started.turnId;
+    } catch (error) {
+      if (error instanceof ExternalSteerError && error.notStarted) {
+        throw new DelegationControlError("DELEGATION_FAILED", error.message, { notStarted: true });
+      }
+      throw error;
     } finally {
       this.#signalActiveWorkChanged();
     }
