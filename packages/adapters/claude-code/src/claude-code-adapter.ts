@@ -229,6 +229,8 @@ interface ActiveTurn {
   cancellation: TurnCancellation | null;
   /** True while Claude can still produce a native result for the current Root Segment. */
   rootSegmentActive: boolean;
+  /** A written steer is not yet taken over by a native Root Segment; the Turn must stay open. */
+  steerAwaitingNative: boolean;
   completion: Promise<void>;
   resolveCompletion(): void;
 }
@@ -580,10 +582,15 @@ class ClaudeHarnessSession implements HarnessSession {
     },
     history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
     subagents: { observe: true, readTranscript: true },
-    // Read live: native delivery joins this Turn only while a requested Turn runs a root tool call
-    // on a CLI that confirms steers (`msg_lifecycle_v1`). Otherwise the Host stops and restarts.
+    // Read live: native delivery joins this Turn while a root tool call runs, or while a held
+    // Turn's continuation waits on background work, on a CLI that confirms steers
+    // (`msg_lifecycle_v1`). A Turn whose cancellation is in flight must not take more input;
+    // every other case stops and restarts.
     get steer(): boolean {
-      return session.#transport?.canSteerActiveTurn?.() === true;
+      return (
+        session.#transport?.canSteerActiveTurn?.() === true &&
+        session.#active?.cancellationRequested !== true
+      );
     },
   }))(this);
   readonly commands: HarnessCommandCapability;
@@ -974,6 +981,7 @@ class ClaudeHarnessSession implements HarnessSession {
       nativeTurnKey,
       nativeTurnRef: null,
       cancellationRequested: false,
+      steerAwaitingNative: false,
       usageRequestIds: new Set(),
       estimatedInputTokens: 0,
       estimatedOutputTokens: 0,
@@ -1015,8 +1023,13 @@ class ClaudeHarnessSession implements HarnessSession {
   }
 
   async #steer(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>> {
-    if (!this.#active || this.#active.command.turnId !== command.turnId) {
+    const active = this.#active;
+    if (!active || active.command.turnId !== command.turnId) {
       return { ok: false, error: invalidState("Claude Code steer target is not the active Turn") };
+    }
+    if (active.cancellationRequested) {
+      // A cancelled Turn must not take more input; its Segments are being interrupted.
+      return { ok: false, error: invalidState("Claude Code steer target is being cancelled") };
     }
     const text = command.input.map((input) => input.text).join("\n");
     if (text.length === 0) {
@@ -1043,10 +1056,15 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       };
     }
+    // The write happens synchronously inside steer(); claim the keep-open before it, so
+    // continuation quiescence cannot finish the held Turn between write and native takeover.
+    active.steerAwaitingNative = true;
     try {
       await transport.steer(text, this.#randomUUID());
     } catch (error) {
       if (error instanceof ClaudeSteerMissedTurnError) {
+        // Nothing was written, or the Session died after writing and the Turn ends anyway.
+        active.steerAwaitingNative = false;
         return { ok: false, error: invalidState("Claude Code steer missed the active Turn") };
       }
       throw error;
@@ -1165,6 +1183,7 @@ class ClaudeHarnessSession implements HarnessSession {
       nativeTurnKey,
       nativeTurnRef: null,
       cancellationRequested: false,
+      steerAwaitingNative: false,
       usageRequestIds: new Set(),
       estimatedInputTokens: 0,
       estimatedOutputTokens: 0,
@@ -2322,6 +2341,7 @@ class ClaudeHarnessSession implements HarnessSession {
     const active: ActiveTurn = {
       command: { type: "turn.start", turnId, input: [] },
       compactionItem: null,
+      steerAwaitingNative: false,
       item,
       agentMessageOrdinal: 1,
       assistantMessageId: null,
@@ -2809,6 +2829,7 @@ class ClaudeHarnessSession implements HarnessSession {
         this.#active !== active ||
         !active.held ||
         active.rootSegmentActive ||
+        active.steerAwaitingNative ||
         this.#phase !== "open"
       ) {
         return;
@@ -2829,6 +2850,7 @@ class ClaudeHarnessSession implements HarnessSession {
 
   #observeRootOutput(active: ActiveTurn): void {
     active.rootSegmentActive = true;
+    active.steerAwaitingNative = false;
     this.#clearContinuationQuiescence();
   }
 

@@ -8,13 +8,17 @@ Host 在原生接受后自己发当前 Turn 的 `userMessage` Item。Adapter 不
 
 `priority: "next"` 在**当前工具调用结束后**、下一次模型请求之前并入；工具结果之后一定还有一次模型请求，所以插入写入时只要有根级工具调用正在执行，它就一定并入当前 Turn。反过来，如果 Claude 正在输出最终文本、没有工具在执行，它可能直接结束本轮，把插入留到下一轮执行：2026-10-22 在 Claude Code 2.1.305 上实测，Host 把插入显示在原来那一轮，而 Claude 在随后的另一轮里回复。
 
-因此 `capabilities.steer` 实时取以下三项的交集，任何一项不满足都为 `false`，Host 改用停止后重发：
+因此 `capabilities.steer` 实时取以下条件的交集，任何一项不满足都为 `false`，Host 改用停止后重发：
 
 - CLI 在 `system/init` 的 `capabilities` 中报告 `msg_lifecycle_v1`，会发出确认插入所需的 `command_lifecycle` 回执；
-- 当前是用户发起的 Turn，不是后台通知等触发的自主 Turn（transport 没有对应的活跃 Turn）；
-- 有根级工具调用已经开始、还没返回结果（子 Agent 内部的工具调用不计入）。
+- 当前是用户发起的 Turn，不是后台通知等触发的自主 Turn（transport 没有对应的活跃 Turn），且它的取消尚未开始；
+- 处于以下两种窗口之一：
+  - 有根级工具调用已经开始、还没返回结果（子 Agent 内部的工具调用不计入），插入在当前工具调用结束后并入本轮；
+  - held Turn 的续态：主回复已结束、后台 Subagent 仍在运行、idle 流存活，插入作为该 Turn 的下一段运行，后台任务不被停止。
 
-`turn.steer` 在写入输入流前同步复查上述三项，不依赖 Renderer 之前的查询结果；工具已经结束时拒绝且不写入。Renderer 已按同轮展示时，Host 报错而不停止后重发。Harness Broker 经公共 `readCapabilities()` 按需读取当前能力；旧 Broker 未声明支持查询时保持停止后重发。
+`turn.steer` 在写入输入流前同步复查上述条件，不依赖 Renderer 之前的查询结果；两个窗口都已关闭、或取消已在进行时拒绝且不写入。Renderer 已按同轮展示时，Host 报错而不停止后重发。Harness Broker 经公共 `readCapabilities()` 按需读取当前能力；旧 Broker 未声明支持查询时保持停止后重发。
+
+续态写入还有一个额外保证：已写入、尚未被原生根段接管的插入会让 held Turn 保持打开，continuation 静默计时器不会在此之前把 Turn 提前收口；原生根输出一开始（`segment.started` 或根输出事件）保活即交接给正常的段生命周期。
 
 ## 接受
 
@@ -24,7 +28,7 @@ CLI 先发 `command_lifecycle` `queued`，表示 Claude 已接受这条输入；
 
 ## 版本
 
-2026-09-24 在 Claude Code 2.1.280 上实机确认；2026-10-21 在 Claude Code 2.1.305（Agent SDK 0.3.273 与 0.3.305）上复核了相同的 `queued` → `started` → `completed` 顺序和单个 `result`，这两个版本都会报告 `msg_lifecycle_v1`。其他版本只依据这项运行时能力判断，没有逐个实机验证。
+2026-09-24 在 Claude Code 2.1.280 上实机确认；2026-10-21 在 Claude Code 2.1.305（Agent SDK 0.3.273 与 0.3.305）上复核了相同的 `queued` → `started` → `completed` 顺序和单个 `result`，这两个版本都会报告 `msg_lifecycle_v1`。2026-10-26 在 Claude Code 2.1.303 上实机确认了 held Turn 续态的同轮插入：主回复结束、后台 Subagent 运行中写入，插入作为该 Turn 下一段得到回复，后台 Subagent 不受影响并最终正常完成。其他版本只依据这项运行时能力判断，没有逐个实机验证。
 
 ## 历史
 

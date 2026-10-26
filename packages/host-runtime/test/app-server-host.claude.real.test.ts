@@ -724,8 +724,24 @@ describe.skipIf(!RUN_REAL)("AppServerHost real Claude projection", () => {
         const turnId = ((turnResponse.result as JsonObject).turn as JsonObject).id;
         if (typeof turnId !== "string") throw new Error("Host returned no Turn ID");
 
-        // The reply ends and the Turn holds on the live background subagent; native
-        // steering must become available for that continuation instead of a restart.
+        // Wait for the main DISPATCHED reply to finish: with its root tool call returned and
+        // the Turn not completed, only the new continuation admission can report steer.
+        await expect(
+          collector.waitFor(
+            (message) =>
+              method(message, "item/completed") &&
+              (message.params as JsonObject).turnId === turnId &&
+              ((message.params as JsonObject).item as JsonObject).type === "agentMessage" &&
+              String(((message.params as JsonObject).item as JsonObject).text ?? "").includes(
+                "DISPATCHED",
+              ),
+          ),
+        ).resolves.toBeDefined();
+        await delay(1_000);
+        expect(collector.messages.some((message) => method(message, "turn/completed"))).toBe(false);
+
+        // The reply has ended and the Turn holds on the live background subagent; native
+        // steering must be available for that continuation instead of a restart.
         let delivery = "";
         const inspectDeadline = Date.now() + 120_000;
         for (let inspectId = 3; Date.now() < inspectDeadline; inspectId += 1) {

@@ -290,8 +290,10 @@ export interface ClaudeTurnTransport {
    */
   supportsNativeSteer?(): boolean;
   /**
-   * True while a requested Turn has a root tool call running on a CLI that confirms steers. A
-   * steer written now joins this Turn after that tool call; otherwise it may run as the next Turn.
+   * True while a requested Turn has a root tool call running on a CLI that confirms steers, or
+   * while a held Turn's continuation is idle-live waiting on background work. A steer written
+   * in the first case joins this Turn after that tool call; in the second it runs as the held
+   * Turn's next Segment without stopping the work it waits on.
    */
   canSteerActiveTurn?(): boolean;
   getPermissionMode(): ClaudePermissionMode;
