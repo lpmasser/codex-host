@@ -360,12 +360,18 @@ export interface HostToolOutput {
   truncated?: boolean;
 }
 
+export type HostToolActivity =
+  | { type: "read"; path: string }
+  | { type: "listFiles"; path: string }
+  | { type: "search"; query: string; path?: string };
+
 export interface HostToolExecutionItem {
   type: "toolExecution";
   itemId: HostItemId;
   toolName: string;
   namespace?: string;
   arguments: JsonValue;
+  activity?: HostToolActivity;
   output?: HostToolOutput;
   durationMs?: number;
 }

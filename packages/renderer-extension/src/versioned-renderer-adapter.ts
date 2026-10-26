@@ -879,7 +879,11 @@ export function installCurrentRendererAdapter(): {
 
   const usageSubscription = createThreadUsageSubscriptionRelay();
   const idleReleaseSync = installIdleReleasePreferenceSync(window);
-  const clients = createRendererHostClients(() => window.__codexhostHostRoutingV1, window);
+  const clients = createRendererHostClients(
+    () => window.__codexhostHostRoutingV1,
+    window,
+    document,
+  );
   const stopGroupSync = startAgentGroupSync(
     getSharedAgentGroupPreferenceStore(),
     () => (disposed ? null : clients.forHost("local")),

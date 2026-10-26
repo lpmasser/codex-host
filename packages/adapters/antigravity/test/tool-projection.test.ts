@@ -11,6 +11,7 @@ import {
   synthesizeAntigravityCommand,
   toolTargetFile,
 } from "../src/index.js";
+import { classifyAntigravityToolActivity } from "../src/tool-projection.js";
 
 const CWD = path.resolve("/test/workspace");
 const newItemId = () => hostItemIdSchema.parse("item-12345");
@@ -337,4 +338,34 @@ describe("Antigravity Tool Projection", () => {
       }
     });
   });
+
+  it.each([
+    [
+      "view_file",
+      { AbsolutePath: '"/workspace/file.ts "' },
+      { type: "read", path: "/workspace/file.ts " },
+    ],
+    [
+      "list_dir",
+      JSON.stringify({ DirectoryPath: "/workspace/dir " }),
+      { type: "listFiles", path: "/workspace/dir " },
+    ],
+    [
+      "grep_search",
+      { Query: " needle ", SearchPath: "/workspace" },
+      { type: "search", query: " needle ", path: "/workspace" },
+    ],
+    ["grep_search", { Query: "needle" }, { type: "search", query: "needle" }],
+    ["grep_search", { Query: '"needle"' }, { type: "search", query: '"needle"' }],
+    ["grep_search", { Query: " " }, { type: "search", query: " " }],
+    ["view_file", { AbsolutePath: "   " }, undefined],
+    ["view_file", { path: "/unsupported-alias" }, undefined],
+    ["grep_search", { SearchPath: "/workspace" }, undefined],
+    ["run_command", { CommandLine: "ls" }, undefined],
+  ])(
+    "uses only native exploration arguments without changing them (%s)",
+    (name, parameters, activity) => {
+      expect(classifyAntigravityToolActivity(name as string, parameters)).toEqual(activity);
+    },
+  );
 });
