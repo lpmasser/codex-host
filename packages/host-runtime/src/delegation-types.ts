@@ -127,6 +127,8 @@ export interface DelegationStartResult {
 export interface ThreadSendInput {
   threadId: string;
   message: string;
+  /** Use the existing steering operation when running; idle Threads start a Turn. */
+  steer?: boolean;
 }
 
 export interface ThreadSendResult {
