@@ -332,6 +332,7 @@ import {
   type DecodedThreadRollbackRequest,
   type ExternalThreadRpcError,
   type CodexApprovalRequestProjection,
+  type CodexQuestionRequestProjection,
   type ExternalHarnessId,
   type JsonObject,
   type JsonRpcId,
@@ -396,6 +397,15 @@ interface PendingDesktopApproval {
   thread: ExternalThread;
   interaction: HostApprovalInteraction;
   projection: CodexApprovalRequestProjection;
+}
+
+interface PendingDesktopQuestion {
+  shared: boolean;
+  responding: boolean;
+  thread: ExternalThread;
+  interaction: HostQuestionInteraction;
+  projection: CodexQuestionRequestProjection;
+  timeout: NodeJS.Timeout | null;
 }
 
 type ExternalThreadStatus = { type: "active"; activeFlags: [] } | { type: "idle" };
@@ -670,7 +680,9 @@ export class AppServerHost {
   readonly #observedSessionUsage: ObservedSessionUsage;
   #repository: ExternalThreadRepository;
   #pendingDesktopApprovals = new Map<HostApprovalRequestId, PendingDesktopApproval>();
-  /** Pending Question requests, shared by the Desktop and delegation answer paths. */
+  // Shared multi-select cards retain the upstream Host-value reply protocol.
+  #pendingDesktopQuestions = new Map<HostQuestionRequestId, PendingDesktopQuestion>();
+  /** Native Question requests, shared by Desktop and delegation answer paths. */
   readonly #questions = new QuestionInteractions({
     run: (threadId, operation) =>
       this.#externalRuntime.idleRelease.runOperation(threadId, operation),
@@ -839,13 +851,7 @@ export class AppServerHost {
       hasRunningDescendants: (threadId) => this.#hasRunningSubagents(threadId),
       idleRelease: {
         queue: this.#desktopRequests,
-        onClosed: async (thread) => {
-          for (const pending of [...this.#pendingDesktopApprovals.values()]) {
-            if (pending.thread === thread)
-              await this.#resolveDesktopApproval(pending.interaction.interactionId);
-          }
-          await this.#questions.closeWhere((request) => request.threadId === thread.id);
-        },
+        onClosed: (thread) => this.#resolveThreadInteractions(thread),
         canRelease: (thread) =>
           !this.#hasRunningSubagents(thread.id) &&
           !thread.session.hasBackgroundWork?.() &&
@@ -854,7 +860,8 @@ export class AppServerHost {
           ![...this.#pendingDesktopApprovals.values()].some(
             (pending) => pending.thread === thread,
           ) &&
-          this.#questions.read(thread.id).length === 0,
+          this.#questions.read(thread.id).length === 0 &&
+          ![...this.#pendingDesktopQuestions.values()].some((pending) => pending.thread === thread),
       },
     });
     this.#delegationCoordinator = new HarnessDelegationCoordinator({
@@ -1078,6 +1085,11 @@ export class AppServerHost {
       await this.#externalRuntime.drain();
       for (const pending of [...this.#pendingDesktopApprovals.values()]) {
         await this.#resolveDesktopApproval(pending.interaction.interactionId, pending.thread).catch(
+          () => undefined,
+        );
+      }
+      for (const pending of [...this.#pendingDesktopQuestions.values()]) {
+        await this.#resolveDesktopQuestion(pending.interaction.interactionId, pending.thread).catch(
           () => undefined,
         );
       }
@@ -5644,7 +5656,8 @@ export class AppServerHost {
     }
     if (event.type === "interaction.closed") {
       const { interactionId } = event;
-      await this.#resolveDesktopApproval(interactionId);
+      await this.#resolveDesktopApproval(interactionId, thread);
+      await this.#resolveDesktopQuestion(interactionId, thread);
       await this.#questions.closeWhere(
         (request) =>
           request.threadId === thread.id && request.nativeInteractionId === interactionId,
@@ -6039,6 +6052,7 @@ export class AppServerHost {
       if (pending.thread === thread)
         await this.#resolveDesktopQuestion(pending.interaction.interactionId, thread);
     }
+    await this.#questions.closeWhere((request) => request.threadId === thread.id);
   }
 
   async #resolveDesktopApproval(
@@ -6177,6 +6191,26 @@ export class AppServerHost {
     for (const message of result.messages) await this.#writer.json(message);
 
     const requestId = this.#allocateQuestionRequestId();
+    if (shared) {
+      const expiresAtMs = interaction.expiresAt ? Date.parse(interaction.expiresAt) : Number.NaN;
+      const timeoutMs = Number.isFinite(expiresAtMs) ? Math.max(0, expiresAtMs - Date.now()) : null;
+      const pending: PendingDesktopQuestion = {
+        shared,
+        responding: false,
+        thread,
+        interaction,
+        projection: result.questionRequest,
+        timeout: null,
+      };
+      if (timeoutMs !== null) {
+        pending.timeout = setTimeout(() => {
+          void this.#cancelExpiredQuestion(requestId).catch((error) => this.#diagnose(error));
+        }, timeoutMs);
+      }
+      this.#pendingDesktopQuestions.set(requestId, pending);
+      // Multi-select groups have one owner/surface; never also publish a native single-choice card.
+      return;
+    }
     this.#questions.register({
       requestId,
       threadId: thread.id,
@@ -6232,6 +6266,54 @@ export class AppServerHost {
         })
         .catch(() => undefined);
       throw error;
+    }
+  }
+
+  async #cancelExpiredQuestion(requestId: HostQuestionRequestId): Promise<void> {
+    const pending = this.#pendingDesktopQuestions.get(requestId);
+    if (!pending) return;
+    await this.#externalRuntime.idleRelease.runOperation(pending.thread.id, async () => {
+      if (
+        this.#externalRuntime.get(pending.thread.id) !== pending.thread ||
+        this.#externalRuntime.idleRelease.failure(pending.thread)
+      )
+        return;
+      await this.#resolveDesktopQuestion(pending.interaction.interactionId, pending.thread);
+      if (pending.responding) return;
+      const result = await pending.thread.session.execute({
+        type: "interaction.respond",
+        interactionId: pending.interaction.interactionId,
+        response: { type: "question", answers: {}, cancelled: true },
+      });
+      if (!result.ok && result.error.code !== "invalidState") {
+        this.#diagnose(`Question expiry failed: ${result.error.message}`);
+      }
+    });
+  }
+
+  #retireDesktopQuestion(interactionId: HostInteractionId, thread: ExternalThread): void {
+    for (const [requestId, pending] of this.#pendingDesktopQuestions) {
+      if (pending.thread !== thread || pending.interaction.interactionId !== interactionId)
+        continue;
+      if (pending.timeout) clearTimeout(pending.timeout);
+      this.#pendingDesktopQuestions.delete(requestId);
+    }
+  }
+
+  async #resolveDesktopQuestion(
+    interactionId: HostInteractionId,
+    thread: ExternalThread,
+  ): Promise<void> {
+    for (const [requestId, pending] of this.#pendingDesktopQuestions) {
+      if (pending.thread !== thread || pending.interaction.interactionId !== interactionId)
+        continue;
+      if (pending.timeout) clearTimeout(pending.timeout);
+      this.#pendingDesktopQuestions.delete(requestId);
+      if (pending.shared) continue;
+      await this.#writer.json({
+        method: "serverRequest/resolved",
+        params: { threadId: pending.thread.id, requestId },
+      });
     }
   }
 

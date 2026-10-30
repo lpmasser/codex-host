@@ -4,7 +4,8 @@
 
 ## 现有路径与职责
 
-- 外部 Harness 的结构化 Question 仍由现有 projector 生成 Desktop 请求；委派方看到的 `request` 就是该请求的 params，答复仍由原有 `parseResponse` 映射选项文本，再交给 Adapter 的 `interaction.respond`。
+- 含多选字段的外部 Question 使用上游共享卡片及 Host 值答复接口；它们不登记为原生 `requestUserInput`，本委派接口暂不列出这些卡片。
+- 外部 Harness 的其他结构化 Question 仍由现有 projector 生成 Desktop 请求；委派方看到的 `request` 就是该请求的 params，答复仍由原有 `parseResponse` 映射选项文本，再交给 Adapter 的 `interaction.respond`。
 - 原生 Codex 的 `item/tool/requestUserInput` 参数原样登记；答复经已有服务端请求 ID 映射返回，不先转成 HostQuestion 再转换回去。
 - 原生 Codex 的异步选择题来自当前活动 Turn 的 `agentMessage.questions`，每题登记一个 `requestUserInputAsync` 凭证。答复使用 Desktop 原有 `<send_user_message_question_reply>` 格式经 `turn/steer` 提交，并绑定提问的 `expectedTurnId`；它不是服务端 RPC 请求，不发送 `serverRequest/resolved`。
 - `QuestionInteractions` 只保存一份挂起请求和回复回调，不判断选项、必填、多选或自由文本规则。协议处理者负责原有解析与校验。
