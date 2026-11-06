@@ -4,7 +4,7 @@ Antigravity CLI 的 `stream-json` 提供运行中的步骤和终态，但部分�
 
 ## 工具详情与已应用补丁
 
-当前 `agy 1.2.14` 原生日志将调用参数写在 `PLANNER_RESPONSE.tool_calls`，执行结果写在对应 `GENERIC` 步骤。Adapter 按原生执行 step index 和工具名关联调用及结果，解码各参数的 JSON 表示；不按文件名寻找“最近一次编辑”，不读取或展示内部 thinking。日志读取限制在所绑定 Profile 的 conversation 目录，拒绝重定向到目录外的文件，并限制读取大小。
+当前 `agy 1.2.14` 原生日志将调用参数写在 `PLANNER_RESPONSE.tool_calls`，执行结果写在对应 `GENERIC` 步骤。Adapter 按原生执行 step index 和工具名关联调用及结果，解码各参数的 JSON 表示；不按文件名寻找“最近一次编辑”；工具详情不读取、不夹带内部 thinking。日志读取限制在所绑定 Profile 的 conversation 目录，拒绝重定向到目录外的文件，并限制读取大小。
 
 精简的 stream 事件继续驱动生命周期。终态工具步骤补取原生参数和输出，命令调用保留原生命令输出，其他工具保存完整参数与受现有输出长度限制的结果。日志未生成、尚未完成或不可读时，保留已有 stream 事实，不把工具判成失败，也不伪造缺少的数据。
 
@@ -24,6 +24,6 @@ input/output/thinking/total token 保留原生用量语义：步骤数据描述�
 
 ## 终态与验证边界
 
-原生 `result.status` / `result.error` 仍是本轮终态的依据。中途网络错误后继续工作、结束却带此前错误的情况属于原生状态事实，Adapter 不因有最终文本就覆盖为成功，也不自动重发整轮任务。
+本轮终态判定沿用 Adapter 既有规则，本投影不改变它，也不自动重发整轮任务。
 
 回归覆盖精简 stream → Profile Transcript → 完整工具 Item / 已应用 diff → 历史快照，并用原生故障会话的三次实际编辑记录核对补丁可由 Git 解析。模拟 CLI 与 Language Server 验证压缩及上下文增长、下降和终态刷新；这些检查不代替真实 Desktop GUI 或服务端网络稳定性验证。修复不改写已有旧历史中的缺失工具数据。
