@@ -56,7 +56,7 @@ Pi 当前 Model 同时具备 Codex OAuth、Codex API 和本地 `priority` 元数
 
 已核对本机 agy `1.2.5` 的 `--help` 及 `-p /help --output-format json`。headless 输入接受 Prompt，不接受双向工具权限回答；官方说明需要交互批准的操作在 headless 下被 soft-denied。现有插件的 Skip permissions 仍是原生启动选项，官方 PreToolUse Hook 支持 allow/deny/ask 等决策，但它在工具执行前触发，并非原生审批请求/应答通道；headless 中 ask 仍被 soft-denied，不能将 Hook 拦截重建为另一套工具权限策略。提问 Hook 仅用于 ask_question，不等于普通工具审批。Python SDK 的 [ask_user policy](https://antigravity.google/docs/sdk/policies/) 是独立 runtime 的能力，不是已登录 CLI Session 的审批回传入口。
 
-原生 headless 命令目录未公布 `/compact` 或 `/compress`，也没有经验证的压缩命令或自动压缩开始/完成事件。SDK/交互终端中存在压缩实现不能证明当前 CLI Session 暴露等价调用入口。后续需原生 headless/RPC 增加可确认的会话压缩操作与结果，再在 Antigravity 插件内映射为命令与 contextCompaction Item；不发送普通“请总结”Prompt 伪装上下文压缩。当前 Python SDK 的 token_threshold 控制自动阈值，官方[按需压缩请求](https://github.com/google-antigravity/antigravity-sdk-python/issues/63)仍未关闭。
+原生 headless 命令目录未公布 `/compact` 或 `/compress`，插件不发送普通“请总结”Prompt 伪装压缩。当前会话投影承接原生 `checkpoint` 开始/终态与 Transcript 的 CHECKPOINT，将其保留为 `contextCompaction`；这是自动压缩事实的展示，没有新增手动压缩调用。工具详情、已应用补丁及原生上下文刷新见 [Transcript 投影](antigravity/antigravity-transcript-projection.md)。SDK 的 token_threshold 仍属于独立 runtime，不据此推导 CLI 支持手动压缩。
 
 依据：[官方 Hooks 文档](https://antigravity.google/docs/hooks)、[官方 headless 文档](https://antigravity.google/docs/cli/headless/)、[官方权限文档](https://antigravity.google/docs/cli/permissions)、[现有插件权限边界](antigravity/antigravity-tool-approval.md)。此次 `/help` 原生探针返回 num_turns=0，没有发起模型请求。
 

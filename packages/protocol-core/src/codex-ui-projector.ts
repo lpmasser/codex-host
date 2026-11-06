@@ -8,6 +8,7 @@ import type {
   HostItemUpdate,
   HostQuestionInteraction,
   HostTextInput,
+  HostToolActivity,
   HostTurnSnapshot,
   HistoricalTurnOutcome,
   InteractionClosedEvent,
@@ -192,6 +193,42 @@ export function toolCommandLine(toolName: string, args: JsonValue): string | und
     return filePath ? `grep ${pattern} ${filePath}` : `grep ${pattern}`;
   }
   return undefined;
+}
+
+function actionFileName(filePath: string): string {
+  const segments = filePath.split(/[/\\]/).filter(Boolean);
+  const last = segments[segments.length - 1];
+  return last && last.length > 0 ? last : filePath;
+}
+
+function projectToolActivity(
+  toolName: string,
+  activity: HostToolActivity,
+): { command: string; action: JsonObject } {
+  if (activity.type === "search") {
+    const command = activity.path
+      ? `${toolName} ${activity.query} ${activity.path}`
+      : `${toolName} ${activity.query}`;
+    return {
+      command,
+      action: {
+        type: "search",
+        command,
+        query: activity.query,
+        path: activity.path ?? null,
+      },
+    };
+  }
+  const command = `${toolName} ${activity.path}`;
+  return {
+    command,
+    action: {
+      type: activity.type,
+      command,
+      path: activity.path,
+      ...(activity.type === "read" ? { name: actionFileName(activity.path) } : {}),
+    },
+  };
 }
 
 function compactToolName(toolName: string): string {
@@ -544,7 +581,8 @@ function projectItem(
         durationMs: item.durationMs ?? null,
       };
     case "toolExecution": {
-      const command = toolCommandLine(item.toolName, item.arguments);
+      const activity = item.activity ? projectToolActivity(item.toolName, item.activity) : null;
+      const command = activity ? activity.command : toolCommandLine(item.toolName, item.arguments);
       if (command) {
         return {
           id: item.itemId,
@@ -554,7 +592,7 @@ function projectItem(
           processId: null,
           source: "agent",
           status: itemStatus(outcome),
-          commandActions: [],
+          commandActions: activity ? [activity.action] : [],
           aggregatedOutput: includeCommandOutput ? toolOutputText(item) : null,
           exitCode: null,
           durationMs: item.durationMs ?? null,
@@ -1137,7 +1175,10 @@ export class CodexTurnProjector {
         },
       });
     } else if (event.update.type === "output.replace") {
-      if (next.type === "toolExecution" && toolCommandLine(next.toolName, next.arguments)) {
+      if (
+        next.type === "toolExecution" &&
+        (next.activity !== undefined || toolCommandLine(next.toolName, next.arguments))
+      ) {
         const text = toolOutputText(next);
         if (text) {
           const previousText =

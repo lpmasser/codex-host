@@ -1,7 +1,6 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink } from "node:fs/promises";
-import https from "node:https";
+import { unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -28,8 +27,8 @@ import {
   type InspectHarnessInput,
   type HostAgentMessageItem,
   type HostCommand,
+  type HostContextCompactionItem,
   type HostEvent,
-  type HostFileChange,
   type HostItem,
   type HostItemOutcome,
   type HostItemSnapshot,
@@ -74,6 +73,7 @@ import {
 import { resolveAntigravityExecutable } from "./command.js";
 import { forkAntigravitySession } from "./fork.js";
 import { AntigravityHistory, antigravityHookDirectory } from "./history.js";
+import { antigravityHttpsPort, hostUsage, pollAntigravityContextUsage } from "./context-usage.js";
 import {
   antigravityAvailableThinkingOptions,
   antigravityModelArguments,
@@ -86,31 +86,29 @@ import {
 } from "./permission-modes.js";
 import { rollbackAntigravityLastTurn } from "./rollback.js";
 import { ANTIGRAVITY_COMMAND_CATALOG, parseAndFormatAntigravityCommand } from "./slash-commands.js";
-import {
-  codeActionFileChange,
-  requestAntigravityTrajectorySteps,
-  type AntigravityCodeAction,
-} from "./code-action-diff.js";
+import { nativeToolFileChange } from "./code-action-diff.js";
 import { fetchAntigravityQuota, type AntigravityQuotaSnapshot } from "./quota.js";
 import { AntigravityQuestionBridge } from "./question-bridge.js";
 import { AntigravitySubagents } from "./subagents.js";
-import { nativeSubagentIdSchema, readSubagentTranscript } from "./subagent-transcript.js";
+import {
+  nativeSubagentIdSchema,
+  readAntigravityToolDetail,
+  readSubagentTranscript,
+} from "./subagent-transcript.js";
 import { createAntigravityUsageStatistics } from "./usage-statistics.js";
 import {
   antigravityToolErrorMessage,
   isAntigravityPermissionDenial,
-  isRecord,
   parseAntigravityStreamLine,
   type AntigravityResultEvent,
   type AntigravityStepUpdateEvent,
   type AntigravityStreamEvent,
-  type AntigravityUsage,
 } from "./stream-events.js";
 import {
   completeAntigravityToolItem,
   isAntigravityFileMutatingTool,
   startAntigravityToolItem,
-  toolTargetFile,
+  synthesizeAntigravityCommand,
 } from "./tool-projection.js";
 
 export interface AntigravityAdapterOptions {
@@ -153,20 +151,26 @@ interface ActiveTurn {
   /** First tool denial of the Turn, kept to explain an otherwise empty result. */
   permissionDenial: string | null;
   latestUsage: HostUsage | null;
-  contextUsagePromise: Promise<Pick<
-    HostUsage,
-    "contextUsedTokens" | "contextWindowTokens"
-  > | null> | null;
+  /**
+   * In-flight native context refresh. At most one runs at a time, so a trigger
+   * that lands while one is running invalidates its sample and requests one
+   * observation at the newest revision.
+   */
+  contextRefresh: Promise<void> | null;
+  contextRevision: number;
+  contextRefreshPending: boolean;
+  /** Whether this Turn has a Language Server context reading, which outranks stream estimates. */
+  contextObserved: boolean;
+  /** Compaction Items retain their native step identity until completion. */
+  compactionItems: Map<number, HostContextCompactionItem>;
+  /** Checkpoint steps whose terminal state already completed a compaction Item. */
+  compactionCompleted: Set<number>;
   /**
    * Serializes stream handling: resolving a real edit diff needs an awaited
    * Language Server round trip, and Items must still reach the Host in the
    * order agy reported them.
    */
   queue: Promise<void>;
-  /** Applied edits already claimed by a tool step, so a repeat edit of the
-   * same file maps to the next recorded Code Action rather than the first. */
-  codeActionCursor: number;
-  fileChanges: Map<number, HostFileChange>;
   /** First sighting of a step whose Item was deferred: agy names the tool and
    * its parameters when the step opens, not when it ends. */
   pendingSteps: Map<number, AntigravityStepUpdateEvent["step_update"]>;
@@ -212,11 +216,6 @@ const DEFAULT_SUBAGENT_OBSERVATION_TIMEOUT_MS = 30_000;
 /** How long a finished Turn's agy may take to exit after its stdin closes before it is signalled. */
 const NATIVE_EXIT_GRACE_MS = 2_000;
 const DEFAULT_TURN_CLEANUP_WAIT_MS = 5_000;
-const CONTEXT_USAGE_TIMEOUT_MS = 8_000;
-const CONTEXT_USAGE_RETRY_MS = 100;
-const TRAJECTORY_TIMEOUT_MS = 2_000;
-const GEMINI_CONTEXT_WINDOW_TOKENS = 1_048_576;
-const CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
 
 /**
  * agy names a tool and its parameters when a step opens and repeats only what
@@ -248,27 +247,6 @@ function mergePendingStep(
         }
       : {}),
   };
-}
-
-/**
- * agy reports a tool target with the platform's own separators while its
- * trajectory reports a `file://` URI, so the two only compare after both are
- * resolved — case-insensitively where the filesystem is.
- */
-function sameFile(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
-export function resolveAntigravityContextWindow(modelId?: string, reportedWindow?: number): number {
-  if (modelId && /^claude(?:[-_.]|$)/iu.test(modelId)) {
-    return CLAUDE_CONTEXT_WINDOW_TOKENS;
-  }
-  if (!modelId || /^gemini(?:[-_.]|$)/iu.test(modelId)) {
-    return GEMINI_CONTEXT_WINDOW_TOKENS;
-  }
-  return reportedWindow && reportedWindow > 0 ? reportedWindow : GEMINI_CONTEXT_WINDOW_TOKENS;
 }
 
 const CAPABILITIES: HarnessSessionCapabilities = {
@@ -338,167 +316,6 @@ export function permissionDeniedTurnError(nativeMode: string | null, denial: str
     retryable: false,
     diagnostic: sanitizeDiagnosticTail(denial),
   };
-}
-
-function safeToken(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
-function contextWindowMetadata(value: unknown): Record<string, unknown> | null {
-  if (!isRecord(value)) return null;
-  const trajectory = isRecord(value.trajectory) ? value.trajectory : value;
-  const generatorMetadata = trajectory.generatorMetadata;
-  if (!Array.isArray(generatorMetadata)) return null;
-  const first = generatorMetadata[0];
-  if (!isRecord(first) || !isRecord(first.chatModel)) return null;
-  const chatStartMetadata = first.chatModel.chatStartMetadata;
-  if (!isRecord(chatStartMetadata) || !isRecord(chatStartMetadata.contextWindowMetadata)) {
-    return null;
-  }
-  return chatStartMetadata.contextWindowMetadata;
-}
-
-/** Parses the real context counters exposed by agy's local Language Server. */
-export function parseAntigravityContextUsage(
-  value: unknown,
-  modelId?: string,
-): Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null {
-  const metadata = contextWindowMetadata(value);
-  if (!metadata) return null;
-  const breakdown = isRecord(metadata.tokenBreakdown) ? metadata.tokenBreakdown : null;
-  const used = safeToken(
-    metadata.estimatedTokensUsed ??
-      metadata.estimated_tokens_used ??
-      breakdown?.totalTokens ??
-      breakdown?.total_tokens,
-  );
-  const window = safeToken(metadata.maxContextTokens ?? metadata.max_context_tokens);
-  if (used === undefined) return null;
-  const contextWindowTokens = resolveAntigravityContextWindow(modelId, window);
-  return { contextUsedTokens: used, contextWindowTokens };
-}
-
-function requestAntigravityContextUsage(
-  port: number,
-  conversationId: string,
-  timeoutMs: number,
-  modelId?: string,
-): Promise<Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null> {
-  return new Promise((resolve) => {
-    const request = https.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path: "/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata",
-        method: "POST",
-        rejectUnauthorized: false,
-        timeout: timeoutMs,
-        headers: { "content-type": "application/json" },
-      },
-      (response) => {
-        let body = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => {
-          body += chunk;
-        });
-        response.on("end", () => {
-          if (response.statusCode !== 200) return resolve(null);
-          try {
-            resolve(parseAntigravityContextUsage(JSON.parse(body), modelId));
-          } catch {
-            resolve(null);
-          }
-        });
-      },
-    );
-    request.on("timeout", () => request.destroy());
-    request.on("error", () => resolve(null));
-    request.end(
-      JSON.stringify({
-        cascadeId: conversationId,
-        generatorMetadataOffset: 0,
-        includeMessages: false,
-      }),
-    );
-  });
-}
-
-async function antigravityHttpsPort(logPath: string): Promise<number | null> {
-  try {
-    const log = await readFile(logPath, "utf8");
-    const match = log.match(
-      /Language server listening on random port at (\d+) for HTTPS \(gRPC\)/iu,
-    );
-    const port = match ? Number(match[1]) : Number.NaN;
-    return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
-  } catch {
-    return null;
-  }
-}
-
-async function pollAntigravityContextUsage(
-  logPath: string,
-  conversationId: string,
-  modelId?: string,
-  isDone?: () => boolean,
-): Promise<Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null> {
-  const deadline = Date.now() + CONTEXT_USAGE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const port = await antigravityHttpsPort(logPath);
-    if (port !== null) {
-      const usage = await requestAntigravityContextUsage(
-        port,
-        conversationId,
-        CONTEXT_USAGE_RETRY_MS,
-        modelId,
-      );
-      if (usage) return usage;
-    }
-    if (isDone?.()) break;
-    await new Promise<void>((resolve) => setTimeout(resolve, CONTEXT_USAGE_RETRY_MS));
-  }
-  return null;
-}
-
-/**
- * Host usage from one agy usage object. A step's usage describes one model request, whose prompt
- * estimates the context in use; agy reports that prompt as `input_tokens` plus the separate
- * `cache_read_tokens`. A result's usage sums every request of the native Conversation, so it
- * carries context only when agy names it.
- */
-function hostUsage(
-  value: AntigravityUsage | undefined,
-  modelId: string | undefined,
-  scope: "request" | "conversation",
-): HostUsage | null {
-  if (!value) return null;
-  const inputTokens = safeToken(value.input_tokens);
-  const outputTokens = safeToken(value.output_tokens);
-  const reasoningOutputTokens = safeToken(value.thinking_tokens);
-  const totalTokens = safeToken(value.total_tokens);
-  const requestPromptTokens =
-    scope === "request" && inputTokens !== undefined
-      ? inputTokens + (safeToken(value.cache_read_tokens) ?? 0)
-      : undefined;
-  const contextUsedTokens =
-    safeToken(value.context_used_tokens ?? value.estimated_tokens_used) ?? requestPromptTokens;
-  const rawWindow = safeToken(value.context_window_tokens ?? value.max_context_tokens);
-  const contextWindowTokens =
-    contextUsedTokens !== undefined || rawWindow !== undefined
-      ? resolveAntigravityContextWindow(modelId, rawWindow)
-      : undefined;
-  const usage: HostUsage = {
-    ...(inputTokens !== undefined ? { inputTokens } : {}),
-    ...(outputTokens !== undefined ? { outputTokens } : {}),
-    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
-    ...(totalTokens !== undefined ? { totalTokens } : {}),
-    ...(contextUsedTokens !== undefined &&
-    contextWindowTokens !== undefined &&
-    contextWindowTokens > 0
-      ? { contextUsedTokens, contextWindowTokens }
-      : {}),
-  };
-  return Object.keys(usage).length > 0 ? usage : null;
 }
 
 function normalizedProcessError(
@@ -861,10 +678,13 @@ class AntigravitySession implements HarnessSession {
       nativePermissionMode: null,
       permissionDenial: null,
       latestUsage: null,
-      contextUsagePromise: null,
+      contextRefresh: null,
+      contextRevision: 0,
+      contextRefreshPending: false,
+      contextObserved: false,
+      compactionItems: new Map(),
+      compactionCompleted: new Set(),
       queue: Promise.resolve(),
-      codeActionCursor: 0,
-      fileChanges: new Map(),
       pendingSteps: new Map(),
       httpsPort: null,
     };
@@ -995,8 +815,10 @@ class AntigravitySession implements HarnessSession {
       if (event.step_update.conversation_id !== this.#nativeRef?.nativeSessionId) return;
       await this.#handleStep(active, event.step_update);
       const usage = hostUsage(event.step_update.usage, active.model?.id, "request");
-      if (usage) this.#publishUsage(active, usage);
-      this.#ensureContextUsage(active, event.step_update.conversation_id);
+      if (usage) this.#publishUsage(active, usage, "stream");
+      if (event.step_update.step_type === "agent_response" && event.step_update.state === "DONE") {
+        this.#ensureContextUsage(active, event.step_update.conversation_id);
+      }
       return;
     }
     if (event.event !== "result") return;
@@ -1023,12 +845,11 @@ class AntigravitySession implements HarnessSession {
       return;
     }
     const usage = hostUsage(event.result.usage, active.model?.id, "conversation");
-    if (usage) this.#publishUsage(active, usage);
+    if (usage) this.#publishUsage(active, usage, "stream");
+    // The Turn's final context has to come from a fresh native observation, not
+    // from a value an earlier point of the Turn already captured.
     this.#ensureContextUsage(active, event.result.conversation_id);
-    if (active.contextUsagePromise) {
-      const contextUsage = await active.contextUsagePromise;
-      if (contextUsage) this.#publishUsage(active, contextUsage);
-    }
+    if (active.contextRefresh) await active.contextRefresh;
     await active.subagents.refresh();
     if (this.#active !== active) return;
     const convId = resultConversationId || this.#nativeRef?.nativeSessionId || "";
@@ -1154,7 +975,18 @@ class AntigravitySession implements HarnessSession {
       );
   }
 
-  #publishUsage(active: ActiveTurn, usage: HostUsage): void {
+  #publishUsage(active: ActiveTurn, usage: HostUsage, source: "stream" | "context"): void {
+    if (source === "context") {
+      active.contextObserved = true;
+    } else if (usage.contextUsedTokens !== undefined && active.contextObserved) {
+      // The stream's context is only a fallback; this Turn's Language Server
+      // reading stays current until the next native observation replaces it.
+      const billing: HostUsage = { ...usage };
+      delete billing.contextUsedTokens;
+      delete billing.contextWindowTokens;
+      if (Object.keys(billing).length === 0) return;
+      usage = billing;
+    }
     active.latestUsage = { ...(active.latestUsage ?? {}), ...usage };
     this.#event({
       type: "session.usage.changed",
@@ -1163,15 +995,48 @@ class AntigravitySession implements HarnessSession {
     });
   }
 
+  /**
+   * Refreshes the native context occupancy. Triggers are the Turn baseline, a
+   * completed checkpoint, and the Turn result — never every token delta — and
+   * an in-flight refresh is reused instead of issuing a second request.
+   */
   #ensureContextUsage(active: ActiveTurn, conversationId: string): void {
-    if (active.contextUsagePromise) return;
-    active.contextUsagePromise = pollAntigravityContextUsage(
-      active.logPath,
-      conversationId,
-      active.model?.id,
-      () =>
-        active.receivedResult || active.cancellationRequested || active.process.exitCode !== null,
-    );
+    active.contextRevision += 1;
+    active.contextRefreshPending = true;
+    if (active.contextRefresh) return;
+    const refresh = this.#refreshContextUsage(active, conversationId).finally(() => {
+      if (active.contextRefresh === refresh) active.contextRefresh = null;
+    });
+    active.contextRefresh = refresh;
+  }
+
+  async #refreshContextUsage(active: ActiveTurn, conversationId: string): Promise<void> {
+    while (
+      this.#active === active &&
+      !active.cancellationRequested &&
+      active.contextRefreshPending
+    ) {
+      active.contextRefreshPending = false;
+      const revision = active.contextRevision;
+      const usage = await pollAntigravityContextUsage(
+        active.logPath,
+        conversationId,
+        active.model?.id,
+        () =>
+          revision !== active.contextRevision ||
+          active.receivedResult ||
+          active.cancellationRequested ||
+          active.process.exitCode !== null,
+      ).catch(() => null);
+      if (this.#active !== active || active.cancellationRequested) return;
+      if (revision === active.contextRevision && usage)
+        this.#publishUsage(active, usage, "context");
+      if (active.contextRefreshPending) continue;
+      // Release the slot before this Promise's continuation runs. A native
+      // event queued in that gap must be able to request a new observation.
+      active.contextRefresh = null;
+      return;
+    }
   }
 
   async #handleStep(
@@ -1179,13 +1044,13 @@ class AntigravitySession implements HarnessSession {
     step: AntigravityStepUpdateEvent["step_update"],
   ): Promise<void> {
     if (step.step_type === "subagent") {
-      if (active.agentItem) {
-        this.#completeItem(active, active.agentItem, { status: "succeeded" });
-        active.agentItem = null;
-        active.agentText = "";
-      }
+      this.#settleAgentItem(active);
       if (active.subagents.handle(step)) return;
       step = { ...step, step_type: "tool" };
+    }
+    if (step.step_type === "checkpoint") {
+      this.#handleCheckpoint(active, step);
+      return;
     }
     if (step.step_type === "agent_response") {
       if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
@@ -1203,15 +1068,35 @@ class AntigravitySession implements HarnessSession {
       return;
     }
     if (step.step_type !== "tool") return;
-    if (active.agentItem) {
-      this.#completeItem(active, active.agentItem, { status: "succeeded" });
-      active.agentItem = null;
-      active.agentText = "";
+    this.#settleAgentItem(active);
+    let merged = mergePendingStep(active.pendingSteps.get(step.step_index), step);
+    if (merged.state === "DONE" || merged.state === "ERROR") {
+      const toolName = merged.tool_name ?? merged.tool_info?.name ?? "antigravity.tool";
+      const detail = await readAntigravityToolDetail({
+        conversationId: merged.conversation_id,
+        stepIndex: merged.step_index,
+        toolName,
+        home: this.#environment.USERPROFILE ?? this.#environment.HOME,
+      });
+      if (this.#active !== active) return;
+      if (detail) {
+        merged = {
+          ...merged,
+          tool_info: {
+            ...merged.tool_info,
+            parameters: detail.parameters,
+            // The stream already provides clean terminal output for commands.
+            ...(detail.output !== undefined &&
+            !synthesizeAntigravityCommand(toolName, detail.parameters, this.#cwd)
+              ? { output: detail.output }
+              : {}),
+          },
+        };
+      }
     }
-    const merged = mergePendingStep(active.pendingSteps.get(step.step_index), step);
     let item = active.tools.get(step.step_index);
     if (!item) {
-      const started = await this.#startToolItem(active, merged);
+      const started = this.#startToolItem(merged);
       if (!started) {
         active.pendingSteps.set(step.step_index, merged);
         return;
@@ -1248,53 +1133,70 @@ class AntigravitySession implements HarnessSession {
     this.#completeItem(active, completed, itemOutcome);
   }
 
+  /** Closes an agent message that is still streaming when something else happens. */
+  #settleAgentItem(active: ActiveTurn): void {
+    if (!active.agentItem) return;
+    this.#completeItem(active, active.agentItem, { status: "succeeded" });
+    active.agentItem = null;
+    active.agentText = "";
+  }
+
   /**
-   * A file-mutating step only becomes a File Change Item once its patch is
-   * known. agy publishes the step before the Language Server has recorded the
-   * applied edit, so an unresolved step stays uncarded until its terminal
-   * update rather than showing an empty patch.
+   * Native checkpoint steps are agy's context compaction. ACTIVE opens one
+   * compaction Item and a terminal state closes it, so a DONE-only checkpoint
+   * still gets a complete lifecycle while repeated terminal updates for the
+   * same step are recorded once.
    */
-  async #startToolItem(
-    active: ActiveTurn,
-    step: AntigravityStepUpdateEvent["step_update"],
-  ): Promise<HostItem | null> {
+  #handleCheckpoint(active: ActiveTurn, step: AntigravityStepUpdateEvent["step_update"]): void {
+    if (active.compactionCompleted.has(step.step_index)) return;
+    if (step.state !== "ACTIVE" && step.state !== "DONE" && step.state !== "ERROR") return;
+    const item =
+      active.compactionItems.get(step.step_index) ??
+      this.#startCompactionItem(active, step.step_index);
+    if (step.state === "ACTIVE") return;
+    active.compactionCompleted.add(step.step_index);
+    active.compactionItems.delete(step.step_index);
+    this.#completeItem(
+      active,
+      item,
+      step.state === "ERROR"
+        ? {
+            status: "failed",
+            error: {
+              code: "nativeFailure",
+              message: "Antigravity context compaction failed",
+              retryable: false,
+            },
+          }
+        : { status: "succeeded" },
+    );
+    // Compaction just rewrote the context window; the cached pre-compaction
+    // value must not survive it.
+    this.#ensureContextUsage(active, step.conversation_id);
+  }
+
+  #startCompactionItem(active: ActiveTurn, stepIndex: number): HostContextCompactionItem {
+    this.#settleAgentItem(active);
+    const item: HostContextCompactionItem = {
+      type: "contextCompaction",
+      itemId: this.#newItemId(),
+    };
+    active.compactionItems.set(stepIndex, item);
+    this.#event({ type: "item.started", turnId: active.command.turnId, item });
+    return item;
+  }
+
+  /** Applied native patches become File Changes only when the tool finishes. */
+  #startToolItem(step: AntigravityStepUpdateEvent["step_update"]): HostItem | null {
     const toolName = step.tool_name ?? step.tool_info?.name ?? "antigravity.tool";
     if (isAntigravityFileMutatingTool(toolName)) {
-      const change = await this.#claimFileChange(active, step, toolName);
-      if (change) {
-        return { type: "fileChange", itemId: this.#newItemId(), changes: [change] };
+      if (step.state === "DONE" && step.tool_info) {
+        const change = nativeToolFileChange(toolName, step.tool_info, this.#cwd);
+        if (change) return { type: "fileChange", itemId: this.#newItemId(), changes: [change] };
       }
       if (step.state !== "DONE" && step.state !== "ERROR") return null;
     }
     return startAntigravityToolItem(this.#newItemId(), step, this.#cwd);
-  }
-
-  async #claimFileChange(
-    active: ActiveTurn,
-    step: AntigravityStepUpdateEvent["step_update"],
-    toolName: string,
-  ): Promise<HostFileChange | null> {
-    const claimed = active.fileChanges.get(step.step_index);
-    if (claimed) return claimed;
-    const target = toolTargetFile(toolName, step.tool_info?.parameters);
-    if (!target) return null;
-    const port = await this.#languageServerPort(active);
-    if (port === null) return null;
-    const actions = await requestAntigravityTrajectorySteps(
-      port,
-      step.conversation_id,
-      TRAJECTORY_TIMEOUT_MS,
-    );
-    const index = actions.findIndex(
-      (action, at) => at >= active.codeActionCursor && sameFile(action.absolutePath, target),
-    );
-    const action: AntigravityCodeAction | undefined = index === -1 ? undefined : actions[index];
-    if (!action) return null;
-    const change = codeActionFileChange(action, this.#cwd);
-    if (!change) return null;
-    active.codeActionCursor = index + 1;
-    active.fileChanges.set(step.step_index, change);
-    return change;
   }
 
   async #languageServerPort(active: ActiveTurn): Promise<number | null> {
@@ -1371,6 +1273,11 @@ class AntigravitySession implements HarnessSession {
           : { status: "succeeded" };
     active.subagents.finish(itemOutcome);
     if (active.agentItem) this.#completeItem(active, active.agentItem, itemOutcome);
+    // A compaction without a terminal checkpoint ends with its Turn, so a
+    // cancelled or failed Turn never leaves the Item open.
+    for (const item of active.compactionItems.values())
+      this.#completeItem(active, item, itemOutcome);
+    active.compactionItems.clear();
     // A step whose patch never resolved still ran, so an interrupted Turn
     // reports it as a Tool Execution rather than dropping it silently.
     for (const step of active.pendingSteps.values()) {

@@ -27,6 +27,122 @@ const transcriptStepSchema = z.object({
   tool_calls: z.array(z.object({ name: z.string(), args: z.unknown().optional() })).optional(),
 });
 
+function transcriptSteps(text: string): Array<z.infer<typeof transcriptStepSchema>> {
+  const lines = text.split("\n");
+  if (lines.at(-1)?.trim()) {
+    try {
+      JSON.parse(lines.at(-1) ?? "");
+    } catch {
+      lines.pop();
+    }
+  }
+  const steps = lines
+    .filter((line) => line.trim())
+    .map((line) => transcriptStepSchema.parse(JSON.parse(line)));
+  const seen = new Set<number>();
+  for (const step of steps) {
+    if (seen.has(step.step_index)) throw new Error("Duplicate Antigravity transcript step");
+    seen.add(step.step_index);
+  }
+  return steps;
+}
+
+export interface AntigravityToolDetail {
+  parameters: Record<string, unknown>;
+  output?: string;
+}
+
+/** Native log arguments are JSON values encoded individually as strings. */
+function transcriptArguments(args: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(args).map(([key, value]) => {
+      if (typeof value !== "string") return [key, value];
+      try {
+        return [key, JSON.parse(value) as unknown];
+      } catch {
+        return [key, value];
+      }
+    }),
+  );
+}
+
+/** Match the execution step, not a filename or a repeated tool name. */
+export function parseAntigravityToolDetail(
+  text: string,
+  stepIndex: number,
+  toolName: string,
+): AntigravityToolDetail | null {
+  let calls: Array<{ name: string; args?: unknown }> = [];
+  for (const step of transcriptSteps(text)) {
+    if (step.type === "USER_INPUT") calls = [];
+    if (step.type === "PLANNER_RESPONSE") calls.push(...(step.tool_calls ?? []));
+    if (step.type !== "GENERIC") continue;
+    const call = calls.shift();
+    if (step.step_index !== stepIndex) continue;
+    if (!call || call.name !== toolName || !isRecord(call.args)) return null;
+    return {
+      parameters: transcriptArguments(call.args),
+      ...(step.content !== undefined ? { output: step.content } : {}),
+    };
+  }
+  return null;
+}
+
+async function readNativeTranscript(conversationId: string, home?: string): Promise<string> {
+  nativeSubagentIdSchema.parse(conversationId);
+  const file = path.join(
+    nativeBrainDirPath(conversationId, home),
+    ".system_generated",
+    "logs",
+    "transcript.jsonl",
+  );
+  const brainRoot = await realpath(path.dirname(nativeBrainDirPath(conversationId, home)));
+  const resolved = await realpath(file);
+  const expected = path.join(
+    brainRoot,
+    conversationId,
+    ".system_generated",
+    "logs",
+    "transcript.jsonl",
+  );
+  const normalize = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value);
+  if (normalize(resolved) !== normalize(expected))
+    throw new Error("Antigravity transcript redirects outside its native location");
+  const handle = await open(resolved, "r");
+  try {
+    const size = (await handle.stat()).size;
+    if (size > MAX_TRANSCRIPT_BYTES) throw new Error("Antigravity transcript too large");
+    const buffer = Buffer.alloc(size);
+    const { bytesRead } = await handle.read(buffer, 0, size, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function readAntigravityToolDetail(input: {
+  conversationId: string;
+  stepIndex: number;
+  toolName: string;
+  home: string | undefined;
+}): Promise<AntigravityToolDetail | null> {
+  try {
+    // The step event can precede the log append. Retry only that bounded flush
+    // gap, never a missing file, malformed log, or mismatched execution step.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const text = await readNativeTranscript(input.conversationId, input.home);
+      const detail = parseAntigravityToolDetail(text, input.stepIndex, input.toolName);
+      if (detail) return detail;
+      if (transcriptSteps(text).some((step) => step.step_index >= input.stepIndex)) return null;
+      if (attempt < 4) await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    return null;
+  } catch {
+    // Streaming steps remain usable while the native log is missing or incomplete.
+    return null;
+  }
+}
+
 export async function subagentRpc(
   port: number,
   conversationId: string,
@@ -101,24 +217,11 @@ export function parseSubagentTranscript(
   cwd: string,
   outputLimit: number,
 ): HostThreadSnapshot {
-  const lines = text.split("\n");
-  if (lines.at(-1)?.trim()) {
-    try {
-      JSON.parse(lines.at(-1) ?? "");
-    } catch {
-      lines.pop();
-    }
-  }
-  const steps = lines
-    .filter((line) => line.trim())
-    .map((line) => transcriptStepSchema.parse(JSON.parse(line)));
+  const steps = transcriptSteps(text);
   const turns: HostThreadSnapshot["turns"] = [];
   let current: HostThreadSnapshot["turns"][number] | undefined;
   let calls: Array<{ name: string; args?: unknown }> = [];
-  const seen = new Set<number>();
   for (const step of steps) {
-    if (seen.has(step.step_index)) throw new Error("Duplicate Subagent step");
-    seen.add(step.step_index);
     if (!current || step.type === "USER_INPUT") {
       calls = [];
       current = {
@@ -155,7 +258,9 @@ export function parseSubagentTranscript(
             },
           }
         : { status: "succeeded" };
-    if (step.type === "PLANNER_RESPONSE") {
+    if (step.type === "CHECKPOINT") {
+      current.items.push({ item: { type: "contextCompaction", itemId }, outcome });
+    } else if (step.type === "PLANNER_RESPONSE") {
       if (step.content) {
         current.items.push({
           item: { type: "agentMessage", itemId, text: step.content.slice(0, outputLimit) },
@@ -172,7 +277,10 @@ export function parseSubagentTranscript(
           step_type: "tool",
           state: step.status,
           tool_name: call?.name ?? step.type,
-          tool_info: { parameters: call?.args ?? null },
+          tool_info: {
+            parameters:
+              call && isRecord(call.args) ? transcriptArguments(call.args) : (call?.args ?? null),
+          },
         },
         cwd,
       );
@@ -208,36 +316,7 @@ export async function readSubagentTranscript(input: {
   }
   try {
     // Never follow a model-supplied log_uri to an arbitrary local file or network share.
-    const file = path.join(
-      nativeBrainDirPath(input.childId, input.home),
-      ".system_generated",
-      "logs",
-      "transcript.jsonl",
-    );
-    const brainRoot = await realpath(path.dirname(nativeBrainDirPath(input.childId, input.home)));
-    const resolved = await realpath(file);
-    const expected = path.join(
-      brainRoot,
-      input.childId,
-      ".system_generated",
-      "logs",
-      "transcript.jsonl",
-    );
-    const normalize = (value: string) =>
-      process.platform === "win32" ? value.toLowerCase() : value;
-    if (normalize(resolved) !== normalize(expected))
-      throw new Error("Subagent log redirects outside its native location");
-    const handle = await open(resolved, "r");
-    let text: string;
-    try {
-      const size = (await handle.stat()).size;
-      if (size > MAX_TRANSCRIPT_BYTES) throw new Error("Subagent transcript too large");
-      const buffer = Buffer.alloc(size);
-      const { bytesRead } = await handle.read(buffer, 0, size, 0);
-      text = buffer.subarray(0, bytesRead).toString("utf8");
-    } finally {
-      await handle.close();
-    }
+    const text = await readNativeTranscript(input.childId, input.home);
     return {
       ok: true,
       value: parseSubagentTranscript(

@@ -2030,6 +2030,11 @@ if (process.argv.includes("models")) {
   process.stdout.write("gemini-3.7-flash-high\\tGemini 3.7 Flash High\\nclaude-3-7-sonnet\\tClaude 3.7 Sonnet\\n");
   process.exit(0);
 }
+if (process.argv.includes("--version")) {
+  process.stdout.write("1.2.14\\n");
+  process.exit(0);
+}
+if (process.argv.some((arg) => arg.startsWith("--print="))) process.exit(0);
 const runsDir = ${JSON.stringify(runsDir)};
 fs.mkdirSync(runsDir, { recursive: true });
 const count = fs.readdirSync(runsDir).length;
@@ -2037,16 +2042,16 @@ fs.writeFileSync(path.join(runsDir, "run-" + count + ".txt"), "");
 
 if (count === 0) {
   process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 1, response: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120, context_used_tokens: 100 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 1, response: "Hello from Gemini", usage: { input_tokens: 100, output_tokens: 20, cache_read_tokens: 0, total_tokens: 120, context_used_tokens: 100 } } }) + "\\n");
 } else if (count === 1) {
   process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 2, response: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290, context_used_tokens: 250 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 2, response: "Hello from Claude", usage: { input_tokens: 250, output_tokens: 40, total_tokens: 290, context_used_tokens: 250 } } }) + "\\n");
 } else {
   process.stdout.write(JSON.stringify({ event: "init", conversation_id: "conv-switch", init: { permission_mode: "dangerously-skip-permissions" } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 3, state: "DONE", step_type: "agent_response", text_delta: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350 } } }) + "\\n");
-  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 3, response: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "step_update", step_update: { conversation_id: "conv-switch", step_index: 3, state: "DONE", step_type: "agent_response", text_delta: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350, context_used_tokens: 300 } } }) + "\\n");
+  process.stdout.write(JSON.stringify({ event: "result", result: { conversation_id: "conv-switch", status: "SUCCESS", num_turns: 3, response: "Back to Gemini", usage: { input_tokens: 300, output_tokens: 50, total_tokens: 350, context_used_tokens: 300 } } }) + "\\n");
 }
 `;
       await writeFile(jsPath, scriptContent);
@@ -2060,7 +2065,10 @@ if (count === 0) {
         await chmod(command, 0o755);
       }
 
-      const adapter = new AntigravityAdapter({ command });
+      const adapter = new AntigravityAdapter({
+        command,
+        environment: { ...process.env, CODEXHOST_DATA_DIR: path.join(directory, "host") },
+      });
       try {
         const opened = await adapter.open({
           kind: "create",
@@ -2107,6 +2115,9 @@ if (count === 0) {
           if (ev.type === "turn.completed") break;
         }
         expect(turn1Usage).not.toBeNull();
+        // Context occupancy only comes from native context fields; the
+        // cumulative billing input never stands in for it.
+        expect(turn1Usage?.contextUsedTokens).toBe(100);
         expect(turn1Usage?.contextWindowTokens).toBe(1_048_576);
         expect(turn1Usage).not.toHaveProperty("cachedInputTokens");
         expect(turn1Usage).not.toHaveProperty("cacheHitRatePercent");
@@ -2126,6 +2137,7 @@ if (count === 0) {
           if (ev.type === "turn.completed") break;
         }
         expect(turn2Usage).not.toBeNull();
+        expect(turn2Usage?.contextUsedTokens).toBe(250);
         expect(turn2Usage?.contextWindowTokens).toBe(200_000);
 
         // Switch back to Gemini
@@ -2150,6 +2162,7 @@ if (count === 0) {
           if (ev.type === "turn.completed") break;
         }
         expect(turn3Usage).not.toBeNull();
+        expect(turn3Usage?.contextUsedTokens).toBe(300);
         expect(turn3Usage?.contextWindowTokens).toBe(1_048_576);
 
         await session.close();
