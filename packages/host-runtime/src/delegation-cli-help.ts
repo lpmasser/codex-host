@@ -17,10 +17,12 @@ The CLI appends the actual caller's Thread link to the task when known, independ
 Reuse --request-id for an idempotent retry with the same parent, sender, task, target and configuration. With a parent, identical recent requests are also deduplicated briefly; without one, only an explicit request ID deduplicates creation.
 --watch true registers notification to the parent. Without a parent the task still starts, but watch reports notRegistered; use thread watch --notify to select a recipient.
 The response confirms cwd and any parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
-  "thread send": `codexhost thread send <thread> --message <text> [--format json|compact]
+  "thread send": `codexhost thread send <thread> --message <text> [--steer true|false] [--format json|compact]
 Start a new Turn in an idle writable Thread and return immediately.
 The CLI appends the actual caller's Thread link when known. A later sender is identified independently of the task's original parent; without caller context the message is unchanged.
 THREAD_BUSY means the current Turn is still active: wait or cancel before sending. Messages are not queued.
+--steer true instead uses the same adjustment operation as Desktop: native steering where supported, otherwise stop and resend. An idle Thread starts a new Turn. Omitted or false keeps the busy rejection above.
+Success confirms acceptance, not execution in the current Turn or task completion. The CLI reply does not distinguish native acceptance from a replacement Turn; use read/wait to observe the result.
 To be notified when that Turn ends, run thread watch after sending.`,
   "thread cancel": `codexhost thread cancel <thread> [--format json|compact]
 Request cancellation of the active Turn while preserving the Thread and history.
@@ -46,10 +48,10 @@ The reply is submitted to the existing request handler, and the same Question cl
   "thread watch": `codexhost thread watch <thread> [--notify <thread>] [--timeout-ms <n>] [--format json|compact]
 Ask the Host to notify one Thread, once, when the watched Thread stops or waits for an answer. Returns immediately; no waiting or polling by the caller is needed, and the caller may end its Turn.
 --notify defaults to the calling Thread when it is identified (CODEXHOST_THREAD_ID, or CODEX_THREAD_ID in native Codex); otherwise it is required. A task's creation parent can differ from the caller.
-The notification starts a new Turn in the notified Thread with the watched Thread's link and outcome: completed, failed, interrupted, needsInput, timedOut, unreadable, or notFound; a terminal outcome names its Turn, and needsInput names the Question request and Turn. It reports execution state only; read the Thread to judge the work.
+The notification uses the same steering operation as thread send --steer true, carrying the watched Thread's link and outcome: completed, failed, interrupted, needsInput, timedOut, unreadable, or notFound; a terminal outcome names its Turn, and needsInput names the Question request and Turn. It reports execution state only; read the Thread to judge the work.
 --timeout-ms defaults to 1740000 (29 min). timedOut means the Thread had not reached a terminal state, which also covers a Harness that stopped without reporting it; watch again to keep waiting. unreadable means reads failed for 60 s, so the state is unknown.
 state=watching means registered. state=alreadyTerminal means the Thread was not running and state=alreadyNeedsInput means it already has an unanswered Question: nothing was registered, nothing will be sent, and the response already includes pendingQuestions. After answering, watch again for the next Question or the end of the Turn.
-A busy notified Thread is notified after its Turn ends (retried for up to 6 hours); notifications due together arrive as one message. THREAD_BUSY is never treated as delivered.
+A notified Thread that cannot accept input yet is retried for up to 6 hours; notifications due together arrive as one message. THREAD_BUSY is never treated as delivered.
 A watch is one-shot and cannot be cancelled. Watching the same pair again while it is still watched returns that watch; once it has stopped, a new watch covers the next stop and any pending notification is still delivered. Watches live in Host Runtime memory and are lost when it restarts.`,
   "thread watches": `codexhost thread watches [--format json|compact]
 List watches that have not been delivered: watching, pendingDelivery (waiting for the notified Thread), or undeliverable (with the reason). Delivered watches are removed.`,
@@ -73,7 +75,7 @@ export const DELEGATION_HELP = `usage:
   codexhost harness list
   codexhost harness inspect <harness>
   codexhost delegate start --harness <id> --task <text>
-  codexhost thread send <thread> --message <text>
+  codexhost thread send <thread> --message <text> [--steer true|false]
   codexhost thread cancel <thread>
   codexhost thread read <thread>
   codexhost thread wait <thread>

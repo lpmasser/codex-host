@@ -340,7 +340,7 @@ export async function runDelegationCli(input: {
       return 0;
     }
     if (group === "thread" && command === "send") {
-      rejectUnknown(parsed, ["--message"]);
+      rejectUnknown(parsed, ["--message", "--steer"]);
       if (parsed.positionals.length !== 1) {
         throw new DelegationControlError(
           "INVALID_ARGUMENT",
@@ -355,6 +355,10 @@ export async function runDelegationCli(input: {
           "Thread identifier and --message are required",
         );
       }
+      const steer = value(parsed, "--steer");
+      if (steer !== undefined && steer !== "true" && steer !== "false") {
+        throw new DelegationControlError("INVALID_ARGUMENT", "--steer must be true or false");
+      }
       writeResult(
         "thread send",
         await requestRuntime({
@@ -363,6 +367,7 @@ export async function runDelegationCli(input: {
           body: {
             threadId: normalizeThreadId(threadId),
             message: withSenderLink(message, environment),
+            ...(steer !== undefined ? { steer: steer === "true" } : {}),
           },
           ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
         }),
