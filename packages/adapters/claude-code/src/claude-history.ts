@@ -19,6 +19,7 @@ import {
 } from "./native-message.js";
 import { ClaudeBackgroundOccupancy } from "./background-occupancy.js";
 import { claudeTranscriptItemId } from "./item-identity.js";
+import { isClaudeNarrationSignature } from "./thinking-signature.js";
 
 interface ClaudeHistoryMessage {
   type: "user" | "assistant";
@@ -49,7 +50,10 @@ function textParts(value: unknown): string[] {
 function thinkingParts(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((part) =>
-    isRecord(part) && part.type === "thinking" && typeof part.thinking === "string"
+    isRecord(part) &&
+    part.type === "thinking" &&
+    typeof part.thinking === "string" &&
+    !isClaudeNarrationSignature(part.signature)
       ? [part.thinking]
       : [],
   );
@@ -396,6 +400,27 @@ export function mapClaudeSnapshot(values: unknown[], sessionId: string): HostThr
         let projectedText = false;
         for (const [blockIndex, block] of content.entries()) {
           if (!isRecord(block)) continue;
+          if (
+            block.type === "thinking" &&
+            isClaudeNarrationSignature(block.signature) &&
+            typeof block.thinking === "string" &&
+            block.thinking.length > 0
+          ) {
+            items.push({
+              item: {
+                type: "agentMessage",
+                itemId: claudeTranscriptItemId(
+                  user.uuid,
+                  "agentMessage",
+                  (agentMessageOrdinal += 1),
+                ),
+                text: block.thinking,
+                phase: "commentary",
+              },
+              outcome: itemOutcome(outcome),
+            });
+            continue;
+          }
           if (block.type === "thinking" && !projectedReasoning && reasoning.length > 0) {
             items.push({
               item: {
@@ -600,7 +625,9 @@ export function mapClaudeSubagentSnapshot(
         if (block.type === "thinking" && typeof block.thinking === "string") {
           if (block.thinking.length > 0) {
             items.push({
-              item: { type: "reasoning", itemId, text: block.thinking },
+              item: isClaudeNarrationSignature(block.signature)
+                ? { type: "agentMessage", itemId, text: block.thinking, phase: "commentary" }
+                : { type: "reasoning", itemId, text: block.thinking },
               outcome: itemOutcome(outcome),
             });
           }
