@@ -11,6 +11,8 @@ import {
 import { WORKBUDDY_DELEGATION_INSTRUCTIONS } from "../src/delegation.js";
 import { WorkBuddyAdapter } from "../src/workbuddy-adapter.js";
 
+const internationalRelease = () => ({ dataFolderName: ".workbuddy-ai" });
+
 const runtimeEnvironment = {
   CODEXHOST_CLI_PATH: "/configured/cli with spaces",
   CODEXHOST_RUNTIME_ENDPOINT: "http://127.0.0.1:43123",
@@ -40,6 +42,7 @@ describe("WorkBuddy cross-Harness delegation", () => {
   it("exposes fixed native instructions while keeping Runtime credentials in the ACP environment", () => {
     const invocation = workBuddyInvocation({ HOME: "/Users/test", ...runtimeEnvironment }, false, {
       platform: "darwin",
+      readProduct: internationalRelease,
       isFile: () => false,
       isExecutable: (candidate) =>
         candidate === WORKBUDDY_MACOS_ELECTRON || candidate === WORKBUDDY_MACOS_CLI,
@@ -68,6 +71,7 @@ describe("WorkBuddy cross-Harness delegation", () => {
       false,
       {
         platform: "darwin",
+        readProduct: internationalRelease,
         isExecutable: (candidate) => candidate === "/custom/workbuddy",
       },
     );
@@ -82,6 +86,7 @@ describe("WorkBuddy cross-Harness delegation", () => {
     expect(
       workBuddyInvocation({ HOME: "/Users/test", ...runtimeEnvironment }, true, {
         platform: "darwin",
+        readProduct: internationalRelease,
         isFile: () => false,
         isExecutable: () => true,
       }).arguments,
@@ -100,7 +105,12 @@ describe("WorkBuddy cross-Harness delegation", () => {
           CODEXHOST_RUNTIME_TOKEN: undefined,
         },
         false,
-        { platform: "darwin", isExecutable: () => true, isFile: () => false },
+        {
+          platform: "darwin",
+          readProduct: internationalRelease,
+          isExecutable: () => true,
+          isFile: () => false,
+        },
       ).arguments,
     ).toEqual(["--eval", expect.any(String), WORKBUDDY_MACOS_CLI, "--acp"]);
   });
