@@ -2,7 +2,6 @@ import { HARNESS_MODEL_REF_MAX_LENGTH, harnessModelRefSchema } from "@codexhost/
 import { describe, expect, it } from "vitest";
 
 import {
-  canonicalizeOfficialCodexModelRef,
   decodeOfficialCodexModelRef,
   encodeOfficialCodexModelRef,
 } from "../src/official-codex-model-ref.js";
@@ -18,12 +17,9 @@ describe("official Codex Model refs", () => {
     expect(decodeOfficialCodexModelRef(ref)).toBe(nativeModelId);
   });
 
-  it("canonicalizes legacy transport-safe native IDs", () => {
+  it("decodes unencoded native IDs as-is", () => {
     const legacy = harnessModelRefSchema.parse({ id: "gpt-5.6-luna" });
     expect(decodeOfficialCodexModelRef(legacy)).toBe("gpt-5.6-luna");
-    expect(canonicalizeOfficialCodexModelRef(legacy)).toEqual({
-      id: "codex-model-v1.Z3B0LTUuNi1sdW5h",
-    });
   });
 
   it("rejects empty, malformed, non-canonical, and overlong refs", () => {
@@ -38,18 +34,6 @@ describe("official Codex Model refs", () => {
     expect(() => encodeOfficialCodexModelRef(" ")).toThrow("must not be empty");
     expect(() => encodeOfficialCodexModelRef("x".repeat(HARNESS_MODEL_REF_MAX_LENGTH))).toThrow(
       "too long",
-    );
-  });
-
-  it("canonicalizes legacy native IDs that collide with the opaque namespace", () => {
-    const nativeModelId = "codex-model-v1.literal";
-    expect(decodeOfficialCodexModelRef(encodeOfficialCodexModelRef(nativeModelId))).toBe(
-      nativeModelId,
-    );
-    const legacy = harnessModelRefSchema.parse({ id: nativeModelId });
-    expect(() => decodeOfficialCodexModelRef(legacy)).toThrow();
-    expect(decodeOfficialCodexModelRef(canonicalizeOfficialCodexModelRef(legacy))).toBe(
-      nativeModelId,
     );
   });
 });

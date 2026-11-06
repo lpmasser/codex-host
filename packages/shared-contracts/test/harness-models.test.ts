@@ -263,6 +263,85 @@ describe("Harness Model runtime contracts", () => {
     ).toBe(false);
   });
 
+  it("validates Model and Thinking option native IDs and rejects collisions", () => {
+    const validCatalog = {
+      models: [
+        { ref: firstRef, label: "First", nativeId: "provider/first" },
+        { ref: secondRef, label: "Second", nativeId: "provider/second" },
+      ],
+      defaultModel: firstRef,
+      thinkingOptions: [
+        { id: "opt1", label: "Option 1", nativeId: "low" },
+        { id: "opt2", label: "Option 2", nativeId: "high" },
+      ],
+      defaultThinkingOptionId: "opt2",
+    };
+    expect(harnessModelCatalogSchema.parse(validCatalog)).toEqual(validCatalog);
+
+    // Duplicate model nativeId
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        ...validCatalog,
+        models: [
+          { ref: firstRef, label: "First", nativeId: "same-native" },
+          { ref: secondRef, label: "Second", nativeId: "same-native" },
+        ],
+      }).success,
+    ).toBe(false);
+
+    // Model nativeId equals a different model's ref.id
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        ...validCatalog,
+        models: [
+          { ref: firstRef, label: "First", nativeId: secondRef.id },
+          { ref: secondRef, label: "Second" },
+        ],
+      }).success,
+    ).toBe(false);
+
+    // Model nativeId equals a different model's fastModel ref
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        models: [
+          { ref: firstRef, label: "First", nativeId: "provider/first.fast" },
+          { ref: secondRef, label: "Second", fastModel: { id: "provider/first.fast" } },
+        ],
+        thinkingOptions: [],
+      }).success,
+    ).toBe(false);
+
+    // Duplicate thinking option nativeId
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        ...validCatalog,
+        thinkingOptions: [
+          { id: "opt1", label: "Option 1", nativeId: "effort" },
+          { id: "opt2", label: "Option 2", nativeId: "effort" },
+        ],
+      }).success,
+    ).toBe(false);
+
+    // Thinking option nativeId equals a different option's id
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        ...validCatalog,
+        thinkingOptions: [
+          { id: "opt1", label: "Option 1", nativeId: "opt2" },
+          { id: "opt2", label: "Option 2" },
+        ],
+      }).success,
+    ).toBe(false);
+
+    // Non-blank / whitespace nativeId
+    expect(
+      harnessModelCatalogSchema.safeParse({
+        ...validCatalog,
+        models: [{ ref: firstRef, label: "First", nativeId: "   " }],
+      }).success,
+    ).toBe(false);
+  });
+
   it("keeps inspection and Thread selection params method-specific", () => {
     expect(
       harnessInspectParamsSchema.parse({
