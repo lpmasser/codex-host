@@ -780,6 +780,7 @@ function diffText(changes: HostFileChange[]): string {
 export class CodexTurnProjector {
   readonly #cwd: string;
   readonly #input: HostTurnSnapshot["input"];
+  readonly #publishInitialInput: boolean;
   readonly #clientUserMessageId: string | null;
   readonly #interactions = new Map<HostInteractionId, ProjectedInteraction>();
   readonly #items = new Map<HostItemId, ProjectedItem>();
@@ -801,12 +802,15 @@ export class CodexTurnProjector {
     cwd: string;
     startedAtMs: number;
     initialInput?: HostTurnSnapshot["input"];
+    /** False when Desktop already owns the optimistic input; read snapshots still retain it. */
+    publishInitialInput?: boolean;
     clientUserMessageId?: string;
   }) {
     this.#threadId = input.threadId;
     this.#turnId = input.turnId;
     this.#cwd = input.cwd;
     this.#input = input.initialInput ?? [];
+    this.#publishInitialInput = input.publishInitialInput ?? true;
     this.#clientUserMessageId = input.clientUserMessageId ?? null;
     this.#startedAtMs = input.startedAtMs;
     this.#startedAt = Math.floor(input.startedAtMs / 1000);
@@ -841,12 +845,15 @@ export class CodexTurnProjector {
     this.#userMessageClientIds.set(itemId, clientId);
   }
 
-  pendingTurn(startedAt: number | null = null): JsonObject {
+  pendingTurn(
+    startedAt: number | null = null,
+    options: { includeInput?: boolean } = {},
+  ): JsonObject {
     return {
       id: this.#turnId,
       status: "inProgress",
       items: [
-        ...this.#projectInput(),
+        ...this.#projectInput(options.includeInput ?? this.#publishInitialInput),
         ...this.#wireItemOrder.flatMap((itemId) => {
           const projected = this.#items.get(itemId);
           if (!projected?.wireStarted) return [];
@@ -1286,12 +1293,13 @@ export class CodexTurnProjector {
     const lastVisible = lastWireItemId === undefined ? undefined : this.#items.get(lastWireItemId);
     const finalAnswer = inferredFinalAnswer(lastVisible, event.outcome.status === "succeeded");
     if (lastVisible && finalAnswer) lastVisible.item = finalAnswer;
+    const initialInput = this.#projectInput(true);
     const turn: JsonObject = {
       id: this.#turnId,
       status: turnStatus(event.outcome),
       // Current Codex sends Tool/File Change state through Item notifications only.
       items: [
-        ...this.#projectInput(),
+        ...initialInput,
         ...this.#wireItemOrder.flatMap((itemId) => {
           const projected = this.#items.get(itemId);
           if (!projected) throw new Error("Host Turn contains an unknown Item");
@@ -1364,7 +1372,12 @@ export class CodexTurnProjector {
         {
           method: "turn/completed",
           emittedAtMs: completedAtMs,
-          params: { threadId: this.#threadId, turn },
+          params: {
+            threadId: this.#threadId,
+            turn: this.#publishInitialInput
+              ? turn
+              : { ...turn, items: (turn.items as JsonObject[]).slice(initialInput.length) },
+          },
         },
       ],
     };
@@ -1385,8 +1398,8 @@ export class CodexTurnProjector {
     };
   }
 
-  #projectInput(): JsonObject[] {
-    return this.#input.length === 0
+  #projectInput(include = this.#publishInitialInput): JsonObject[] {
+    return !include || this.#input.length === 0
       ? []
       : [
           {

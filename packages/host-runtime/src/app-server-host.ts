@@ -856,7 +856,6 @@ export class AppServerHost {
       startOfficial: (input) => this.#startOfficialDelegation(input),
       listOfficial: (input) => this.#listDelegationThreads(input),
       officialThreadMetadata: (threadId) => this.#readOfficialThreadMetadata(threadId),
-      activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
     });
     const maintenanceOperation = <T>(run: () => Promise<T>): Promise<T> =>
@@ -869,13 +868,7 @@ export class AppServerHost {
       start: (input) =>
         maintenanceOperation(async () => {
           if (options.sharedDelegation && input.harnessId !== "codex") {
-            const active = [...this.#activeOfficialTurns.keys()];
-            const parentThreadId =
-              input.parentThreadId ?? (active.length === 1 ? active[0] : undefined);
-            return options.sharedDelegation.start({
-              ...input,
-              ...(parentThreadId ? { parentThreadId } : {}),
-            });
+            return options.sharedDelegation.start(input);
           }
           return this.#waitForPlugins().then(() => this.#delegationCoordinator.start(input));
         }),
@@ -2440,8 +2433,7 @@ export class AppServerHost {
 
   async #canHandleDelegationStart(input: DelegationStartInput): Promise<boolean> {
     if (input.parentThreadId) return this.#ownsDelegationThread(input.parentThreadId);
-    const externalActive = this.#externalRuntime.values().some((thread) => thread.running);
-    return externalActive || this.#activeOfficialTurns.size > 0;
+    return true;
   }
 
   async #ownsDelegationThread(threadId: string): Promise<boolean> {
@@ -2562,7 +2554,7 @@ export class AppServerHost {
   }
 
   async #startOfficialDelegation(
-    input: DelegationStartInput & { parentThreadId: string; cwd: string; title: string },
+    input: DelegationStartInput & { cwd: string; title: string },
   ): Promise<DelegationStartResult> {
     const digest = createHash("sha256")
       .update(
@@ -2576,16 +2568,20 @@ export class AppServerHost {
       .digest("hex");
     const existing = input.requestId
       ? await this.#repository.findDelegationByRequest(input.requestId)
-      : await this.#repository.findRecentDelegation({
-          parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
-          targetHarnessId: harnessIdSchema.parse("codex"),
-          taskDigest: digest,
-          since: new Date(Date.now() - 30_000),
-        });
+      : input.parentThreadId
+        ? await this.#repository.findRecentDelegation({
+            parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+            targetHarnessId: harnessIdSchema.parse("codex"),
+            taskDigest: digest,
+            since: new Date(Date.now() - 30_000),
+          })
+        : null;
     if (
       existing &&
       input.requestId &&
-      (existing.targetHarnessId !== "codex" || existing.taskDigest !== digest)
+      (existing.targetHarnessId !== "codex" ||
+        existing.taskDigest !== digest ||
+        existing.parentHostThreadId !== input.parentThreadId)
     ) {
       throw new DelegationControlError(
         "INVALID_ARGUMENT",
@@ -2670,13 +2666,19 @@ export class AppServerHost {
     this.#activeOfficialTurns.set(threadId, turnId);
     const delegationId = hostThreadIdSchema.parse(randomUUID());
     try {
-      const source = await this.#repository.find(input.parentThreadId);
+      const source = input.parentThreadId
+        ? await this.#repository.find(input.parentThreadId)
+        : null;
       const pendingTerminal = this.#pendingOfficialTerminalStatuses.get(threadId);
       await this.#repository.createDelegation({
         delegationId,
-        parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+        ...(input.parentThreadId
+          ? {
+              parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+              sourceHarnessId: source?.harnessId ?? harnessIdSchema.parse("codex"),
+            }
+          : {}),
         childHostThreadId: hostThreadIdSchema.parse(threadId),
-        sourceHarnessId: source?.harnessId ?? harnessIdSchema.parse("codex"),
         targetHarnessId: harnessIdSchema.parse("codex"),
         status: pendingTerminal ?? "running",
         ...(input.requestId ? { requestId: input.requestId } : {}),
@@ -4653,7 +4655,7 @@ export class AppServerHost {
     const turns = this.#withOpenBackgroundCommands(thread, thread.turns);
     if (!thread.activeTurnId) return turns;
     const active = thread.projectedTurns.get(thread.activeTurnId);
-    return active ? [...turns, active.projector.pendingTurn()] : turns;
+    return active ? [...turns, active.projector.pendingTurn(null, { includeInput: true })] : turns;
   }
 
   /**
@@ -5061,7 +5063,14 @@ export class AppServerHost {
     const commands = thread.session.commands;
     if (!commands || !isExternalCommandCandidate(text)) {
       assertActive?.();
-      return this.#beginExternalTurn(thread, text, clientUserMessageId, sourceHostId, projectInput);
+      return this.#beginExternalTurn(
+        thread,
+        text,
+        inputText,
+        clientUserMessageId,
+        sourceHostId,
+        projectInput,
+      );
     }
     this.#pendingExternalCommandRequests.add(thread.id);
     try {
@@ -5077,6 +5086,7 @@ export class AppServerHost {
         return await this.#beginExternalTurn(
           thread,
           text,
+          inputText,
           clientUserMessageId,
           sourceHostId,
           projectInput,
@@ -5127,6 +5137,7 @@ export class AppServerHost {
   async #beginExternalTurn(
     thread: ExternalThread,
     text: string,
+    originalText: string,
     clientUserMessageId?: string,
     sourceHostId?: unknown,
     projectInput = false,
@@ -5153,12 +5164,9 @@ export class AppServerHost {
         turnId,
         cwd: thread.cwd,
         startedAtMs,
-        ...(this.#options.externalOnly || projectInput
-          ? {
-              initialInput: [{ type: "text" as const, text }],
-              ...(clientUserMessageId ? { clientUserMessageId } : {}),
-            }
-          : {}),
+        initialInput: [{ type: "text", text: originalText }],
+        publishInitialInput: this.#options.externalOnly === true || projectInput,
+        ...(clientUserMessageId ? { clientUserMessageId } : {}),
       }),
     };
     const gate = turnProjectionGate();
