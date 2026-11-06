@@ -7,6 +7,7 @@ import {
   type DelegationStartInput,
   type DelegationWatchApi,
   type HarnessInspectInput,
+  type ThreadAnswerInput,
   type ThreadListInput,
   type ThreadReadInput,
   type ThreadWaitInput,
@@ -129,6 +130,10 @@ export class DelegationControlRegistry implements DelegationControlApi, Delegati
     if (input.hostId !== undefined && input.hostId !== "local")
       throw new DelegationControlError("INVALID_ARGUMENT", "Remote Hosts support thread read only");
     return (await this.#registrationForThread(input.threadId)).wait(input);
+  }
+
+  async answer(input: ThreadAnswerInput) {
+    return (await this.#registrationForThread(input.threadId)).answer(input);
   }
 
   async watch(input: ThreadWatchInput) {
