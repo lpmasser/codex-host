@@ -19,7 +19,7 @@ export const CLAUDE_CONTEXT_WINDOW_TOKENS = 200_000;
 const CONTEXT_USAGE_TIMEOUT_MS = 8_000;
 const CONTEXT_USAGE_RETRY_MS = 100;
 
-function safeToken(value: unknown): number | undefined {
+export function safeToken(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 

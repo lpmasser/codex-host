@@ -1,6 +1,6 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { nativeToolFileChange } from "../src/index.js";
+import { nativeToolFileChange, parseAntigravityStepThinking } from "../src/index.js";
 const cwd = path.resolve("/test/workspace");
 const target = path.join(cwd, "src", "app.ts");
 const output = (patch: string) => `[diff_block_start]\n${patch}\n[diff_block_end]\n`;
@@ -66,5 +66,39 @@ describe("native applied diff boundary", () => {
         ),
       ).toBeNull();
     }
+  });
+});
+
+describe("parseAntigravityStepThinking", () => {
+  it("reads plannerResponse thinking or rawThinking at the step index or offset", () => {
+    const payload = {
+      steps: [
+        { type: "CORTEX_STEP_TYPE_USER_INPUT", status: "CORTEX_STEP_STATUS_DONE" },
+        {
+          type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+          status: "CORTEX_STEP_STATUS_DONE",
+          plannerResponse: {
+            thinking: "Inspecting the binary symbols before running tools.",
+            response: "Done.",
+          },
+        },
+        {
+          type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+          status: "CORTEX_STEP_STATUS_DONE",
+          plannerResponse: {
+            rawThinking: "Fallback raw thinking block.",
+          },
+        },
+      ],
+    };
+    expect(parseAntigravityStepThinking(payload, 0)).toBeNull();
+    expect(parseAntigravityStepThinking(payload, 1)).toBe(
+      "Inspecting the binary symbols before running tools.",
+    );
+    expect(parseAntigravityStepThinking(payload, 2)).toBe("Fallback raw thinking block.");
+    expect(parseAntigravityStepThinking({ steps: [payload.steps[1]] }, 256, 256)).toBe(
+      "Inspecting the binary symbols before running tools.",
+    );
+    expect(parseAntigravityStepThinking(null, 1)).toBeNull();
   });
 });
