@@ -67,6 +67,7 @@ import {
   installReasoningTranscriptSoftWrap,
   TRANSCRIPT_ITEM_SELECTOR,
 } from "./renderer-transcript-dom.js";
+import { installRendererComposerRailStyle } from "./renderer-composer-rail-style.js";
 import { RendererCodexAccountState } from "./renderer-codex-account-state.js";
 import {
   createRendererCodexUsageGate,
@@ -784,6 +785,7 @@ export function installRendererBindingProbe(
   const pendingReplacements = new Map<Element, PendingComposerReplacement>();
   let disposed = false;
   const disposeReasoningSoftWrap = installReasoningTranscriptSoftWrap(document);
+  const disposeComposerRailStyle = installRendererComposerRailStyle(document);
   let scanScheduled = false;
   let refreshTargetsOnNextScan = false;
   let adapterDispose: (() => void) | null = null;
@@ -3618,6 +3620,7 @@ export function installRendererBindingProbe(
       modelControl = null;
       mutationObserver.disconnect();
       disposeReasoningSoftWrap();
+      disposeComposerRailStyle();
       delegationMention?.dispose();
       skillLibrary.dispose();
       disposeSkillReferences();
