@@ -177,10 +177,6 @@ interface ActiveTurn {
   contextRefreshPending: boolean;
   /** Whether this Turn has a Language Server context reading, which outranks stream estimates. */
   contextObserved: boolean;
-  /** Compaction Items retain their native step identity until completion. */
-  compactionItems: Map<number, HostContextCompactionItem>;
-  /** Checkpoint steps whose terminal state already completed a compaction Item. */
-  compactionCompleted: Set<number>;
   /**
    * Serializes stream handling: resolving a real edit diff needs an awaited
    * Language Server round trip, and Items must still reach the Host in the
@@ -240,6 +236,7 @@ const DEFAULT_SUBAGENT_OBSERVATION_TIMEOUT_MS = 30_000;
 /** How long a finished Turn's agy may take to exit after its stdin closes before it is signalled. */
 const NATIVE_EXIT_GRACE_MS = 2_000;
 const DEFAULT_TURN_CLEANUP_WAIT_MS = 5_000;
+const TRAJECTORY_TIMEOUT_MS = 2_000;
 
 /**
  * agy names a tool and its parameters when a step opens and repeats only what
@@ -808,8 +805,6 @@ class AntigravitySession implements HarnessSession {
       contextRevision: 0,
       contextRefreshPending: false,
       contextObserved: false,
-      compactionItems: new Map(),
-      compactionCompleted: new Set(),
       queue: Promise.resolve(),
       pendingSteps: new Map(),
       thinkingSteps: new Set(),
@@ -1240,10 +1235,6 @@ class AntigravitySession implements HarnessSession {
       if (active.subagents.handle(step)) return;
       step = { ...step, step_type: "tool" };
     }
-    if (step.step_type === "checkpoint") {
-      this.#handleCheckpoint(active, step);
-      return;
-    }
     if (step.step_type === "agent_response") {
       await this.#maybeProjectStepThinking(active, step);
       const isDelta = typeof step.text_delta === "string" && step.text_delta.length > 0;
@@ -1375,51 +1366,7 @@ class AntigravitySession implements HarnessSession {
           }
         : { status: "succeeded" },
     );
-  }
-
-  /**
-   * A file-mutating step only becomes a File Change Item once its patch is
-   * known. agy publishes the step before the Language Server has recorded the
-   * applied edit, so an unresolved step stays uncarded until its terminal
-   * update rather than showing an empty patch.
-   */
-  #handleCheckpoint(active: ActiveTurn, step: AntigravityStepUpdateEvent["step_update"]): void {
-    if (active.compactionCompleted.has(step.step_index)) return;
-    if (step.state !== "ACTIVE" && step.state !== "DONE" && step.state !== "ERROR") return;
-    const item =
-      active.compactionItems.get(step.step_index) ??
-      this.#startCompactionItem(active, step.step_index);
-    if (step.state === "ACTIVE") return;
-    active.compactionCompleted.add(step.step_index);
-    active.compactionItems.delete(step.step_index);
-    this.#completeItem(
-      active,
-      item,
-      step.state === "ERROR"
-        ? {
-            status: "failed",
-            error: {
-              code: "nativeFailure",
-              message: "Antigravity context compaction failed",
-              retryable: false,
-            },
-          }
-        : { status: "succeeded" },
-    );
-    // Compaction just rewrote the context window; the cached pre-compaction
-    // value must not survive it.
     this.#ensureContextUsage(active, step.conversation_id);
-  }
-
-  #startCompactionItem(active: ActiveTurn, stepIndex: number): HostContextCompactionItem {
-    this.#settleAgentItem(active);
-    const item: HostContextCompactionItem = {
-      type: "contextCompaction",
-      itemId: this.#newItemId(),
-    };
-    active.compactionItems.set(stepIndex, item);
-    this.#event({ type: "item.started", turnId: active.command.turnId, item });
-    return item;
   }
 
   /** Applied native patches become File Changes only when the tool finishes. */
@@ -1469,7 +1416,11 @@ class AntigravitySession implements HarnessSession {
           : null;
     let thinking = inlineThinking;
     if (thinking === null) {
-      const thinkingTokens = safeToken(step.usage?.thinking_tokens);
+      const thinkingTokens = hostUsage(
+        step.usage,
+        active.model?.id,
+        "request",
+      )?.reasoningOutputTokens;
       if (!isTerminal || thinkingTokens === undefined || thinkingTokens > 0) {
         const port = await this.#languageServerPort(active);
         if (port !== null) {
@@ -1619,11 +1570,6 @@ class AntigravitySession implements HarnessSession {
     if (active.compactionItem) this.#completeItem(active, active.compactionItem, itemOutcome);
     active.compactionItem = null;
     if (active.agentItem) this.#completeItem(active, active.agentItem, itemOutcome);
-    // A compaction without a terminal checkpoint ends with its Turn, so a
-    // cancelled or failed Turn never leaves the Item open.
-    for (const item of active.compactionItems.values())
-      this.#completeItem(active, item, itemOutcome);
-    active.compactionItems.clear();
     // A step whose patch never resolved still ran, so an interrupted Turn
     // reports it as a Tool Execution rather than dropping it silently.
     for (const step of active.pendingSteps.values()) {

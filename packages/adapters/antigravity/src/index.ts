@@ -27,7 +27,11 @@ export {
   parseAntigravityStreamLine,
 } from "./stream-events.js";
 export type { AntigravityStreamEvent } from "./stream-events.js";
-export { nativeToolFileChange, parseAntigravityStepThinking, requestAntigravityStepThinking } from "./code-action-diff.js";
+export {
+  nativeToolFileChange,
+  parseAntigravityStepThinking,
+  requestAntigravityStepThinking,
+} from "./code-action-diff.js";
 export {
   compactToolName,
   completeAntigravityToolItem,

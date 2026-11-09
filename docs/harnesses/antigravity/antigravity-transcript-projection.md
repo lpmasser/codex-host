@@ -16,7 +16,7 @@ Antigravity CLI 的 `stream-json` 提供运行中的步骤和终态，但部分�
 
 ## 压缩事件与上下文用量
 
-原生 `checkpoint` 步骤映射为 `contextCompaction`，按同一个 step index 结算开始与完成；DONE-only、重复终态、失败与取消遵循普通 Item 生命周期。Subagent Transcript 的 CHECKPOINT 同样保留为压缩 Item，不消耗待关联的工具调用。该投影表达真实压缩事件，没有新增手动 `/compact` 命令或 Host 自有压缩机制。
+主会话原生 `checkpoint` 的 `contextCompaction` 生命周期与手动 `/compact` 命令沿用上游 Adapter；压缩结束触发原生上下文读数刷新。Subagent Transcript 的 CHECKPOINT 保留为压缩 Item，不消耗待关联的工具调用。Host 不自建压缩机制。
 
 input/output/thinking/total token 保留原生用量语义：步骤数据描述对应生成，result 数据汇总用量。当前上下文占用以 Language Server 的原生上下文读数为准，不由累计输入推算；本轮尚无该读数时，才以单次请求的 `input_tokens` 加 `cache_read_tokens` 作为后备，result 的会话累计用量不作为上下文。读取最新有效的 contextWindowMetadata，生成完成、压缩及本轮结束重新读取；旧异步查询不能覆盖更新结果。刷新保持一个在途读取，并合并期间的新触发，过程读取不为每个文本 delta 发请求；失败不会把累计 token 冒充为当前上下文。
 
