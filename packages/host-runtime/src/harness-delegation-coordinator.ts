@@ -707,15 +707,20 @@ export class HarnessDelegationCoordinator {
         input.threadIds.map(async (threadId) => ({
           threadId,
           children: await Promise.all(
-            (byParent.get(threadId) ?? []).map(async (row) => {
-              const childTitle = await title(row);
-              return {
-                threadId: row.delegation.childHostThreadId,
-                harnessId: row.delegation.targetHarnessId,
-                status: row.status,
-                ...(childTitle ? { title: childTitle } : {}),
-              };
-            }),
+            (byParent.get(threadId) ?? [])
+              .toSorted(
+                (left, right) =>
+                  Date.parse(right.delegation.createdAt) - Date.parse(left.delegation.createdAt),
+              )
+              .map(async (row) => {
+                const childTitle = await title(row);
+                return {
+                  threadId: row.delegation.childHostThreadId,
+                  harnessId: row.delegation.targetHarnessId,
+                  status: row.status,
+                  ...(childTitle ? { title: childTitle } : {}),
+                };
+              }),
           ),
         })),
       ),

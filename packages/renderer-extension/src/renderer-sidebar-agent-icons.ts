@@ -143,7 +143,7 @@ export function rendererAgentForThreadOwnership(ownership: ThreadOwnership): Ren
 // Desktop wraps some titles (hover label, secondary line), so the title is not always a direct
 // child of the trigger. Anchor the icon to the title's outermost wrapper that still sits in a
 // horizontal flex row, keeping it on the title line.
-export function sidebarTitleLineAnchor(titleTrigger: HTMLElement, title: HTMLElement): HTMLElement {
+function sidebarAgentIconAnchor(titleTrigger: HTMLElement, title: HTMLElement): HTMLElement {
   const view = title.ownerDocument.defaultView;
   let anchor = title;
   while (anchor.parentElement && anchor.parentElement !== titleTrigger) {
@@ -200,7 +200,7 @@ class BrowserSidebarAgentIconRow implements SidebarAgentIconRow {
       this.clear();
       return;
     }
-    const anchor = sidebarTitleLineAnchor(titleTrigger, title);
+    const anchor = sidebarAgentIconAnchor(titleTrigger, title);
     const icons = [
       ...this.element.querySelectorAll<HTMLElement>(`[${SIDEBAR_AGENT_ICON_ATTRIBUTE}]`),
     ];

@@ -36,6 +36,7 @@ export const delegationChildrenResultSchema = z.strictObject({
     .array(
       z.strictObject({
         threadId: hostThreadIdSchema,
+        /** Newest first. */
         children: z.array(delegationChildSchema),
       }),
     )

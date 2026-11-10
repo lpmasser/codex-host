@@ -8,15 +8,16 @@ import {
 import { createRendererAgentIcon, rendererAgentLabel } from "./renderer-agent-icon.js";
 import type { RendererModelClient } from "./renderer-model-client.js";
 import {
+  SIDEBAR_AGENT_ICON_ATTRIBUTE,
   SIDEBAR_THREAD_HOST_ID_ATTRIBUTE,
   SIDEBAR_THREAD_ROW_SELECTOR,
-  sidebarTitleLineAnchor,
   threadIdFromSidebarRowElement,
 } from "./renderer-sidebar-agent-icons.js";
 
 /**
- * Sidebar badge on a Thread that started other Threads with `delegate start`: the count, a dot
- * while any of them runs, and a popover listing each one with its status. The data is the Host's
+ * Corner count on the Agent icon of a Thread that started other Threads with `delegate start`,
+ * blue while any of them runs; the icon then opens a popover listing each child, running ones
+ * first, with its status. The data is the Host's
  * Delegation records; the badge only reads, and opening a child uses Desktop's own router.
  */
 
@@ -87,7 +88,12 @@ export function installRendererSidebarDelegationBadges(options: {
       threadIds: [parent],
       includeTitles: true,
     });
-    const list = result.parents[0]?.children ?? [];
+    // The Host lists newest first; running children move to the top, keeping that order.
+    const list = (result.parents[0]?.children ?? []).toSorted(
+      (left, right) =>
+        Number(delegationChildState(right) === "running") -
+        Number(delegationChildState(left) === "running"),
+    );
     if (disposed || !anchor.isConnected) return;
     closePopover();
 
@@ -186,72 +192,96 @@ export function installRendererSidebarDelegationBadges(options: {
     };
   };
 
+  // The badge decorates the row's Agent icon, which `renderer-sidebar-agent-icons` owns and may
+  // recreate; a recreated icon is decorated again on the next sidebar mutation.
+  const decorations = new WeakMap<HTMLElement, () => void>();
+
+  const undecorate = (icon: HTMLElement): void => {
+    decorations.get(icon)?.();
+    decorations.delete(icon);
+  };
+
   const renderBadge = (row: HTMLElement, threadId: string): void => {
+    const icon = row.querySelector<HTMLElement>(`[${SIDEBAR_AGENT_ICON_ATTRIBUTE}]`);
+    if (!icon) return;
     const list = children.get(threadId) ?? [];
-    const existing = row.querySelector<HTMLElement>(`[${BADGE_ATTRIBUTE}]`);
-    const titleTrigger = row.querySelector<HTMLElement>("[data-thread-title-trigger]");
-    const title = titleTrigger?.querySelector<HTMLElement>("[data-thread-title]");
-    if (list.length === 0 || !titleTrigger || !title) {
-      existing?.remove();
+    if (list.length === 0) {
+      undecorate(icon);
       return;
     }
-    // Same title-line anchor as the Agent icon, so the badge stays on the title's line.
-    const anchor = sidebarTitleLineAnchor(titleTrigger, title);
     const running = list.some((child) => delegationChildState(child) === "running");
     const presentation = `${threadId}:${list.length}:${running}`;
-    if (
-      existing?.dataset.presentation === presentation &&
-      existing.previousElementSibling === anchor
-    )
-      return;
-    existing?.remove();
+    if (icon.getAttribute(BADGE_ATTRIBUTE) === presentation) return;
+    undecorate(icon);
 
-    const badge = root.createElement("span");
-    badge.setAttribute(BADGE_ATTRIBUTE, threadId);
-    badge.dataset.presentation = presentation;
-    badge.setAttribute("role", "button");
-    badge.tabIndex = 0;
-    const label = `已派出 ${list.length} 个会话${running ? "，有会话运行中" : ""}`;
-    badge.setAttribute("aria-label", label);
-    badge.title = label;
-    badge.textContent = `↗${list.length}`;
-    Object.assign(badge.style, {
+    const original = {
+      title: icon.title,
+      label: icon.getAttribute("aria-label"),
+      role: icon.getAttribute("role"),
+      style: icon.getAttribute("style"),
+    };
+    const label = `${original.label ?? ""} · 已派出 ${list.length} 个会话${running ? "，有会话运行中" : ""}`;
+    icon.setAttribute(BADGE_ATTRIBUTE, presentation);
+    icon.setAttribute("role", "button");
+    icon.setAttribute("aria-label", label);
+    icon.title = label;
+    icon.tabIndex = 0;
+    Object.assign(icon.style, {
       position: "relative",
-      flex: "none",
-      marginLeft: "4px",
-      padding: "0 4px",
-      borderRadius: "4px",
-      fontSize: "11px",
-      lineHeight: "16px",
-      opacity: running ? "0.95" : "0.5",
+      pointerEvents: "auto",
       cursor: "pointer",
     } satisfies Partial<CSSStyleDeclaration>);
-    if (running) {
-      const dot = root.createElement("span");
-      Object.assign(dot.style, {
-        position: "absolute",
-        top: "1px",
-        right: "-1px",
-        width: "5px",
-        height: "5px",
-        borderRadius: "50%",
-        background: "#3e9bff",
-      } satisfies Partial<CSSStyleDeclaration>);
-      badge.append(dot);
-    }
+
+    const count = root.createElement("span");
+    count.textContent = list.length > 9 ? "9+" : String(list.length);
+    Object.assign(count.style, {
+      position: "absolute",
+      right: "-6px",
+      bottom: "-4px",
+      minWidth: "11px",
+      height: "11px",
+      padding: "0 2px",
+      boxSizing: "border-box",
+      borderRadius: "6px",
+      background: running ? "#3e9bff" : "color-mix(in srgb, currentColor 45%, transparent)",
+      color: "#fff",
+      font: "600 8px/11px system-ui, -apple-system, sans-serif",
+      textAlign: "center",
+      pointerEvents: "none",
+    } satisfies Partial<CSSStyleDeclaration>);
+    icon.append(count);
+
     const open = (event: Event): void => {
       event.preventDefault();
       event.stopPropagation();
-      void openPopover(badge, threadId).catch(() => undefined);
+      void openPopover(icon, threadId).catch(() => undefined);
     };
-    // The row navigates on press; keep the badge's own press from reaching it.
-    for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup"])
-      badge.addEventListener(type, (event) => event.stopPropagation());
-    badge.addEventListener("click", open);
-    badge.addEventListener("keydown", (event) => {
+    const swallow = (event: Event): void => event.stopPropagation();
+    const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === "Enter" || event.key === " ") open(event);
+    };
+    // The row navigates on press; keep the icon's own press from reaching it.
+    const pressEvents = ["pointerdown", "mousedown", "pointerup", "mouseup"] as const;
+    for (const type of pressEvents) icon.addEventListener(type, swallow);
+    icon.addEventListener("click", open);
+    icon.addEventListener("keydown", onKeyDown);
+    decorations.set(icon, () => {
+      for (const type of pressEvents) icon.removeEventListener(type, swallow);
+      icon.removeEventListener("click", open);
+      icon.removeEventListener("keydown", onKeyDown);
+      count.remove();
+      icon.removeAttribute(BADGE_ATTRIBUTE);
+      icon.removeAttribute("tabindex");
+      icon.title = original.title;
+      for (const [name, value] of [
+        ["aria-label", original.label],
+        ["role", original.role],
+        ["style", original.style],
+      ] as const) {
+        if (value === null) icon.removeAttribute(name);
+        else icon.setAttribute(name, value);
+      }
     });
-    anchor.after(badge);
   };
 
   const apply = (): void => {
@@ -327,7 +357,8 @@ export function installRendererSidebarDelegationBadges(options: {
       view.clearInterval(timer);
       root.removeEventListener("visibilitychange", onVisibility);
       closePopover();
-      for (const badge of root.querySelectorAll(`[${BADGE_ATTRIBUTE}]`)) badge.remove();
+      for (const icon of root.querySelectorAll<HTMLElement>(`[${BADGE_ATTRIBUTE}]`))
+        undecorate(icon);
     },
   };
 }
