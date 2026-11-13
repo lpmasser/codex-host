@@ -31,6 +31,7 @@ export function delegationChildRows(input: {
   const byParent = new Map<string, DelegationChildRow[]>();
   for (const delegation of input.delegations) {
     const parent = delegation.parentHostThreadId;
+    if (!parent) continue;
     let rows = byParent.get(parent);
     if (!rows) byParent.set(parent, (rows = []));
     rows.push({
