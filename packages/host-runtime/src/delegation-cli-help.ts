@@ -31,23 +31,25 @@ List Harnesses available in the active Runtime.`,
 Read available Models, native defaults, Thinking options, and configuration capabilities.
 Use the returned Model and Thinking IDs for explicit selections.`,
   "delegate start": `codexhost delegate start --harness <id> (--task <text> | --task-file <path|->) [--task-name <name>] [--cwd <path>] [--worktree <branch>] [--base <ref>] [--model <model>] [--thinking <thinking>] [--parent-thread <thread>] [--request-id <id>] [--ref <uri>]... [--watch true|false] [--watch-timeout-ms <n>] [--format json|compact|text]
-Create an independent child Thread, submit the task, and return immediately.
+Create an independent Thread, submit the task, and return immediately. A parent is optional.
 --task and --task-file are mutually exclusive. --task-file reads UTF-8 from a file, or stdin for -; maximum 262144 bytes (256 KiB) before removing one final LF or CRLF. Other whitespace and special characters are preserved; empty/whitespace-only input is rejected. Terminal stdin is rejected: use a quoted heredoc (<<'EOF') or a pipe. --task is unchanged.
 --task-name supplies a short subtask name (1-120 characters); otherwise the first task line is used.
-The child title is the subtask name only, fixed at creation; parent titles are not appended. Existing Threads are not renamed.
+With a parent Thread, the title is "subtask name · parent title"; without one it is just the subtask name. Titles are fixed at creation.
 Omit --model and --thinking to use the Harness native defaults. Either the catalog id or the nativeId shown by harness inspect is accepted.
 --cwd overrides the child workspace; a relative path resolves against the caller process cwd. Otherwise use the resolved parent Thread workspace, then the Host Runtime process cwd.
 --worktree creates a new branch and workspace at <main-repository>.worktrees/<sanitized-branch>, then uses it as the child cwd. The source is --cwd, or the caller process cwd when omitted (not the parent Thread workspace).
 --base requires --worktree and defaults to that source checkout's HEAD commit, including detached HEAD. JSON and compact responses add worktree {path, branch, base}, where base is the resolved commit SHA. Existing branches/directories, merges, rebases, unmerged indexes, non-Git cwd and unresolved bases are rejected. Uncommitted source changes are not copied.
 No automatic merge or cleanup is performed; --request-id does not reuse an existing worktree or branch. If creation or the Runtime request fails after creating artifacts, the error reports any retained worktree/branch in details.worktree (worktreeRetained=true); a failed response can still mean the child started.
---parent-thread overrides caller inference. PARENT_THREAD_AMBIGUOUS requires an explicit parent.
-Reuse --request-id for an idempotent retry. Identical recent parent/target/task/configuration requests are also deduplicated briefly.
---watch true also registers thread watch on the child with the resolved parent as the notified Thread; the response's watch field reports whether it was registered.
+--parent-thread sets the creation relationship; otherwise the known caller Thread is used. No caller means no parent. Active Threads and the Host process environment are never used to guess a caller.
+The CLI appends the actual caller's Thread link to the task when known, independently of --parent-thread. It never reads that Thread automatically.
+Reuse --request-id for an idempotent retry with the same parent, sender, task, target and configuration. With a parent, identical recent requests are also deduplicated briefly; without one, only an explicit request ID deduplicates creation.
+--watch true also registers thread watch on the child with the resolved parent as the notified Thread; without a parent the task still starts but watch reports notRegistered. Use thread watch --notify to select a recipient.
 --ref records where the work came from, such as an issue URL; repeat it for several. Absolute URIs only, at most 16 per Thread; credentials in a URI are removed. A child inherits its parent Thread's references.
 An external client that omits --parent-thread starts the work as itself (parent client:<name>) and must pass --cwd.
 The response confirms cwd and parent. Use its Thread reference with thread read, wait, send, cancel, or watch.`,
   "thread send": `codexhost thread send <thread> (--message <text> | --message-file <path|->) [--interrupt] [--watch true|false] [--watch-timeout-ms <n>] [--format json|compact|text]
 Start a new Turn in a writable Thread and return after submission.
+The CLI appends the actual caller's Thread link when known. A later sender is identified independently of the task's original parent; without caller context the message is unchanged.
 --message and --message-file are mutually exclusive. --message-file reads UTF-8 from a file, or stdin for -; maximum 262144 bytes (256 KiB) before removing one final LF or CRLF. Other whitespace and special characters are preserved; empty/whitespace-only input is rejected. Terminal stdin is rejected: use a quoted heredoc (<<'EOF') or a pipe. --message is unchanged.
 Without --interrupt, THREAD_BUSY means the current Turn is still active. Messages are not queued.
 --interrupt cancels an active Turn and confirms it stopped before sending (30 s stop timeout); an idle Thread is sent normally. Cancellation failure/timeout sends nothing. It preserves existing watches, suppressing the temporary stop notification; it never retries or queues a failed send.
@@ -68,7 +70,7 @@ timedOut=true is a running checkpoint: the child keeps running. The response alr
 ${MESSAGE_VIEW_HELP}`,
   "thread watch": `codexhost thread watch <thread> [--notify <thread>] [--timeout-ms <n>] [--format json|compact|text]
 Ask the Host to notify one Thread, once, when the watched Thread stops. Returns immediately; no waiting or polling by the caller is needed, and the caller may end its Turn.
---notify defaults to the calling Thread when it is identified (CODEXHOST_THREAD_ID, or CODEX_THREAD_ID in native Codex); for an external client it defaults to the client, and the notification becomes an event in its log (see codexhost events). Otherwise it is required. delegate start reports the caller as its parent.
+--notify defaults to the calling Thread when it is identified (CODEXHOST_THREAD_ID, or CODEX_THREAD_ID in native Codex); for an external client it defaults to the client, and the notification becomes an event in its log (see codexhost events). Otherwise it is required. A task's creation parent can differ from the caller.
 The notification starts a new Turn in the notified Thread with the watched Thread's link and outcome: completed, failed, interrupted, timedOut, unreadable, or notFound. It reports execution state only and asks the notified agent to read each Thread's result before continuing.
 Link labels use the observed title (Thread id if unavailable); a suffix after " · " is limited to 20 characters plus an ellipsis without renaming the Thread.
 --timeout-ms defaults to 1740000 (29 min). timedOut means the Thread had not reached a terminal state, which also covers a Harness that stopped without reporting it; watch again to keep waiting. unreadable means reads failed for 60 s, so the state is unknown.

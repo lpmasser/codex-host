@@ -948,7 +948,7 @@ export class AppServerHost {
       startOfficial: (input) => this.#startOfficialDelegation(input),
       listOfficial: (input) => this.#listDelegationThreads(input),
       officialThreadMetadata: (threadId) => this.#readOfficialThreadMetadata(threadId),
-      activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
+      activeOfficialThreads: () => [...this.#activeOfficialTurns.keys()],
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
     });
     options.sharedThreads?.setLocalOwnershipProbe((threadId) => this.#hasLocalThread(threadId));
@@ -963,13 +963,7 @@ export class AppServerHost {
         start: (input) =>
           maintenanceOperation(async () => {
             if (options.sharedDelegation && input.harnessId !== "codex") {
-              const active = [...this.#activeOfficialTurns.keys()];
-              const parentThreadId =
-                input.parentThreadId ?? (active.length === 1 ? active[0] : undefined);
-              return options.sharedDelegation.start({
-                ...input,
-                ...(parentThreadId ? { parentThreadId } : {}),
-              });
+              return options.sharedDelegation.start(input);
             }
             return this.#waitForPlugins().then(() => this.#delegationCoordinator.start(input));
           }),
@@ -2094,8 +2088,7 @@ export class AppServerHost {
 
   async #canHandleDelegationStart(input: DelegationStartInput): Promise<boolean> {
     if (input.parentThreadId) return this.#ownsDelegationThread(input.parentThreadId);
-    const externalActive = this.#externalRuntime.values().some((thread) => thread.running);
-    return externalActive || this.#activeOfficialTurns.size > 0;
+    return true;
   }
 
   async #hasLocalThread(threadId: string): Promise<boolean> {
@@ -2228,19 +2221,23 @@ export class AppServerHost {
   }
 
   async #startOfficialDelegation(
-    input: DelegationStartInput & { parentThreadId: string; cwd: string; title: string },
+    input: DelegationStartInput & { cwd: string; title: string },
   ): Promise<DelegationStartResult> {
     const resolveDuplicate = async (taskDigest: string) =>
       input.requestId
         ? this.#repository.findDelegationByRequest(input.requestId)
-        : this.#repository.findRecentDelegation({
-            parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
-            targetHarnessId: harnessIdSchema.parse("codex"),
-            taskDigest,
-            since: new Date(Date.now() - 30_000),
-          });
+        : input.parentThreadId
+          ? this.#repository.findRecentDelegation({
+              parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+              targetHarnessId: harnessIdSchema.parse("codex"),
+              taskDigest,
+              since: new Date(Date.now() - 30_000),
+            })
+          : null;
     const matchesDigest = (delegation: StoredDelegationRecordV1, taskDigest: string) =>
-      delegation.targetHarnessId === "codex" && delegation.taskDigest === taskDigest;
+      delegation.targetHarnessId === "codex" &&
+      delegation.taskDigest === taskDigest &&
+      delegation.parentHostThreadId === input.parentThreadId;
     const existingResult = (existing: StoredDelegationRecordV1): DelegationStartResult => {
       const turnId = this.#activeOfficialTurns.get(existing.childHostThreadId) ?? "pending";
       return {
@@ -2316,7 +2313,7 @@ export class AppServerHost {
           if (matchesDigest(existing, digest)) return existingResult(existing);
         } else {
           existing = await resolveDuplicate(digest);
-          if (existing) return existingResult(existing);
+          if (existing && matchesDigest(existing, digest)) return existingResult(existing);
         }
       }
       if (requestedModel) {
@@ -2368,13 +2365,19 @@ export class AppServerHost {
     this.#activeOfficialTurns.set(threadId, turnId);
     const delegationId = hostThreadIdSchema.parse(randomUUID());
     try {
-      const source = await this.#repository.find(input.parentThreadId);
+      const source = input.parentThreadId
+        ? await this.#repository.find(input.parentThreadId)
+        : null;
       const pendingTerminal = this.#pendingOfficialTerminalStatuses.get(threadId);
       await this.#repository.createDelegation({
         delegationId,
-        parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+        ...(input.parentThreadId
+          ? {
+              parentHostThreadId: hostThreadIdSchema.parse(input.parentThreadId),
+              sourceHarnessId: source?.harnessId ?? harnessIdSchema.parse("codex"),
+            }
+          : {}),
         childHostThreadId: hostThreadIdSchema.parse(threadId),
-        sourceHarnessId: source?.harnessId ?? harnessIdSchema.parse("codex"),
         targetHarnessId: harnessIdSchema.parse("codex"),
         status: pendingTerminal ?? "running",
         ...(input.requestId ? { requestId: input.requestId } : {}),

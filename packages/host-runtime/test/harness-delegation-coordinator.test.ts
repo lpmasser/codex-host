@@ -89,7 +89,7 @@ async function fixture(
       const metadata = await officialThreadCwd(threadId);
       return typeof metadata === "string" ? { cwd: metadata } : (metadata ?? {});
     },
-    activeOfficialParents: () => [],
+    activeOfficialThreads: () => [],
     externalThreadBusy,
   });
   return {
@@ -184,6 +184,44 @@ describe("HarnessDelegationCoordinator", () => {
       await value.close();
     }
   });
+  it("creates independent tasks without inferring an active parent or deduplicating unrelated callers", async () => {
+    const value = await fixture(undefined, undefined, {
+      CODEXHOST_THREAD_ID: "host-process-parent",
+    });
+    try {
+      const ids = new Set<string>();
+      for (let active = 0; active < 3; active++) {
+        const result = await value.coordinator.start({
+          harnessId: "pi",
+          task: "independent task",
+          cwd: "/synthetic",
+        });
+        ids.add(result.threadId);
+        expect(result).not.toHaveProperty("parentThreadId");
+        const record = await value.repository.getDelegationByChild(
+          hostThreadIdSchema.parse(result.threadId),
+        );
+        expect(record).not.toHaveProperty("parentHostThreadId");
+        expect(record).not.toHaveProperty("sourceHarnessId");
+        expect(await value.repository.find(result.threadId)).toMatchObject({
+          title: "independent task",
+        });
+      }
+      expect(ids.size).toBe(3);
+      const request = {
+        harnessId: "pi" as const,
+        task: "retryable task",
+        requestId: "independent-retry",
+      };
+      const first = await value.coordinator.start(request);
+      expect(await value.coordinator.start(request)).toMatchObject({ threadId: first.threadId });
+      await expect(
+        value.coordinator.start({ ...request, parentThreadId: "different-parent" }),
+      ).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
+    } finally {
+      await value.close();
+    }
+  });
   it("carries the display name through the real CLI HTTP endpoint and persists it separately from the task", async () => {
     const value = await fixture(undefined, async () => ({ title: "Main project" }));
     const server = await startDelegationControlServer({
@@ -219,19 +257,19 @@ describe("HarnessDelegationCoordinator", () => {
         threadId: string;
         title: string;
       };
-      expect(result.title).toBe("Protocol review");
+      expect(result.title).toBe("Protocol review · Main project");
       expect(await value.repository.find(result.threadId)).toMatchObject({
-        title: "Protocol review",
+        title: "Protocol review · Main project",
       });
       expect(value.delivered).toEqual(["Full instructions\nwith details"]);
-      expect(value.notifications[0]).toMatchObject({ name: "Protocol review" });
+      expect(value.notifications[0]).toMatchObject({ name: "Protocol review · Main project" });
     } finally {
       await server.close();
       await value.close();
     }
   });
 
-  it("saves only the subtask name without changing task delivery or retry identity", async () => {
+  it("saves the subtask and parent names without changing task delivery or retry identity", async () => {
     const value = await fixture();
     try {
       const parent = await value.repository.createProvisional({
@@ -252,18 +290,18 @@ describe("HarnessDelegationCoordinator", () => {
         requestId: "named-child",
       };
       const result = await value.coordinator.start(input);
-      expect(result.title).toBe("Protocol review");
+      expect(result.title).toBe("Protocol review · Project review");
       expect(await value.repository.find(result.threadId)).toMatchObject({
-        title: "Protocol review",
+        title: "Protocol review · Project review",
       });
-      expect(value.notifications[0]).toMatchObject({ name: "Protocol review" });
+      expect(value.notifications[0]).toMatchObject({ name: "Protocol review · Project review" });
       await value.repository.setTitle(parent.hostThreadId, "Renamed parent");
       expect(
         await value.coordinator.start({ ...input, taskName: "Changed display name" }),
       ).toMatchObject({ threadId: result.threadId });
       expect(value.adapter.sessions).toHaveLength(1);
       expect(await value.repository.find(result.threadId)).toMatchObject({
-        title: "Protocol review",
+        title: "Protocol review · Project review",
       });
       const next = await value.coordinator.start({
         harnessId: input.harnessId,
@@ -272,7 +310,7 @@ describe("HarnessDelegationCoordinator", () => {
         requestId: "next-child",
       });
       expect(await value.repository.find(next.threadId)).toMatchObject({
-        title: "Next task",
+        title: "Next task · Renamed parent",
       });
     } finally {
       await value.close();
@@ -287,7 +325,7 @@ describe("HarnessDelegationCoordinator", () => {
     { title: "", preview: " \n " },
     { title: "", preview: undefined },
   ])(
-    "does not append or change the parent title or preview ($title, $preview)",
+    "appends the parent title or preview without changing the parent ($title, $preview)",
     async ({ title, preview }) => {
       const value = await fixture();
       try {
@@ -310,7 +348,10 @@ describe("HarnessDelegationCoordinator", () => {
           taskName: "删除 Skill 命令链路",
           parentThreadId: parent.hostThreadId,
         });
-        const childTitle = "删除 Skill 命令链路";
+        const parentTitle =
+          (title?.trim() || preview || "Untitled Thread").replace(/\s+/gu, " ").trim() ||
+          "Untitled Thread";
+        const childTitle = `删除 Skill 命令链路 · ${parentTitle}`;
         expect(result.title).toBe(childTitle);
         expect(await value.repository.find(result.threadId)).toMatchObject({ title: childTitle });
         expect(value.notifications[0]).toMatchObject({ name: childTitle });
@@ -322,7 +363,7 @@ describe("HarnessDelegationCoordinator", () => {
     },
   );
 
-  it("excludes long native parent titles from the subtask name", async () => {
+  it("bounds long native parent titles after the subtask name", async () => {
     const value = await fixture(undefined, async () => ({ title: "🐙".repeat(150) }));
     try {
       const result = await value.coordinator.start({
@@ -332,7 +373,7 @@ describe("HarnessDelegationCoordinator", () => {
         parentThreadId: "native-parent",
       });
       const record = await value.repository.find(result.threadId);
-      expect(record?.title).toBe("Tool test");
+      expect(record?.title).toBe(`Tool test · ${"🐙".repeat(94)}`);
     } finally {
       await value.close();
     }
@@ -1125,7 +1166,6 @@ describe("HarnessDelegationCoordinator", () => {
       });
       const thread = value.registered[0];
       if (!thread) throw new Error("delegated Thread was not registered");
-      expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
       // The Adapter completed the Turn as failed, then its process died.
       thread.running = false;
       thread.activeTurnId = null;
@@ -1183,8 +1223,6 @@ describe("HarnessDelegationCoordinator", () => {
       thread.running = false;
       thread.activeTurnId = null;
       thread.turns = [{ id: started.turnId, status: "interrupted", items: [] }];
-      // Parent inference must still see the Thread as the active caller.
-      expect(value.coordinator.activeThreadIds()).toEqual([started.threadId]);
 
       await expect(
         value.coordinator.read({ threadId: started.threadId, view: "result" }),
