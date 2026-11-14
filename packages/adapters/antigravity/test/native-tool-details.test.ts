@@ -118,6 +118,7 @@ describe("Antigravity native tool details", () => {
       64_000,
     );
     expect(snapshot.turns[0]?.items).toMatchObject([
+      { item: { type: "reasoning", text: "Never expose the planner's internal thinking." } },
       { item: { type: "contextCompaction" } },
       {
         item: {

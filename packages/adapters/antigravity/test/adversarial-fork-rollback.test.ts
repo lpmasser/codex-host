@@ -816,7 +816,7 @@ describe("Empirical Adversarial Challenges: Fork & Rollback", () => {
           sourceRef: ref2,
           environment: { CODEXHOST_DATA_DIR: dataDir, CODEXHOST_THREAD_ID: "th-consec-2" },
         });
-        expect(rb1.ok).toBe(true);
+        expect(rb1.ok, JSON.stringify(rb1)).toBe(true);
         if (!rb1.ok) return;
         const session1 = rb1.value;
         const snap1 = await session1.readSnapshot();
