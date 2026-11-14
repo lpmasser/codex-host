@@ -327,9 +327,9 @@ describe("HarnessDelegationCoordinator", () => {
           taskName: "删除 Skill 命令链路",
           parentThreadId: parent.hostThreadId,
         });
-        const parentTitle = (title?.trim() || preview || "Untitled Thread")
-          .replace(/\s+/gu, " ")
-          .trim();
+        const parentTitle =
+          (title?.trim() || preview || "Untitled Thread").replace(/\s+/gu, " ").trim() ||
+          "Untitled Thread";
         const childTitle = `删除 Skill 命令链路 · ${parentTitle}`;
         expect(result.title).toBe(childTitle);
         expect(await value.repository.find(result.threadId)).toMatchObject({ title: childTitle });
