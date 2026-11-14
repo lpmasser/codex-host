@@ -167,6 +167,7 @@ describe("delegation control server", () => {
         start,
         send: vi.fn(),
         cancel: vi.fn(),
+        answer: vi.fn(),
         read: vi.fn(),
         wait: vi.fn(),
         list: vi.fn(),

@@ -158,7 +158,7 @@ describe("send CLI options", () => {
       expect(result.code, result.error).toBe(0);
       expect(JSON.parse(String(result.fetchImpl.mock.calls[0]?.[1]?.body))).toEqual({
         threadId: "target",
-        message: "continue",
+        message: "continue\n\nSender: codex://threads/parent",
         interrupt: true,
         notifyThreadId: "parent",
         watchTimeoutMs: 1740000,

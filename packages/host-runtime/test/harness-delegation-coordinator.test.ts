@@ -77,6 +77,9 @@ async function fixture(
       });
       if (!result.ok) throw new Error(result.error.message);
     },
+    steerExternalTurn: async () => {
+      throw new Error("Steering belongs to the Host integration fixture");
+    },
     notifyThreadStarted: async (thread) => {
       notifications.push(thread);
     },
@@ -97,7 +100,12 @@ async function fixture(
   });
   return {
     adapter,
-    coordinator,
+    // AppServerHost wires Questions separately; this fixture only creates Threads.
+    coordinator: Object.assign(coordinator, {
+      answer: async () => {
+        throw new Error("No Question responder in this fixture");
+      },
+    }),
     directory,
     delivered,
     notifications,
@@ -230,12 +238,7 @@ describe("HarnessDelegationCoordinator", () => {
     const value = await fixture(undefined, async () => ({ title: "Main project" }));
     const server = await startDelegationControlServer({
       token: "test-token",
-      api: Object.assign(value.coordinator, {
-        // AppServerHost wires Questions separately; this fixture only creates Threads.
-        answer: async () => {
-          throw new Error("No Question responder in this fixture");
-        },
-      }),
+      api: value.coordinator,
     });
     try {
       const output = new PassThrough();
