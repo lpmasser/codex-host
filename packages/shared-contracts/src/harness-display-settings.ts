@@ -46,6 +46,7 @@ export const DEFAULT_HARNESS_DISPLAY_ORDER: readonly string[] = [
   "kiro-cli",
   "codebuddy",
   "workbuddy",
+  "workbuddy-cn",
   "cursor-cli",
   "hermes",
   "qoder",

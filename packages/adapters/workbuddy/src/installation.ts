@@ -9,6 +9,7 @@ import {
 } from "@codexhost/harness-discovery";
 import type { HarnessInstallationState } from "@codexhost/shared-contracts";
 import { resolveWorkBuddyLaunch } from "./command.js";
+import type { WorkBuddyDistribution } from "./distribution.js";
 
 interface WorkBuddyProduct {
   applicationName?: unknown;
@@ -40,16 +41,21 @@ export function createWorkBuddyInstallation(
   dependencies: {
     platform?: NodeJS.Platform;
     arch?: NodeJS.Architecture;
+    distribution?: WorkBuddyDistribution;
     readProduct?: (file: string) => Promise<WorkBuddyProduct>;
     fetchText?: (url: string) => Promise<string>;
   } = {},
 ) {
   const platform = dependencies.platform ?? process.platform;
   const arch = dependencies.arch ?? process.arch;
+  const distribution = dependencies.distribution ?? "global";
   return async (action: "check" | "update"): Promise<HarnessInstallationState> => {
     if (action === "update")
       throw new Error("Complete the update with WorkBuddy's official desktop installer");
-    const { executable, bundle } = resolveWorkBuddyLaunch(environment, { platform });
+    const { executable, bundle } = resolveWorkBuddyLaunch(environment, {
+      platform,
+      distribution,
+    });
     if (!bundle)
       return {
         currentVersion: versionFromOutput(

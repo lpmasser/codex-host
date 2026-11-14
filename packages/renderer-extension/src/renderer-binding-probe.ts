@@ -512,6 +512,7 @@ export function restoredThreadOwnership(inspection: ThreadInspection): RestoredT
     inspection.harnessId === "kiro-cli" ||
     inspection.harnessId === "codebuddy" ||
     inspection.harnessId === "workbuddy" ||
+    inspection.harnessId === "workbuddy-cn" ||
     inspection.harnessId === "cursor-cli"
   ) {
     const route = decodeHarnessPluginRoute(inspection.transportModelId);
