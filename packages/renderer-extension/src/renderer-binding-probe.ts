@@ -67,6 +67,7 @@ import {
   installReasoningTranscriptSoftWrap,
   TRANSCRIPT_ITEM_SELECTOR,
 } from "./renderer-transcript-dom.js";
+import { installRendererMotionReentry } from "./renderer-motion-reentry.js";
 import { RendererCodexAccountState } from "./renderer-codex-account-state.js";
 import {
   createRendererCodexUsageGate,
@@ -785,6 +786,12 @@ export function installRendererBindingProbe(
   const pendingReplacements = new Map<Element, PendingComposerReplacement>();
   let disposed = false;
   const disposeReasoningSoftWrap = installReasoningTranscriptSoftWrap(document);
+  let motionReentry: ReturnType<typeof installRendererMotionReentry> | undefined;
+  const installMotionReentryWhenReady = (): void => {
+    if (adapterStatus.state === "ready" && !motionReentry) {
+      motionReentry = installRendererMotionReentry(window);
+    }
+  };
   let scanScheduled = false;
   let refreshTargetsOnNextScan = false;
   let adapterDispose: (() => void) | null = null;
@@ -3315,6 +3322,7 @@ export function installRendererBindingProbe(
     }
   };
   const onAdapterStatus = () => {
+    installMotionReentryWhenReady();
     publishConnectionStatus();
     if (shouldRefreshCodexAccountsForAdapterState(adapterStatus.state)) {
       reconcileHarnessAvailabilityHost();
@@ -3557,6 +3565,7 @@ export function installRendererBindingProbe(
       applyAdapterAgent = applyAgent ?? null;
       modelControl = nextModelControl ?? null;
       adapterStatus = status;
+      installMotionReentryWhenReady();
       publishConnectionStatus();
       const installedModelControl = modelControl;
       queueMicrotask(() => {
@@ -3619,6 +3628,7 @@ export function installRendererBindingProbe(
       modelControl = null;
       mutationObserver.disconnect();
       disposeReasoningSoftWrap();
+      motionReentry?.dispose();
       delegationMention?.dispose();
       skillLibrary.dispose();
       disposeSkillReferences();
