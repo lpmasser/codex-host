@@ -18,6 +18,10 @@ import type { RendererConnectionDiagnostics } from "../src/settings/connections-
 import type { RendererSessionImportClient } from "../src/settings/session-import-page.js";
 import type * as VersionedRendererAdapter from "../src/versioned-renderer-adapter.js";
 
+vi.mock("../src/renderer-motion-reentry.js", () => ({
+  installRendererMotionReentry: () => ({ ready: Promise.resolve(), dispose: vi.fn() }),
+}));
+
 const testState = vi.hoisted(() => ({
   composer: null as unknown as Element,
   editor: null as unknown as Element,
