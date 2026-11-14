@@ -13,7 +13,7 @@ import {
   nativeSessionRefSchema,
   type HarnessId,
 } from "@codexhost/shared-contracts";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AntigravityAdapter } from "../src/index.js";
 import { AntigravityHistory } from "../src/history.js";
@@ -138,6 +138,19 @@ class SessionEventConsumer {
 }
 
 describe("Empirical Adversarial Challenges: Fork & Rollback", () => {
+  let nativeHomeDirectory: string;
+
+  beforeEach(async () => {
+    nativeHomeDirectory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-adv-home-"));
+    vi.stubEnv("HOME", nativeHomeDirectory);
+    vi.stubEnv("USERPROFILE", nativeHomeDirectory);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(nativeHomeDirectory, { recursive: true, force: true });
+  });
+
   describe("1. Forking from First, Middle, and Last Turn", () => {
     it("forks at first turn (1 of 3), middle turn (2 of 3), and last turn (3 of 3)", async () => {
       const turns = [
