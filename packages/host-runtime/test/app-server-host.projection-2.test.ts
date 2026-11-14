@@ -520,7 +520,9 @@ describe("AppServerHost HarnessAdapter projection", () => {
 
     await expect(pending).resolves.toMatchObject({ harnessId: "pi", status: "running" });
     expect(fixture.adapter.sessions[0]?.cwd).toBe(path.resolve("/native-workspace"));
-    expect((await fixture.mappingStore.listThreads())[0]?.title).toBe("inherit workspace · Native project");
+    expect((await fixture.mappingStore.listThreads())[0]?.title).toBe(
+      "inherit workspace · Native project",
+    );
     fixture.adapter.sessions[0]?.succeedTurn();
     await stopFixture(fixture);
   });

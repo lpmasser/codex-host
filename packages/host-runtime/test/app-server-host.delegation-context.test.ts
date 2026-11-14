@@ -73,9 +73,12 @@ describe("Delegation context", () => {
       expect(started).toMatchObject({ params: { turn: { items: [] } } });
       const first = await registry.read({ threadId, view: "messages", from: 1, to: 1 });
       expect(first.turns).toEqual([
-        { turnId, turnNumber: 1, status: "running", messages: [
-          { id: `${turnId}-user`, role: "user", text: "synthetic" },
-        ] },
+        {
+          turnId,
+          turnNumber: 1,
+          status: "running",
+          messages: [{ id: `${turnId}-user`, role: "user", text: "synthetic" }],
+        },
       ]);
       const session = fixture.adapter.sessions[0];
       if (!session) throw new Error("Missing running Session");
