@@ -123,7 +123,8 @@ import {
   isNativeProjectThreadCreator,
 } from "@codexhost/desktop-control/renderer-bindings";
 import { loadCodexNativeServices } from "./codex-native-services.js";
-import { openCodexSchedules } from "./codex-schedule-navigation.js";
+import { openCodexSchedules, openCodexThread } from "./codex-schedule-navigation.js";
+import { installRendererSidebarDelegationBadges } from "./renderer-sidebar-delegation-badges.js";
 import { openRendererThread } from "./renderer-fork-control.js";
 import type {
   RendererConnectionDiagnostics,
@@ -855,6 +856,16 @@ export function installRendererBindingProbe(
         : undefined;
     },
     getLocalAgent: localAgentForSidebarThread,
+  });
+  const sidebarDelegationBadges = installRendererSidebarDelegationBadges({
+    getClient: (hostId) => modelClientForHost(hostId),
+    getPlugins: (hostId) => {
+      const state = hostHarnessAvailabilityState(hostId);
+      return state.directoryClient === modelClientForHost(hostId)
+        ? (state.plugins ?? undefined)
+        : undefined;
+    },
+    openThread: (threadId) => openCodexThread(threadId),
   });
   let connectionDiagnostics: RendererConnectionDiagnostics | null = null;
   const remoteConnections = createRemoteConnectionsControl(window, modelClientForHost);
@@ -3633,6 +3644,7 @@ export function installRendererBindingProbe(
       skillLibrary.dispose();
       disposeSkillReferences();
       sidebarAgentIcons.dispose();
+      sidebarDelegationBadges.dispose();
       sidebarThreadState.dispose();
       nativeScheduleControls.dispose();
       settingsLifecycle.dispose();

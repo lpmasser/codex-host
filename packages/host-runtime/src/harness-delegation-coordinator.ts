@@ -16,8 +16,15 @@ import {
   type JsonObject,
   type RoutedHarnessId,
 } from "@codexhost/protocol-core";
-import { harnessIdSchema, hostThreadIdSchema, hostTurnIdSchema } from "@codexhost/shared-contracts";
+import {
+  harnessIdSchema,
+  hostThreadIdSchema,
+  hostTurnIdSchema,
+  type DelegationChildrenParams,
+  type DelegationChildrenResult,
+} from "@codexhost/shared-contracts";
 
+import { delegationChildRows, type DelegationChildRow } from "./delegation-children.js";
 import {
   DELEGATION_THREAD_ID_ENV,
   DelegationControlError,
@@ -669,16 +676,17 @@ export class HarnessDelegationCoordinator {
     }
     if (!input.parentThreadId) return this.#listOfficial(input);
     const parent = hostThreadIdSchema.parse(input.parentThreadId);
-    const delegations = await this.#repository.listDelegations(parent);
-    const records = await this.#repository.list();
-    const byId = new Map(records.map((record) => [record.hostThreadId, record] as const));
-    const rows = delegations.map((delegation) => {
-      const record = byId.get(delegation.childHostThreadId);
+    const children = delegationChildRows({
+      delegations: await this.#repository.listDelegations(parent),
+      records: await this.#repository.list(),
+      activeThreadIds: this.activeThreadIds(),
+    });
+    const rows = (children.get(parent) ?? []).map(({ delegation, record, status }) => {
       return {
         threadId: delegation.childHostThreadId,
         harnessId: delegation.targetHarnessId as RoutedHarnessId,
         deepLink: `codex://threads/${delegation.childHostThreadId}`,
-        status: delegation.status,
+        status,
         ...(record
           ? {
               cwd: record.cwd,
@@ -721,6 +729,47 @@ export class HarnessDelegationCoordinator {
       threads: page,
       nextCursor:
         nextOffset < rows.length ? Buffer.from(String(nextOffset)).toString("base64url") : null,
+    };
+  }
+
+  /** Delegated children of each parent, in request order, for the Desktop sidebar. */
+  async children(input: DelegationChildrenParams): Promise<DelegationChildrenResult> {
+    const byParent = delegationChildRows({
+      delegations: await this.#repository.listDelegations(),
+      records: await this.#repository.list(),
+      activeThreadIds: this.activeThreadIds(),
+    });
+    const title = async ({ delegation, record }: DelegationChildRow) => {
+      if (record) return record.title;
+      if (!input.includeTitles || delegation.targetHarnessId !== "codex") return undefined;
+      try {
+        return (await this.#officialThreadMetadata(delegation.childHostThreadId)).title;
+      } catch {
+        return undefined;
+      }
+    };
+    return {
+      parents: await Promise.all(
+        input.threadIds.map(async (threadId) => ({
+          threadId,
+          children: await Promise.all(
+            (byParent.get(threadId) ?? [])
+              .toSorted(
+                (left, right) =>
+                  Date.parse(right.delegation.createdAt) - Date.parse(left.delegation.createdAt),
+              )
+              .map(async (row) => {
+                const childTitle = await title(row);
+                return {
+                  threadId: row.delegation.childHostThreadId,
+                  harnessId: row.delegation.targetHarnessId,
+                  status: row.status,
+                  ...(childTitle ? { title: childTitle } : {}),
+                };
+              }),
+          ),
+        })),
+      ),
     };
   }
 

@@ -7,8 +7,13 @@ import {
   type SkillsListParams,
   type SkillsListResult,
   type SkillsChangedParams,
+  DELEGATION_CHILDREN_METHOD,
   DELEGATION_READ_METHOD,
+  delegationChildrenParamsSchema,
+  delegationChildrenResultSchema,
   delegationReadParamsSchema,
+  type DelegationChildrenParams,
+  type DelegationChildrenResult,
   type DelegationReadParams,
   REMOTE_SSH_SETUP_METHOD,
   remoteSshSetupResultSchema,
@@ -264,6 +269,7 @@ export interface RendererModelClient extends Partial<RendererSessionImportClient
   ): Promise<HarnessConfigurationState>;
   setupSsh?(input: RemoteSshSetupParams): Promise<RemoteSshSetupResult>;
   readDelegationThread?(input: DelegationReadParams): Promise<unknown>;
+  listDelegationChildren?(input: DelegationChildrenParams): Promise<DelegationChildrenResult>;
   runtimeStatus?(): Promise<RuntimeStatus>;
   updateRemote?(version: string): Promise<RuntimeStatus>;
   checkUpdate(): Promise<UpdateCheckResult | null>;
@@ -600,6 +606,14 @@ export function createRendererModelClient(
     async setupSsh(input: RemoteSshSetupParams) {
       return remoteSshSetupResultSchema.parse(
         await manager.sendRequest(REMOTE_SSH_SETUP_METHOD, remoteSshSetupParamsSchema.parse(input)),
+      );
+    },
+    async listDelegationChildren(input: DelegationChildrenParams) {
+      return delegationChildrenResultSchema.parse(
+        await manager.sendRequest(
+          DELEGATION_CHILDREN_METHOD,
+          delegationChildrenParamsSchema.parse(input),
+        ),
       );
     },
     async readDelegationThread(input: DelegationReadParams) {
