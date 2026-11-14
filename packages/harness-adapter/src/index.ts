@@ -81,6 +81,7 @@ export type {
   HostThreadSnapshot,
   HostTextInput,
   HostTextQuestion,
+  HostToolActivity,
   HostToolExecutionItem,
   HostToolOutput,
   HostTurnSnapshot,

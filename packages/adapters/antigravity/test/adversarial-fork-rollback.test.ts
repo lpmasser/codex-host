@@ -13,7 +13,7 @@ import {
   nativeSessionRefSchema,
   type HarnessId,
 } from "@codexhost/shared-contracts";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AntigravityAdapter } from "../src/index.js";
 import { AntigravityHistory } from "../src/history.js";
@@ -138,6 +138,19 @@ class SessionEventConsumer {
 }
 
 describe("Empirical Adversarial Challenges: Fork & Rollback", () => {
+  let nativeHomeDirectory: string;
+
+  beforeEach(async () => {
+    nativeHomeDirectory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-adv-home-"));
+    vi.stubEnv("HOME", nativeHomeDirectory);
+    vi.stubEnv("USERPROFILE", nativeHomeDirectory);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(nativeHomeDirectory, { recursive: true, force: true });
+  });
+
   describe("1. Forking from First, Middle, and Last Turn", () => {
     it("forks at first turn (1 of 3), middle turn (2 of 3), and last turn (3 of 3)", async () => {
       const turns = [
@@ -816,7 +829,7 @@ describe("Empirical Adversarial Challenges: Fork & Rollback", () => {
           sourceRef: ref2,
           environment: { CODEXHOST_DATA_DIR: dataDir, CODEXHOST_THREAD_ID: "th-consec-2" },
         });
-        expect(rb1.ok).toBe(true);
+        expect(rb1.ok, JSON.stringify(rb1)).toBe(true);
         if (!rb1.ok) return;
         const session1 = rb1.value;
         const snap1 = await session1.readSnapshot();

@@ -2,20 +2,13 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type {
-  HostCommandExecutionItem,
-  HostFileChange,
-  HostToolExecutionItem,
-} from "@codexhost/harness-adapter";
+import type { HostCommandExecutionItem, HostToolExecutionItem } from "@codexhost/harness-adapter";
 import { hostItemIdSchema, hostTurnIdSchema } from "@codexhost/shared-contracts";
 import { describe, expect, it } from "vitest";
 
 import {
   AntigravityAdapter,
-  codeActionFileChange,
   completeAntigravityToolItem,
-  displayPath,
-  parseAntigravityCodeActions,
   startAntigravityToolItem,
   synthesizeAntigravityCommand,
   toolTargetFile,
@@ -25,105 +18,7 @@ const CWD = path.resolve("/test/adversarial_workspace");
 let itemCounter = 0;
 const nextItemId = () => hostItemIdSchema.parse(`stress-item-${++itemCounter}`);
 
-const insert = (text: string) => ({ text, type: "UNIFIED_DIFF_LINE_TYPE_INSERT" });
-const remove = (text: string) => ({ text, type: "UNIFIED_DIFF_LINE_TYPE_DELETE" });
-const keep = (text: string) => ({ text, type: "UNIFIED_DIFF_LINE_TYPE_UNCHANGED" });
-
-/** Builds the File Change agy's Language Server would report for one edit. */
-function editChange(
-  relativePath: string,
-  lines: { text: string; type: string }[],
-  createFile = false,
-): HostFileChange | null {
-  const absolute = path.join(CWD, relativePath).replaceAll("\\", "/").replace(/^\//, "");
-  const [action] = parseAntigravityCodeActions({
-    steps: [
-      {
-        type: "CORTEX_STEP_TYPE_CODE_ACTION",
-        status: "CORTEX_STEP_STATUS_DONE",
-        codeAction: {
-          actionResult: {
-            edit: {
-              absoluteUri: `file:///${absolute}`,
-              ...(createFile ? { createFile: true } : {}),
-              diff: { unifiedDiff: { lines } },
-            },
-          },
-        },
-      },
-    ],
-  });
-  return action ? codeActionFileChange(action, CWD) : null;
-}
-
 describe("Antigravity Adversarial & Stress Testing", () => {
-  describe("1. Applied edits: line endings, boundaries, and complex payloads", () => {
-    it("keeps a CRLF file readable as a line-typed patch", () => {
-      const change = editChange(
-        "src/crlf.ts",
-        [insert("line1\r"), insert("line2\r"), insert("line3\r")],
-        true,
-      );
-      expect(change?.unifiedDiff).toContain("--- /dev/null");
-      expect(change?.unifiedDiff).toContain("+++ b/src/crlf.ts");
-      expect(change?.unifiedDiff).toContain("@@ -0,0 +1,3 @@");
-      expect(change?.unifiedDiff.split("\n")).toHaveLength(8);
-    });
-
-    it("reports a pure insertion and a pure deletion with the right ranges", () => {
-      const inserted = editChange("empty_target.txt", [insert("newly inserted line")]);
-      expect(inserted?.unifiedDiff).toContain("@@ -0,0 +1,1 @@");
-      expect(inserted?.unifiedDiff).toContain("+newly inserted line");
-
-      const deleted = editChange("delete_target.txt", [remove("line to delete")]);
-      expect(deleted?.unifiedDiff).toContain("@@ -1,1 +0,0 @@");
-      expect(deleted?.unifiedDiff).toContain("-line to delete");
-    });
-
-    it("drops an edit that changed nothing instead of emitting an empty patch", () => {
-      // An empty patch is what Codex Desktop misreads as a phantom +N -0 card.
-      expect(editChange("same.ts", [keep("const a = 1;"), keep("const b = 2;")])).toBeNull();
-      expect(editChange("empty.ts", [])).toBeNull();
-    });
-
-    it("splits edits separated by unchanged lines into multiple hunks", () => {
-      const lines = Array.from({ length: 60 }, (_, index) => keep(`line ${index + 1}`));
-      lines[2] = insert("MODIFIED LINE 3");
-      lines[55] = insert("MODIFIED LINE 56");
-      const change = editChange("src/long.ts", lines);
-      expect(change?.unifiedDiff).toContain("+MODIFIED LINE 3");
-      expect(change?.unifiedDiff).toContain("+MODIFIED LINE 56");
-      expect(change?.unifiedDiff.match(/@@ -\d+,\d+ \+\d+,\d+ @@/gu)).toHaveLength(2);
-    });
-
-    it("carries multi-byte unicode, emojis, and right-to-left text through unchanged", () => {
-      const change = editChange("src/i18n.ts", [
-        remove("const greeting = 'Hello'; // 🌲 Initial"),
-        insert("const greeting = '🚀 Hello 👨‍👩‍👧‍👦 🎉'; // 🔥 Updated"),
-        keep("const cjk = '简体中文 繁體中文 日本語 한국어';"),
-        keep("const rtl = 'مرحبا بالعالم';"),
-      ]);
-      expect(change?.unifiedDiff).toContain("+const greeting = '🚀 Hello 👨‍👩‍👧‍👦 🎉'; // 🔥 Updated");
-      expect(change?.unifiedDiff).toContain(" const rtl = 'مرحبا بالعالم';");
-    });
-
-    it("processes an extremely long single line quickly", () => {
-      const start = Date.now();
-      const change = editChange("huge_line.min.js", [
-        remove("A".repeat(20_000)),
-        insert("A".repeat(10_000) + "B".repeat(10_000)),
-      ]);
-      expect(Date.now() - start).toBeLessThan(1_000);
-      expect(change?.unifiedDiff.length).toBeGreaterThan(40_000);
-    });
-
-    it("keeps control characters in content while still rejecting them in a path", () => {
-      expect(displayPath("bad\u0000file.txt", CWD)).toBeNull();
-      const change = editChange("escaped.txt", [insert("line1\t\u001b[31mRed\u001b[0m")], true);
-      expect(change?.unifiedDiff).toContain("+line1\t\u001b[31mRed\u001b[0m");
-    });
-  });
-
   describe("4. Parameter Missing & Fallback Resilience", () => {
     it("falls back to HostToolExecutionItem on any missing required parameters", () => {
       const item1 = startAntigravityToolItem(

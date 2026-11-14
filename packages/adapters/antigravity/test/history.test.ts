@@ -11,6 +11,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { AntigravityHistory } from "../src/history.js";
+import type { HostItemSnapshot } from "@codexhost/harness-adapter";
 
 const nativeTurnRef = nativeTurnRefSchema.parse({
   harnessId: "antigravity",
@@ -78,6 +79,60 @@ describe("Antigravity history sidecar", () => {
       await rm(dataDirectory, { recursive: true, force: true });
     }
   });
+
+  it.each([true, false])(
+    "reloads activity metadata or derives it from old facts (%s)",
+    async (savedActivity) => {
+      const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-history-"));
+      const environment = { CODEXHOST_DATA_DIR: dataDirectory, CODEXHOST_THREAD_ID: "activity" };
+      const activity = { type: "read", path: "/workspace/file.ts " } as const;
+      const snapshot: HostItemSnapshot = {
+        item: {
+          type: "toolExecution",
+          itemId: hostItemIdSchema.parse("read"),
+          toolName: "view_file",
+          arguments: { AbsolutePath: activity.path },
+          ...(savedActivity ? { activity } : {}),
+          output: { content: [{ type: "text", text: "original content" }] },
+        },
+        outcome: { status: "succeeded" },
+      };
+      const file = path.join(dataDirectory, "antigravity-history", "activity.json");
+      const { readFile } = await import("node:fs/promises");
+      try {
+        const history = await AntigravityHistory.open({
+          environment,
+          nativeSessionId: "conversation-1",
+        });
+        history.append({
+          nativeTurnRef,
+          turnInput: [],
+          items: [snapshot],
+          outcome: { status: "succeeded" },
+        });
+        await history.flush();
+        const before = await readFile(file, "utf8");
+        expect(JSON.parse(before).turns[0].items[0].item.activity).toEqual(
+          savedActivity ? activity : undefined,
+        );
+        const restored = await AntigravityHistory.open({
+          environment,
+          nativeSessionId: "conversation-1",
+        });
+        expect(restored.snapshot()[0]?.items).toEqual([
+          {
+            ...snapshot,
+            item: { ...snapshot.item, activity },
+          },
+        ]);
+        const found = await AntigravityHistory.findByNativeSessionId(environment, "conversation-1");
+        expect(found?.snapshot()).toEqual(restored.snapshot());
+        expect(await readFile(file, "utf8")).toBe(before);
+      } finally {
+        await rm(dataDirectory, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("falls back to known Native Turn placeholders when no sidecar exists", async () => {
     const dataDirectory = await mkdtemp(path.join(os.tmpdir(), "codexhost-agy-history-"));
