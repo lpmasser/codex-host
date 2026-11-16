@@ -365,9 +365,12 @@ export class CodeBuddySession implements HarnessSession {
         this.#onFault(error);
         return Promise.resolve(cancelled);
       }
-      return identity.then((turnId) =>
-        turnId && this.#active?.autonomous?.round === round ? run(turnId) : cancelled,
-      );
+      return identity.then((turnId) => {
+        const active = this.#active;
+        return turnId && active?.autonomous?.round === round && !active.cancelled && !active.done
+          ? run(turnId)
+          : cancelled;
+      });
     }
     const active = this.#active;
     return active && !active.autonomous && !active.promptSettled
@@ -861,6 +864,7 @@ export class CodeBuddySession implements HarnessSession {
       type: "turn.completed",
       turnId: active.command.turnId,
       outcome,
+      ...(active.autonomous ? { ephemeral: true as const } : {}),
       ...(nativeTurnRef ? { nativeTurnRef } : {}),
     });
     if (this.#active === active) this.#active = undefined;
