@@ -19,6 +19,8 @@ export interface CodeBuddyRuntimeProfile {
   /** The first configured value is the native history root. */
   readonly configDirectoryEnvironmentVariables: readonly string[];
   readonly defaultConfigDirectoryName: string;
+  /** Product-owned check before native data access, including a direct persisted source ID. */
+  readonly validateConfigRoot?: (root: string, source?: string) => void;
   /** Native project directory encoding, applied to the canonical working directory. */
   readonly projectDirectoryName?: (canonicalCwd: string) => string;
   /** Commands that are safe to advertise before a Native Session reports its live catalog. */
