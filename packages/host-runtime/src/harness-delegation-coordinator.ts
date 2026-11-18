@@ -573,7 +573,7 @@ export class HarnessDelegationCoordinator {
       }
       if (location.kind === "error")
         throw new DelegationControlError("THREAD_NOT_FOUND", location.error.message);
-      const { thread, turns, busy } = await this.#readExternalThread(input.threadId, true);
+      const { thread, turns, busy } = await this.#readExternalThread(input.threadId);
       return exportDelegationThread(
         input,
         {
@@ -588,7 +588,7 @@ export class HarnessDelegationCoordinator {
     });
   }
 
-  async #readExternalThread(threadId: string, includeLiveItems = false) {
+  async #readExternalThread(threadId: string) {
     const resolution = await this.#externalRuntime.resolve(threadId);
     if (resolution.kind === "error") {
       throw new DelegationControlError("INTERNAL_ERROR", resolution.error.message);
@@ -614,10 +614,7 @@ export class HarnessDelegationCoordinator {
       ? thread.projectedTurns.get(thread.activeTurnId)?.projector
       : undefined;
     const turns = thread.activeTurnId
-      ? [
-          ...thread.turns,
-          (includeLiveItems ? projector?.snapshotTurn() : projector?.pendingTurn()) ?? {},
-        ]
+      ? [...thread.turns, projector?.snapshotTurn() ?? {}]
       : thread.turns;
     return { thread, turns, busy: this.#externalThreadBusy(thread) };
   }
