@@ -135,7 +135,7 @@ Host SHALL 独立于 Thread 记录持久化 Delegation 关系，包含 Delegatio
 - **AND** 关系记录 MUST NOT 包含会话内容
 
 ### Requirement: 委派 CLI 的运行时连接与调用方身份由 Host 解析
-Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runtime 端点与令牌，并 SHALL 通过显式白名单将这些连接参数放行给官方 App Server 进程。除该白名单外，Host MUST NOT 向官方 App Server 泄漏其他内部环境变量。CLI SHALL 仅使用被提供的连接参数，MUST NOT 自行发现 Runtime、在多个 Runtime 之间选择，或从 PATH 猜测替代 CLI。父 Thread SHALL 优先取自显式父参数，其次取自 CLI 调用方的 `CODEXHOST_THREAD_ID` 或原生 `CODEX_THREAD_ID`。缺少父身份时 SHALL 创建无父任务，不从活跃 Turn 或 Host 进程环境推断父关系。
+Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runtime 端点与令牌，并 SHALL 通过显式白名单将这些连接参数放行给官方 App Server 进程。除该白名单外，Host MUST NOT 向官方 App Server 泄漏其他内部环境变量。CLI SHALL 仅使用被提供的连接参数，MUST NOT 自行发现 Runtime、在多个 Runtime 之间选择，或从 PATH 猜测替代 CLI。CLI SHALL 从 `CODEXHOST_THREAD_ID` 或原生 `CODEX_THREAD_ID` 读取实际调用方；显式父参数只控制创建关系。没有调用方或显式父参数时 SHALL 创建无父任务，不从活跃 Turn 或 Host 进程环境推断来源。
 
 #### Scenario: 外部 Harness 进程中调用
 - **WHEN** CLI 在 Host 拉起的外部 Harness 进程中被调用且未提供显式父 Thread 参数
@@ -154,9 +154,15 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 
 #### Scenario: 普通终端发起独立任务
 - **WHEN** CLI 已能连接 Runtime，但没有调用方线程且没有显式父参数
-- **THEN** SHALL 创建无父任务，不受活跃任务数量影响
+- **THEN** SHALL 创建无父任务，不受活跃任务数量影响，不附加发送者链接
 - **AND** Runtime SHALL 对原生 Codex 和外部 Harness 均优先使用已注册的共享 catalog；没有共享 catalog 时 SHALL 使用唯一注册会话，注册项不唯一时明确失败，不猜父任务或任意选择 Host
 - **AND** 无父的 `--watch true` SHALL 报告 `notRegistered` 而不撤销创建
+
+#### Scenario: 发送者与父关系不同
+- **WHEN** 当前调用方通过 `delegate start` 或 `thread send` 交付任务或消息
+- **THEN** CLI SHALL 在正文末尾附带实际调用方的线程链接；缺少调用方时正文不变
+- **AND** 显式父参数和既有父关系 MUST NOT 替代实际发送者
+- **AND** 接收方 SHALL 自行决定是否读取来源对话
 
 #### Scenario: 官方进程环境被检查
 - **WHEN** 传递给官方 App Server 的环境被构造
@@ -184,7 +190,7 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 - **AND** 失败输出 SHALL 携带可辨识的错误代码
 
 ### Requirement: 委派创建与结果观察解耦且不主动注入父 Session
-`codexhost delegate start --harness <harnessId> --task <text> [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>]` SHALL 在创建目标 Session/Thread 并投递任务后立即返回。`--harness` 与 `--task` SHALL 为必填参数；`--parent-thread` SHALL 显式指定父关系；`--request-id` SHALL 承载调用方提供的幂等标识。发起方 Agent SHALL 可以自主选择通过 `thread read` 读取、通过有界 `thread wait` 等待、通过 `thread watch` 或 `--watch true` 注册一次性停下通知、稍后再次观察，或不再跟踪。除调用方显式注册的 watch 外，Host MUST NOT 在子任务完成后向父 Session 注入结果、唤醒父 Agent 或为此创建自主 Turn。
+`codexhost delegate start --harness <harnessId> --task <text> [--parent-thread <thread>] [--request-id <id>] [--watch true|false] [--watch-timeout-ms <n>]` SHALL 在创建目标 Session/Thread 并投递任务后立即返回。`--harness` 与 `--task` SHALL 为必填参数；`--parent-thread` SHALL 显式指定父关系，不改变消息发送者身份；`--request-id` SHALL 承载调用方提供的幂等标识。发起方 Agent SHALL 可以自主选择通过 `thread read` 读取、通过有界 `thread wait` 等待、通过 `thread watch` 或 `--watch true` 注册一次性停下通知、稍后再次观察，或不再跟踪。除调用方显式注册的 watch 外，Host MUST NOT 在子任务完成后向父 Session 注入结果、唤醒父 Agent 或为此创建自主 Turn。
 
 #### Scenario: 委派创建成功返回
 - **WHEN** 调用方执行有效的 `codexhost delegate start --harness <harnessId> --task <text>`
@@ -352,6 +358,12 @@ Host SHALL 向它拉起的 Harness 进程提供配套 CLI 的绝对路径、Runt
 - **AND** 每条消息 SHALL 包含稳定消息标识、所属 `turnId`、`role` 与文本
 - **AND** Agent 消息在 Harness 已投影阶段信息时 MAY 包含 `phase: "commentary"` 或 `phase: "final"`
 - **AND** `messages` SHALL 只包含用户可见输入、Agent 可见中间消息和 Agent 最终消息
+
+#### Scenario: 读取普通 Desktop 会话正在进行的用户输入
+- **WHEN** 普通 Desktop 发起的 Turn 尚未结束，调用方读取 messages 视图
+- **THEN** SHALL 包含本轮已提交的可见用户输入，无需等待原生历史落盘
+- **AND** Turn 完成后的内存快照及历史刷新 SHALL 保留该用户消息，不因输入暂时缺失造成分页漏读或重读
+- **AND** MUST NOT 为读取快照而重复发布 Desktop 已显示的初始用户输入
 
 #### Scenario: 读取增量消息
 - **WHEN** 调用方使用前一次响应的 `nextCursor` 再次执行 `thread read --view messages --cursor <cursor>`
