@@ -252,7 +252,7 @@ function updateCheck(status: UpdateStatus | null = null): UpdateCheckResult {
     updateAvailable: true,
     installationAvailable: true,
     releaseNotes: "Safer updates",
-    releaseNotesUrl: "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
+    releaseNotesUrl: "https://github.com/lpmasser/codex-host/releases/tag/v1.2.3",
     status,
     error: null,
   };
@@ -3212,9 +3212,7 @@ describe("Renderer Updates page", () => {
     expect(releaseLink.rel).toBe("noopener noreferrer");
 
     await vi.waitFor(() => {
-      expect(releaseLink.href).toBe(
-        "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
-      );
+      expect(releaseLink.href).toBe("https://github.com/lpmasser/codex-host/releases/tag/v1.2.3");
     });
 
     const panel = elementWithClass(content, "settings-update-panel");
@@ -3226,9 +3224,7 @@ describe("Renderer Updates page", () => {
       expect(panel.dataset.updateState).toBe("failed");
     });
     expect(descendants(content)).toContain(releaseLink);
-    expect(releaseLink.href).toBe(
-      "https://github.com/BytePioneer-AI/codex-host/releases/tag/v1.2.3",
-    );
+    expect(releaseLink.href).toBe("https://github.com/lpmasser/codex-host/releases/tag/v1.2.3");
 
     cleanup?.();
     scope.dispose();
@@ -3321,7 +3317,7 @@ describe("Renderer Updates page", () => {
           ({ tagName, href }) =>
             tagName === "a" &&
             href ===
-              "https://github.com/BytePioneer-AI/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
+              "https://github.com/lpmasser/codex-host/releases/download/v1.2.3/codexhost-1.2.3-windows-x64.exe",
         );
         expect(link).toMatchObject({ target: "_blank", rel: "noopener noreferrer" });
       }
