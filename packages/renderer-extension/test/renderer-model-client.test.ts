@@ -436,6 +436,7 @@ describe("Renderer fixed Model request client", () => {
       "inspectThreadUsage",
       "installation",
       "listCodexAccounts",
+      "listDelegationChildren",
       "listHarnessAccountSources",
       "listHarnessAccounts",
       "listHarnessPlugins",

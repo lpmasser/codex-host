@@ -34,3 +34,11 @@ Host 不承诺底层未提供的快照稳定性，也不额外维护已返回 Th
 ## 验证边界
 
 `delegation-thread-list-pagination.test.ts` 通过真实 AppServerHost、共享 Mapping Store、OfficialRuntimeScope 和可变 keyset 后端覆盖共享 catalog、插入／删除、cwd 校验、limit 变化及六种排序；`run-host-runtime.remote-control-catalog.test.ts` 检查生产 Remote Control 注册路径。它们不代替真实 Windows Remote Control 的连接验收，也不证明任意 native 后端具备快照能力。
+
+## 派出会话的状态与侧栏徽标
+
+`--parent` 列表和侧栏徽标共用同一份子会话数据：Delegation 记录里的父子关系，加上 Host 当前的运行状态。委派记录只保存子会话最近一次结束时的状态，已结束的子会话再收到后续消息开始新一轮时，记录仍是 `completed`；因此 Host 当前正在运行的子会话一律报 `running`，其余沿用记录。
+
+Desktop 左侧本地会话行上，派过任务的会话在 Agent 图标右下角显示直接派出的会话数（超过 9 个显示 `9+`），有子会话运行时角标为蓝色，否则为灰色；该图标随之可点击，点击弹出子会话列表而不打开父会话。列表运行中的在前，其余按派出时间从新到旧；每行为 Harness 图标、标题和状态（运行中、报错、已结束；创建中算运行中，被中断算已结束），点击一行经 Desktop 自己的路由打开该会话。角标挂在侧栏 Agent 图标上，不另占标题位置，Desktop 悬停时在行尾显示的按钮不会使其移动；Agent 图标被重建时角标随下一次侧栏变化重新挂上。
+
+Renderer 通过 `codexhost/thread/delegation-children` 批量读取可见行的子会话，页面可见时每 5 秒一次，隐藏时不读；只观察侧栏节点的变化来恢复被重新渲染的徽标。原生 Codex 子会话没有 Host 记录，标题只在打开弹层时向官方读取。只处理本地 Host 的行；远程连接的行不显示徽标。
