@@ -1501,10 +1501,39 @@ describe("ClaudeSdkTransport Question callbacks", () => {
 
     await expect(turn).resolves.toEqual({ status: "succeeded" });
     expect(events).toEqual([
-      { type: "reasoning.delta", messageId: assistantId, delta: "visible" },
-      { type: "reasoning.completed", messageId: assistantId },
+      { type: "reasoning.delta", messageId: `${assistantId}:thinking:0`, delta: "visible" },
+      { type: "reasoning.completed", messageId: `${assistantId}:thinking:0` },
       { type: "text.delta", messageId: assistantId, delta: "answer" },
       { type: "message.completed", messageId: assistantId, checkpointId: assistantId },
+    ]);
+    await value.transport.close();
+  });
+
+  it("delivers streamed thinking when the native stream ends without a Result", async () => {
+    const value = fixture();
+    await value.transport.start();
+    const events: ClaudeTurnEvent[] = [];
+    const turn = value.transport.runTurn(
+      "synthetic",
+      "00000000-0000-4000-8000-000000000002",
+      (event) => events.push(event),
+    );
+    const assistantId = "00000000-0000-4000-8000-000000000003";
+    value.fakeQuery.push({
+      type: "stream_event",
+      uuid: assistantId,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "unfinished" },
+      },
+    } as unknown as SDKMessage);
+    value.fakeQuery.close();
+
+    await expect(turn).rejects.toThrow("Claude SDK Query ended unexpectedly");
+    // No signature confirmed narration, so the summary stays Reasoning.
+    expect(events).toEqual([
+      { type: "reasoning.delta", messageId: `${assistantId}:thinking:0`, delta: "unfinished" },
     ]);
     await value.transport.close();
   });
