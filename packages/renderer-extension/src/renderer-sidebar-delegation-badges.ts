@@ -2,6 +2,7 @@ import {
   DELEGATION_CHILDREN_MAX_PARENTS,
   hostThreadIdSchema,
   type DelegationChild,
+  type DelegationChildStatus,
   type HarnessPluginDescriptor,
 } from "@codexhost/shared-contracts";
 
@@ -15,10 +16,10 @@ import {
 } from "./renderer-sidebar-agent-icons.js";
 
 /**
- * Corner count on the Agent icon of a Thread that started other Threads with `delegate start`,
- * blue while any of them runs; the icon then opens a popover listing each child, running ones
- * first, with its status. The data is the Host's
- * Delegation records; the badge only reads, and opening a child uses Desktop's own router.
+ * Corner count on the Agent icon of a Thread whose children appear under it in the Web Thread
+ * tree, colored by the most urgent child state (question, then running); the icon then opens a
+ * popover listing each child, most urgent first, with its state. The badge only reads, and
+ * opening a child uses Desktop's own router.
  */
 
 const BADGE_ATTRIBUTE = "data-codexhost-delegation-badge";
@@ -27,19 +28,32 @@ const LOCAL_HOST_ID = "local";
 const POLL_INTERVAL_MS = 5_000;
 const SIDEBAR_SCROLL_SELECTOR = "[data-app-action-sidebar-scroll]";
 
-type ChildState = "running" | "failed" | "finished";
-
-export function delegationChildState(child: Pick<DelegationChild, "status">): ChildState {
-  if (child.status === "creating" || child.status === "running") return "running";
-  return child.status === "failed" ? "failed" : "finished";
-}
-
-const STATE_LABEL: Record<ChildState, string> = {
+const STATE_PRIORITY: Record<DelegationChildStatus, number> = { question: 0, running: 1, idle: 2 };
+const STATE_LABEL: Record<DelegationChildStatus, string> = {
+  question: "待回答",
   running: "运行中",
-  failed: "报错",
-  finished: "已结束",
+  idle: "无活动",
 };
-const STATE_GLYPH: Record<ChildState, string> = { running: "●", failed: "✕", finished: "✓" };
+const STATE_GLYPH: Record<DelegationChildStatus, string> = {
+  question: "?",
+  running: "●",
+  idle: "○",
+};
+const STATE_COLOR: Record<DelegationChildStatus, string> = {
+  question: "#f5a524",
+  running: "#3e9bff",
+  idle: "color-mix(in srgb, currentColor 45%, transparent)",
+};
+
+/** The most urgent state among the children, which colors the badge. */
+export function delegationBadgeState(
+  children: readonly Pick<DelegationChild, "status">[],
+): DelegationChildStatus {
+  return children.reduce<DelegationChildStatus>(
+    (state, child) => (STATE_PRIORITY[child.status] < STATE_PRIORITY[state] ? child.status : state),
+    "idle",
+  );
+}
 
 export interface RendererSidebarDelegationBadges {
   dispose(): void;
@@ -88,11 +102,9 @@ export function installRendererSidebarDelegationBadges(options: {
       threadIds: [parent],
       includeTitles: true,
     });
-    // The Host lists newest first; running children move to the top, keeping that order.
+    // The Host lists newest first; more urgent states move to the top, keeping that order.
     const list = (result.parents[0]?.children ?? []).toSorted(
-      (left, right) =>
-        Number(delegationChildState(right) === "running") -
-        Number(delegationChildState(left) === "running"),
+      (left, right) => STATE_PRIORITY[left.status] - STATE_PRIORITY[right.status],
     );
     if (disposed || !anchor.isConnected) return;
     closePopover();
@@ -120,7 +132,7 @@ export function installRendererSidebarDelegationBadges(options: {
     } satisfies Partial<CSSStyleDeclaration>);
 
     for (const child of list) {
-      const state = delegationChildState(child);
+      const state = child.status;
       const item = root.createElement("button");
       item.type = "button";
       item.setAttribute("role", "menuitem");
@@ -160,8 +172,8 @@ export function installRendererSidebarDelegationBadges(options: {
       status.textContent = `${STATE_GLYPH[state]} ${STATE_LABEL[state]}`;
       Object.assign(status.style, {
         flex: "none",
-        opacity: state === "finished" ? "0.6" : "1",
-        color: state === "failed" ? "#e5484d" : "inherit",
+        opacity: state === "idle" ? "0.6" : "1",
+        color: state === "question" ? STATE_COLOR.question : "inherit",
       } satisfies Partial<CSSStyleDeclaration>);
       item.append(icon, title, status);
       item.addEventListener("click", (event) => {
@@ -209,8 +221,8 @@ export function installRendererSidebarDelegationBadges(options: {
       undecorate(icon);
       return;
     }
-    const running = list.some((child) => delegationChildState(child) === "running");
-    const presentation = `${threadId}:${list.length}:${running}`;
+    const state = delegationBadgeState(list);
+    const presentation = `${threadId}:${list.length}:${state}`;
     if (icon.getAttribute(BADGE_ATTRIBUTE) === presentation) return;
     undecorate(icon);
 
@@ -220,7 +232,7 @@ export function installRendererSidebarDelegationBadges(options: {
       role: icon.getAttribute("role"),
       style: icon.getAttribute("style"),
     };
-    const label = `${original.label ?? ""} · 已派出 ${list.length} 个会话${running ? "，有会话运行中" : ""}`;
+    const label = `${original.label ?? ""} · 已派出 ${list.length} 个会话${state === "idle" ? "" : `，有会话${STATE_LABEL[state]}`}`;
     icon.setAttribute(BADGE_ATTRIBUTE, presentation);
     icon.setAttribute("role", "button");
     icon.setAttribute("aria-label", label);
@@ -243,7 +255,7 @@ export function installRendererSidebarDelegationBadges(options: {
       padding: "0 2px",
       boxSizing: "border-box",
       borderRadius: "6px",
-      background: running ? "#3e9bff" : "color-mix(in srgb, currentColor 45%, transparent)",
+      background: STATE_COLOR[state],
       color: "#fff",
       font: "600 8px/11px system-ui, -apple-system, sans-serif",
       textAlign: "center",
