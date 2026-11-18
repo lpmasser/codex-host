@@ -288,6 +288,7 @@ describe("Harness plugin discovery and loading", () => {
   it.each([
     ["codebuddy", "CodeBuddy", "CODEXHOST_CODEBUDDY_COMMAND"],
     ["workbuddy", "WorkBuddy", "CODEXHOST_WORKBUDDY_COMMAND"],
+    ["workbuddy-cn", "WorkBuddy CN", "CODEXHOST_WORKBUDDYCN_COMMAND"],
     ["qoder", "Qoder", "CODEXHOST_QODER_COMMAND"],
     ["qoder-cn", "Qoder CN", "CODEXHOST_QODERCN_COMMAND"],
     ["zcode", "ZCode", "CODEXHOST_ZCODE_APP"],
@@ -333,6 +334,8 @@ describe("Harness plugin discovery and loading", () => {
     "antigravity",
     "qoder",
     "qoder-cn",
+    "workbuddy",
+    "workbuddy-cn",
   ])("ships a valid %s manifest and resolvable compiled resources", async (id) => {
     const location = path.resolve("packages/adapters", id);
     const manifest = harnessPluginManifestSchema.parse(
