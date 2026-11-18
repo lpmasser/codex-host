@@ -191,6 +191,11 @@ function callerThreadId(environment: NodeJS.ProcessEnv): string | undefined {
   );
 }
 
+function withSenderLink(text: string, environment: NodeJS.ProcessEnv): string {
+  const sender = callerThreadId(environment);
+  return sender ? `${text}\n\nSender: codex://threads/${normalizeThreadId(sender)}` : text;
+}
+
 export async function runDelegationCli(input: {
   arguments: string[];
   environment?: NodeJS.ProcessEnv;
@@ -423,11 +428,13 @@ export async function runDelegationCli(input: {
         );
       const harnessId = value(parsed, "--harness");
       const task = await resolveCliTextInput(parsed.options, "--task", input.stdin);
-      if (!harnessId || !task)
+      if (!harnessId || task === undefined)
         throw new DelegationControlError(
           "INVALID_ARGUMENT",
           "--harness and either --task or --task-file are required",
         );
+      if (!task.trim())
+        throw new DelegationControlError("INVALID_ARGUMENT", "Task must not be empty");
       const parentThread = value(parsed, "--parent-thread") ?? callerThreadId(environment);
       const watch = value(parsed, "--watch");
       if (watch !== undefined && watch !== "true" && watch !== "false")
@@ -440,7 +447,7 @@ export async function runDelegationCli(input: {
       // Validate all local options before creating a worktree or making a Runtime request.
       const body = {
         harnessId,
-        task,
+        task: withSenderLink(task, environment),
         ...(value(parsed, "--task-name") !== undefined
           ? { taskName: value(parsed, "--task-name") }
           : {}),
@@ -527,7 +534,7 @@ export async function runDelegationCli(input: {
           path: "/v1/thread/send",
           body: {
             threadId: normalizeThreadId(threadId),
-            message,
+            message: withSenderLink(message, environment),
             ...(interrupt === "true" ? { interrupt: true } : {}),
             ...(steer !== undefined ? { steer: steer === "true" } : {}),
             ...(watch === "true"
