@@ -44,7 +44,7 @@ describe("WorkBuddy product Model metadata", () => {
       ]);
       expect(invocation.environment.ACC_PRODUCT_CONFIG_PATH).toBeUndefined();
       vi.spyOn(command, "workBuddyInvocation").mockReturnValue(invocation);
-      expect(await loadWorkBuddyProductModels(environment)).toEqual([
+      expect(await loadWorkBuddyProductModels(environment, "global")).toEqual([
         { id: "glm-5.2", name: "GLM-5.2" },
       ]);
     } finally {
