@@ -731,6 +731,54 @@ describe("HarnessDelegationCoordinator", () => {
     }
   });
 
+  it("shows sidebar children from the Thread tree with question over running over idle", async () => {
+    const value = await fixture();
+    try {
+      const started = await value.coordinator.start({
+        harnessId: "pi",
+        task: "external child",
+        cwd: "/synthetic",
+        parentThreadId: "parent-thread",
+      });
+      for (const child of ["native-child", "pinned-child"]) {
+        await value.repository.createDelegation({
+          delegationId: hostThreadIdSchema.parse(`${child}-delegation`),
+          parentHostThreadId: hostThreadIdSchema.parse("parent-thread"),
+          childHostThreadId: hostThreadIdSchema.parse(child),
+          sourceHarnessId: harnessIdSchema.parse("pi"),
+          targetHarnessId: harnessIdSchema.parse("codex"),
+          status: "completed",
+          taskDigest: "a".repeat(64),
+        });
+      }
+      // The tree leaves out the pinned child, so the sidebar does too.
+      const parents = { [started.threadId]: "parent-thread", "native-child": "parent-thread" };
+      const statuses = async () =>
+        Object.fromEntries(
+          (
+            await value.coordinator.children(
+              { threadIds: [hostThreadIdSchema.parse("parent-thread")] },
+              parents,
+            )
+          ).parents[0]!.children.map((child) => [child.threadId, child.status]),
+        );
+
+      await expect(statuses()).resolves.toEqual({
+        [started.threadId]: "running",
+        "native-child": "idle",
+      });
+      value.pending.push({
+        kind: "requestUserInput",
+        interactionId: "interaction-1",
+        turnId: started.turnId,
+        request: { questions: [{ id: "q", question: "Continue?", options: [{ label: "Yes" }] }] },
+      });
+      await expect(statuses()).resolves.toMatchObject({ [started.threadId]: "question" });
+    } finally {
+      await value.close();
+    }
+  });
+
   it("wait returns terminal snapshots early and running snapshots on timeout without writing", async () => {
     const value = await fixture();
     try {

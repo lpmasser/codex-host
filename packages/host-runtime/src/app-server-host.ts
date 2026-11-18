@@ -1777,7 +1777,10 @@ export class AppServerHost {
         await this.#writer.json(rpcError(request, -32602, "Invalid delegation children request"));
         return;
       }
-      const result = await this.#delegationCoordinator.children(parsed.data);
+      const result = await this.#delegationCoordinator.children(
+        parsed.data,
+        (await this.#threadTree.read()).parents,
+      );
       await this.#writer.json(rpcEnvelope(request, { result: jsonValueSchema.parse(result) }));
       return;
     }

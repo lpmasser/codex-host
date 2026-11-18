@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { harnessIdSchema, hostThreadIdSchema } from "./ids.js";
 
-/** Threads started from each parent with `delegate start`, read from Host-local Delegation records. */
+/** Children of each parent in the Thread tree (the Web sidebar's relation), with their live state. */
 export const DELEGATION_CHILDREN_METHOD = "codexhost/thread/delegation-children";
 export const DELEGATION_CHILDREN_MAX_PARENTS = 100;
 
@@ -13,13 +13,8 @@ export const delegationChildrenParamsSchema = z.strictObject({
 });
 export type DelegationChildrenParams = z.infer<typeof delegationChildrenParamsSchema>;
 
-export const delegationChildStatusSchema = z.enum([
-  "creating",
-  "running",
-  "completed",
-  "failed",
-  "interrupted",
-]);
+/** A pending question outranks running; anything else is idle. */
+export const delegationChildStatusSchema = z.enum(["question", "running", "idle"]);
 export type DelegationChildStatus = z.infer<typeof delegationChildStatusSchema>;
 
 export const delegationChildSchema = z.strictObject({
