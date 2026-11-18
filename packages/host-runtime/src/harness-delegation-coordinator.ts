@@ -604,7 +604,7 @@ export class HarnessDelegationCoordinator {
         return this.#exportOfficial(input);
       }
       if (location.kind === "error") throw externalThreadError(location.error);
-      const { thread, turns, busy } = await this.#readExternalThread(input.threadId, true);
+      const { thread, turns, busy } = await this.#readExternalThread(input.threadId);
       return exportDelegationThread(
         input,
         {
@@ -629,7 +629,7 @@ export class HarnessDelegationCoordinator {
     return resolution;
   }
 
-  async #readExternalThread(threadId: string, includeLiveItems = false) {
+  async #readExternalThread(threadId: string) {
     const { thread, historyFresh } = await this.#resolveExternalThread(threadId);
     if (!this.#externalThreadBusy(thread) && !historyFresh) {
       const error = await this.#externalRuntime.refresh(thread);
@@ -648,10 +648,7 @@ export class HarnessDelegationCoordinator {
       ? thread.projectedTurns.get(thread.activeTurnId)?.projector
       : undefined;
     const turns = thread.activeTurnId
-      ? [
-          ...thread.turns,
-          (includeLiveItems ? projector?.snapshotTurn() : projector?.pendingTurn()) ?? {},
-        ]
+      ? [...thread.turns, projector?.snapshotTurn() ?? {}]
       : thread.turns;
     return { thread, turns, busy: this.#externalThreadBusy(thread) };
   }
