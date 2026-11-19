@@ -126,6 +126,7 @@ class FakeConnection implements ModernConnectionLike {
   forkResponse: Promise<ModernRemoteResult<unknown>> | undefined;
   cancelResponse: Promise<ModernRemoteResult<unknown>> | undefined;
   closeError: Error | undefined;
+  closeResult: Promise<void> | undefined;
 
   constructor() {
     this.control.push(controlBaseline());
@@ -330,6 +331,7 @@ class FakeConnection implements ModernConnectionLike {
     this.control.finish();
     this.events.finish();
     for (const feed of this.follows.values()) feed.finish();
+    if (this.closeResult) return this.closeResult;
     return this.closeError ? Promise.reject(this.closeError) : Promise.resolve();
   }
 
@@ -3099,5 +3101,133 @@ describe("Modern DeepSeek Harness Adapter", () => {
 
     await expect(adapter.close()).rejects.toThrow("process tree survived");
     expect(connection.closeCalls).toBe(1);
+  });
+
+  async function startRunningTurn(
+    connection: FakeConnection,
+    session: HarnessSession,
+    sessionId: string,
+    turnId: string,
+    rpcId: string,
+  ): Promise<AsyncIterator<HarnessSessionOutput>> {
+    const outputs = lifecycleOutputs(session);
+    await session.execute({
+      type: "turn.start",
+      turnId: turnId as never,
+      input: [{ type: "text", text: "running" }],
+    });
+    const follow = connection.follows.get(sessionId);
+    follow?.push(liveEvent(1, "turn/start", { turn: 1 }));
+    follow?.push(
+      liveEvent(
+        2,
+        "user/message",
+        {
+          id: `u-${rpcId}`,
+          role: "user",
+          content: [{ type: "text", text: "running" }],
+          source: { kind: "user", rpcId },
+        },
+        true,
+      ),
+    );
+    await expect(outputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.started" } },
+    });
+    return outputs;
+  }
+
+  it("confirms active Session release once fault cleanup stops the managed process", async () => {
+    const onFault = vi.fn();
+    const { adapter, connection } = setup(["journal-first", "adapter-fault", "req-1", "req-2"], {
+      onFault,
+    });
+    const cwd = path.resolve("fixture-fault-process-stop");
+    connection.expectedCwds.set("session-journal-first", cwd);
+    connection.expectedCwds.set("session-adapter-fault", cwd);
+
+    const first = await adapter.open({ kind: "create", cwd });
+    const second = await adapter.open({ kind: "create", cwd });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+
+    const firstOutputs = await startRunningTurn(
+      connection,
+      first.value,
+      "session-journal-first",
+      "turn-journal-first",
+      "req-1",
+    );
+    await startRunningTurn(
+      connection,
+      second.value,
+      "session-adapter-fault",
+      "turn-adapter-fault",
+      "req-2",
+    );
+
+    // First session faults alone while dsh web is still alive: release must stay blocked.
+    connection.follows
+      .get("session-journal-first")
+      ?.push({ type: "event", event: { invalid: true } });
+    await expect(firstOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.completed", outcome: { status: "failed" } } },
+    });
+    await expect(firstOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "session.faulted" } },
+    });
+    await expect(first.value.close()).rejects.toThrow("native execution stop was not confirmed");
+
+    // Adapter fault tears down the managed dsh web process tree.
+    let resolveProcessStop!: () => void;
+    connection.closeResult = new Promise<void>((resolve) => {
+      resolveProcessStop = resolve;
+    });
+    connection.fault(new ModernRemoteConnectionError("unavailable", "stream closed"));
+    expect(onFault).toHaveBeenCalledTimes(1);
+
+    let secondClosed = false;
+    const secondClose = second.value.close().then(() => {
+      secondClosed = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(secondClosed).toBe(false);
+
+    // Once dsh web exits, both the adapter-faulted session and a retried earlier session confirm release.
+    resolveProcessStop();
+    await expect(secondClose).resolves.toBeUndefined();
+    await expect(first.value.close()).resolves.toBeUndefined();
+    await expect(adapter.close()).resolves.toBeUndefined();
+  });
+
+  it("keeps blocking active Session release when fault cleanup cannot stop the managed process", async () => {
+    const { adapter, connection } = setup(["active", "req-active"]);
+    const cwd = path.resolve("fixture-fault-process-survived");
+    connection.expectedCwds.set("session-active", cwd);
+    const opened = await adapter.open({ kind: "create", cwd });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    await startRunningTurn(
+      connection,
+      opened.value,
+      "session-active",
+      "turn-survived",
+      "req-active",
+    );
+
+    connection.closeError = new Error("process tree survived");
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      connection.fault(new ModernRemoteConnectionError("unavailable", "stream closed"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+      await expect(opened.value.close()).rejects.toThrow("process tree survived");
+      await expect(adapter.close()).rejects.toThrow("process tree survived");
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
   });
 });
