@@ -329,6 +329,8 @@ export interface ModernHarnessSessionOptions {
   readonly acceptedCorrelationTimeoutMs?: number;
   readonly onClosed?: () => void;
   readonly flushSession?: () => Promise<void>;
+  /** Settles when the owning managed `dsh web` process tree is confirmed stopped. */
+  readonly managedProcessStop?: () => Promise<void> | undefined;
 }
 
 export interface ModernSessionControl extends ModernConfigurationControl {
@@ -369,6 +371,7 @@ export class ModernHarnessSession implements HarnessSession, ModernEventSink {
   readonly #acceptedCorrelationTimeoutMs: number;
   readonly #onClosed: () => void;
   readonly #flushSession: (() => Promise<void>) | undefined;
+  readonly #managedProcessStop: (() => Promise<void> | undefined) | undefined;
   readonly #fallbackModel: HarnessModelRef;
   readonly #fallbackThinkingOptionId: HarnessThinkingOptionId | undefined;
   readonly #sessionDirectory: string | undefined;
@@ -458,6 +461,7 @@ export class ModernHarnessSession implements HarnessSession, ModernEventSink {
     );
     this.#onClosed = options.onClosed ?? (() => undefined);
     this.#flushSession = options.flushSession;
+    this.#managedProcessStop = options.managedProcessStop;
     this.#events = [...options.journal.events];
     this.#historyBytes = journalHistoryBytes(this.#events, this.#maxHistoryBytes);
     this.#validator = new ModernEventValidator(this.#maxEvents, this.#profile);
@@ -629,18 +633,32 @@ export class ModernHarnessSession implements HarnessSession, ModernEventSink {
   }
 
   close(): Promise<void> {
-    const faultCleanup = this.#closePromise;
-    if (this.#faultMayHaveNativeWork && !this.#closing && faultCleanup) {
+    if (this.#faulted && this.#closePromise) {
       this.#closing = true;
-      // Fault cleanup retires local projection, but cannot certify native execution stopped.
-      this.#closePromise = faultCleanup.then(() => {
-        throw new Error(
-          "DeepSeek Harness native execution stop was not confirmed before the Session fault",
-        );
-      });
+      const processStop = this.#managedProcessStop?.();
+      return this.#closePromise.then(
+        () => {
+          if (!this.#faultMayHaveNativeWork) return;
+          if (processStop) return processStop;
+          // Fault cleanup retires local projection, but cannot certify native execution stopped
+          // until the owning managed DSH process tree is confirmed exited.
+          throw new Error(
+            "DeepSeek Harness native execution stop was not confirmed before the Session fault",
+          );
+        },
+        (error: unknown) => {
+          if (processStop) return processStop;
+          throw error;
+        },
+      );
     }
     this.#closePromise ??= this.#performClose();
     return this.#closePromise;
+  }
+
+  /** Adapter-owned local teardown drain after fault; never waits on managed process exit. */
+  async waitForFaultCleanup(): Promise<void> {
+    await this.#closePromise?.catch(() => undefined);
   }
 
   /** Adapter-owned transport/control fault convergence. */
@@ -2861,6 +2879,7 @@ export class ModernHarnessSession implements HarnessSession, ModernEventSink {
     }
     this.#settleAllPromptCorrelationGraces({ kind: "fault", error: failure });
     this.#abortOperations();
+    this.#nativeCloseTerminal?.();
     this.#closePromise ??= this.#performFault(failure, acceptedPending);
   }
 
@@ -2940,7 +2959,7 @@ export class ModernHarnessSession implements HarnessSession, ModernEventSink {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const terminal = new Promise<void>((resolve) => {
         this.#nativeCloseTerminal = () => {
-          if (activeAtClose?.terminal) resolve();
+          if (activeAtClose?.terminal || this.#faulted) resolve();
         };
       });
       try {
