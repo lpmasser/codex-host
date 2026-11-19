@@ -74,6 +74,7 @@ import {
 import { modernSessionCapabilities, ModernHarnessSession } from "./session.js";
 import { loadModernSessionCandidates, ModernSessionListError } from "./session-list.js";
 import {
+  MODERN_STREAM_REPLACEMENT_COOLDOWN_MS,
   redactModernCredential,
   sanitizeModernRemoteFailure,
   type ModernRemoteFailure,
@@ -115,6 +116,8 @@ export interface ModernDeepSeekHarnessAdapterOptions extends ModernRemoteConnect
   readonly recoveryOpenTimeoutMs?: number;
   readonly promptCorrelationGraceMs?: number;
   readonly acceptedCorrelationTimeoutMs?: number;
+  /** Called once when this managed generation enters terminal fault and must be retired. */
+  readonly onFault?: (error: HarnessError) => void;
 }
 
 export interface ModernConnectionLike extends ModernJournalRemote {
@@ -173,9 +176,18 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
   #closePromise: Promise<void> | undefined;
   #fault: HarnessError | undefined;
   #declaredEventFailure: HarnessError | undefined;
+  #faultNotified = false;
   #normalClose = false;
   #eventRecovery: Promise<void> | undefined;
-  #eventReplacementUsed = false;
+  #lastEventReplacementAt: number | undefined;
+  #processStop:
+    | {
+        readonly promise: Promise<void>;
+        readonly resolve: () => void;
+        readonly reject: (reason: unknown) => void;
+        settled: boolean;
+      }
+    | undefined;
 
   constructor(
     options: ModernDeepSeekHarnessAdapterOptions,
@@ -184,10 +196,14 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
     this.#options = options;
     this.#profile = deepSeekModernProfile(options.version);
     this.#dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencies };
-    const connectionOptions: ModernRemoteConnectionOptions & { version?: string } = {
+    const connectionOptions: ModernRemoteConnectionOptions & {
+      version?: string;
+      onFault?: (error: HarnessError) => void;
+    } = {
       ...options,
     };
     delete connectionOptions.version;
+    delete connectionOptions.onFault;
     this.#connection = this.#dependencies.createConnection(connectionOptions);
     if (options.openWebUi && this.#connection.openWebUi) {
       this.webUi = Object.freeze({
@@ -200,6 +216,7 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
       onFault: (error) => this.#fail(toHarnessError(error, "unavailable")),
     });
     this.#control = new ModernControlStore(this.#connection, {
+      now: this.#dependencies.now,
       onFault: (error) => this.#fail(toHarnessError(error, "unavailable")),
     });
     this.#removeConnectionFaultListener = this.#connection.onFault((error) => {
@@ -223,6 +240,7 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
       this.#accepting = false;
       const failure = this.#declaredEventFailure;
       if (failure) {
+        this.#ensureProcessStop();
         this.#closePromise = (async () => {
           await this.#events.fail(failure).catch(() => undefined);
           await this.#performClose(this.#fault ?? failure);
@@ -479,6 +497,7 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
         permissionModes,
         sessionId,
         flushSession: () => this.#connection.flushSession(sessionId),
+        managedProcessStop: () => this.#processStop?.promise,
         randomUUID: this.#dependencies.randomUUID,
         now: this.#dependencies.now,
         ...(this.#options.toolOutputLimit === undefined
@@ -855,33 +874,80 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
     });
   }
 
+  #ensureProcessStop(): void {
+    if (this.#processStop) return;
+    let resolve!: () => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    // Sessions may never observe a rejection if none are closing; close() still propagates it.
+    promise.catch(() => undefined);
+    this.#processStop = { promise, resolve, reject, settled: false };
+  }
+
+  #resolveProcessStop(): void {
+    this.#ensureProcessStop();
+    if (!this.#processStop || this.#processStop.settled) return;
+    this.#processStop.settled = true;
+    this.#processStop.resolve();
+  }
+
+  #rejectProcessStop(reason: unknown): void {
+    this.#ensureProcessStop();
+    if (!this.#processStop || this.#processStop.settled) return;
+    this.#processStop.settled = true;
+    this.#processStop.reject(reason);
+  }
+
+  #notifyFault(error: HarnessError): void {
+    if (this.#faultNotified) return;
+    this.#faultNotified = true;
+    try {
+      this.#options.onFault?.(error);
+    } catch {
+      // An outer lifecycle observer cannot disrupt fault cleanup.
+    }
+  }
+
   #fail(error: HarnessError): void {
     if (this.#fault || this.#normalClose) return;
     const failure = sanitizedHarnessError(error);
     this.#fault = failure;
     this.#accepting = false;
+    this.#ensureProcessStop();
     this.#lifetime.abort(new Error("DeepSeek Harness Adapter faulted"));
     for (const session of this.#sessions) session.fault(failure);
-    if (this.#closePromise) return;
-    this.#closePromise = this.#performClose(failure);
-    // Nobody awaits fault cleanup here; its failure belongs to whoever calls close() later.
-    this.#closePromise.catch(() => undefined);
+    if (!this.#closePromise) {
+      this.#closePromise = this.#performClose(failure);
+      // Nobody awaits fault cleanup here; its failure belongs to whoever calls close() later.
+      this.#closePromise.catch(() => undefined);
+    }
+    this.#notifyFault(failure);
   }
 
   #sealEventFailure(error: HarnessError): void {
     if (this.#fault || this.#normalClose || this.#declaredEventFailure) return;
-    this.#declaredEventFailure = sanitizedHarnessError(error);
+    const failure = sanitizedHarnessError(error);
+    this.#declaredEventFailure = failure;
     this.#accepting = false;
+    this.#ensureProcessStop();
     this.#lifetime.abort(new Error("DeepSeek Harness event gateway failed"));
+    this.#notifyFault(failure);
   }
 
   #recoverEvents(error: ModernEventGatewayError): void {
     if (!this.#accepting || this.#eventRecovery) return;
-    if (this.#eventReplacementUsed) {
+    const now = this.#dependencies.now();
+    if (
+      this.#lastEventReplacementAt !== undefined &&
+      now - this.#lastEventReplacementAt < MODERN_STREAM_REPLACEMENT_COOLDOWN_MS
+    ) {
       void this.#events.fail(error).catch(() => undefined);
       return;
     }
-    this.#eventReplacementUsed = true;
+    this.#lastEventReplacementAt = now;
     const recovery = this.#events
       .replace()
       .catch(async (replacementError: unknown) => {
@@ -905,7 +971,10 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
     this.#removeConnectionFaultListener();
     const sessions = [...this.#sessions];
     const sessionClosures = sessions.map((session) => {
-      if (failure) session.fault(failure);
+      if (failure) {
+        session.fault(failure);
+        return session.waitForFaultCleanup();
+      }
       return session.close();
     });
     const sessionResults = await Promise.allSettled(sessionClosures);
@@ -913,10 +982,17 @@ export class ModernDeepSeekHarnessAdapter implements HarnessAdapter {
     await this.#control.close().catch(() => undefined);
     const connectionClose = this.#connection.close();
     const [connectionResult] = await Promise.allSettled([connectionClose]);
+    if (connectionResult.status === "fulfilled") {
+      this.#resolveProcessStop();
+    } else {
+      this.#rejectProcessStop(connectionResult.reason);
+    }
     await Promise.allSettled([...this.#inflight, this.#eventRecovery]);
     if (connectionResult.status === "rejected") throw connectionResult.reason;
-    const sessionFailure = sessionResults.find((result) => result.status === "rejected");
-    if (sessionFailure?.status === "rejected") throw sessionFailure.reason;
+    if (!failure) {
+      const sessionFailure = sessionResults.find((result) => result.status === "rejected");
+      if (sessionFailure?.status === "rejected") throw sessionFailure.reason;
+    }
   }
 }
 
