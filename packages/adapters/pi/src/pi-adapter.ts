@@ -4,7 +4,8 @@ import {
   type SubagentConfiguration,
 } from "@codexhost/harness-adapter";
 import { createPiUsageStatistics } from "./pi-usage-statistics.js";
-import { fetchPiAccounts } from "./account-balance.js";
+import { agentDirectory, fetchPiAccounts } from "./account-balance.js";
+import { watchPiCatalogConfig } from "./pi-catalog-config-watch.js";
 import { createPiCredentialImports } from "./pi-credential-imports.js";
 import { PI_FAST_COMMAND, supportsPiFastModel } from "./pi-fast-mode.js";
 import { persistEmptyPiSession, readPiEmptySessionConfiguration } from "./pi-empty-session.js";
@@ -2316,6 +2317,7 @@ export class PiAdapter implements HarnessAdapter {
   readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
   readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
   readonly #inspections = new Set<PiTurnTransport>();
+  readonly #configWatches = new Set<() => void>();
   readonly #sessions = new Set<PiHarnessSession>();
   readonly #toolOutputLimit: number;
   readonly #environment: NodeJS.ProcessEnv;
@@ -2348,6 +2350,19 @@ export class PiAdapter implements HarnessAdapter {
     this.usageStatistics = createPiUsageStatistics({ ...process.env, ...options.environment });
     this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
     this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+  }
+
+  /** Pi re-reads its user configuration at startup, so a changed file stales the cached catalog. */
+  subscribeInspectionChanges(listener: () => void): () => void {
+    const stop = watchPiCatalogConfig(agentDirectory(this.#environment), () => {
+      this.#inspectionCache.clear();
+      listener();
+    });
+    this.#configWatches.add(stop);
+    return () => {
+      this.#configWatches.delete(stop);
+      stop();
+    };
   }
 
   /** Pi itself holds no Account; this reports configured Provider balances. */
@@ -2764,6 +2779,8 @@ export class PiAdapter implements HarnessAdapter {
 
   close(): Promise<void> {
     if (!this.#closePromise) {
+      for (const stop of this.#configWatches) stop();
+      this.#configWatches.clear();
       this.#closePromise = Promise.all([
         this.#importScope.close(),
         ...[...this.#inspections].map((transport) => transport.close()),
