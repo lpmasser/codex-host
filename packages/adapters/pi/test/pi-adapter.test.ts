@@ -1147,6 +1147,32 @@ describe("Pi HarnessAdapter Session", () => {
     await adapter.close();
   });
 
+  it("re-inspects after the user edits Pi's catalog configuration", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-catalog-config-"));
+    await writeFile(path.join(directory, "models.json"), "{}");
+    const { adapter, dependencies } = fixture({
+      environment: { PI_CODING_AGENT_DIR: directory },
+    });
+    let notified = 0;
+    adapter.subscribeInspectionChanges(() => notified++);
+    try {
+      await adapter.inspect({ cwd: "/synthetic" });
+
+      // Pi persisting an unchanged file does not count as a configuration change.
+      await writeFile(path.join(directory, "models.json"), "{}");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(notified).toBe(0);
+
+      await writeFile(path.join(directory, "models.json"), '{"providers":{}}');
+      await vi.waitFor(() => expect(notified).toBe(1));
+      await adapter.inspect({ cwd: "/synthetic" });
+      expect(dependencies.createTransport).toHaveBeenCalledTimes(2);
+    } finally {
+      await adapter.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("falls back inspect cwd when Host omits cwd or supplies the filesystem root", async () => {
     const { adapter, dependencies } = fixture();
     const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/");
