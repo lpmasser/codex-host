@@ -126,6 +126,7 @@ class FakeConnection implements ModernConnectionLike {
   forkResponse: Promise<ModernRemoteResult<unknown>> | undefined;
   cancelResponse: Promise<ModernRemoteResult<unknown>> | undefined;
   closeError: Error | undefined;
+  closeResult: Promise<void> | undefined;
 
   constructor() {
     this.control.push(controlBaseline());
@@ -330,6 +331,7 @@ class FakeConnection implements ModernConnectionLike {
     this.control.finish();
     this.events.finish();
     for (const feed of this.follows.values()) feed.finish();
+    if (this.closeResult) return this.closeResult;
     return this.closeError ? Promise.reject(this.closeError) : Promise.resolve();
   }
 
@@ -605,6 +607,7 @@ function liveEvent(
 function setup(
   uuids = ["created"],
   adapterOptions: Partial<ConstructorParameters<typeof ModernDeepSeekHarnessAdapter>[0]> = {},
+  now: () => number = () => 1_000,
 ): {
   readonly adapter: ModernDeepSeekHarnessAdapter;
   readonly connection: FakeConnection;
@@ -615,7 +618,7 @@ function setup(
     { command: "dsh", version: DSH_VERSION, ...adapterOptions },
     {
       randomUUID: () => values.shift() ?? "fallback",
-      now: () => 1_000,
+      now,
       createConnection: () => connection,
     },
   );
@@ -3099,5 +3102,194 @@ describe("Modern DeepSeek Harness Adapter", () => {
 
     await expect(adapter.close()).rejects.toThrow("process tree survived");
     expect(connection.closeCalls).toBe(1);
+  });
+
+  it("confirms active Session release once fault cleanup stops the managed process", async () => {
+    const onFault = vi.fn();
+    const { adapter, connection } = setup(["journal-first", "adapter-fault", "req-1", "req-2"], {
+      onFault,
+    });
+    const cwd = path.resolve("fixture-fault-process-stop");
+    connection.expectedCwds.set("session-journal-first", cwd);
+    connection.expectedCwds.set("session-adapter-fault", cwd);
+
+    const first = await adapter.open({ kind: "create", cwd });
+    const second = await adapter.open({ kind: "create", cwd });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    const firstOutputs = lifecycleOutputs(first.value);
+    const secondOutputs = lifecycleOutputs(second.value);
+
+    await first.value.execute({
+      type: "turn.start",
+      turnId: "turn-journal-first" as never,
+      input: [{ type: "text", text: "running before single-session fault" }],
+    });
+    const firstFollow = connection.follows.get("session-journal-first");
+    firstFollow?.push(liveEvent(1, "turn/start", { turn: 1 }));
+    firstFollow?.push(
+      liveEvent(
+        2,
+        "user/message",
+        {
+          id: "u1",
+          role: "user",
+          content: [{ type: "text", text: "running before single-session fault" }],
+          source: { kind: "user", rpcId: "req-1" },
+        },
+        true,
+      ),
+    );
+    await expect(firstOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.started" } },
+    });
+
+    await second.value.execute({
+      type: "turn.start",
+      turnId: "turn-adapter-fault" as never,
+      input: [{ type: "text", text: "running during adapter fault" }],
+    });
+    const secondFollow = connection.follows.get("session-adapter-fault");
+    secondFollow?.push(liveEvent(1, "turn/start", { turn: 1 }));
+    secondFollow?.push(
+      liveEvent(
+        2,
+        "user/message",
+        {
+          id: "u2",
+          role: "user",
+          content: [{ type: "text", text: "running during adapter fault" }],
+          source: { kind: "user", rpcId: "req-2" },
+        },
+        true,
+      ),
+    );
+    await expect(secondOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.started" } },
+    });
+
+    // First session faults alone while dsh web is still alive: release must stay blocked.
+    firstFollow?.push({ type: "event", event: { invalid: true } });
+    await expect(firstOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.completed", outcome: { status: "failed" } } },
+    });
+    await expect(firstOutputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "session.faulted" } },
+    });
+    await expect(first.value.close()).rejects.toThrow("native execution stop was not confirmed");
+
+    // Adapter fault tears down the managed dsh web process tree.
+    let resolveProcessStop!: () => void;
+    connection.closeResult = new Promise<void>((resolve) => {
+      resolveProcessStop = resolve;
+    });
+    connection.fault(new ModernRemoteConnectionError("unavailable", "stream closed"));
+    expect(onFault).toHaveBeenCalledTimes(1);
+
+    let secondClosed = false;
+    const secondClose = second.value.close().then(() => {
+      secondClosed = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(secondClosed).toBe(false);
+
+    // Once dsh web exits, both the adapter-faulted session and a retried earlier session confirm release.
+    resolveProcessStop();
+    await expect(secondClose).resolves.toBeUndefined();
+    await expect(first.value.close()).resolves.toBeUndefined();
+    await expect(adapter.close()).resolves.toBeUndefined();
+  });
+
+  it("keeps blocking active Session release when fault cleanup cannot stop the managed process", async () => {
+    const { adapter, connection } = setup(["active", "req-active"]);
+    const cwd = path.resolve("fixture-fault-process-survived");
+    connection.expectedCwds.set("session-active", cwd);
+    const opened = await adapter.open({ kind: "create", cwd });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const outputs = lifecycleOutputs(opened.value);
+
+    await opened.value.execute({
+      type: "turn.start",
+      turnId: "turn-survived" as never,
+      input: [{ type: "text", text: "running" }],
+    });
+    const follow = connection.follows.get("session-active");
+    follow?.push(liveEvent(1, "turn/start", { turn: 1 }));
+    follow?.push(
+      liveEvent(
+        2,
+        "user/message",
+        {
+          id: "u-survived",
+          role: "user",
+          content: [{ type: "text", text: "running" }],
+          source: { kind: "user", rpcId: "req-active" },
+        },
+        true,
+      ),
+    );
+    await expect(outputs.next()).resolves.toMatchObject({
+      value: { kind: "event", event: { type: "turn.started" } },
+    });
+
+    connection.closeError = new Error("process tree survived");
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      connection.fault(new ModernRemoteConnectionError("unavailable", "stream closed"));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+      await expect(opened.value.close()).rejects.toThrow("process tree survived");
+      await expect(adapter.close()).rejects.toThrow("process tree survived");
+    } finally {
+      process.off("unhandledRejection", unhandled);
+    }
+  });
+
+  it("recovers isolated event and journal stream drops separated by the cooldown window", async () => {
+    let now = 1_000;
+    const { adapter, connection } = setup(["created"], {}, () => now);
+    const sessionId = "session-created";
+    const cwd = path.resolve("fixture-cooldown-recovery");
+    connection.expectedCwds.set(sessionId, cwd);
+    const initial = journalSnapshot(sessionId, cwd, null, undefined, true);
+    connection.journalSnapshotQueues.set(sessionId, [
+      initial,
+      structuredClone(initial),
+      structuredClone(initial),
+    ]);
+    const replacementEvents1 = connection.queueEventReplacement("client-2");
+    connection.queueEventReplacement("client-3");
+
+    const opened = await adapter.open({ kind: "create", cwd });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    const firstFollow = connection.follows.get(sessionId);
+    firstFollow?.finish();
+    connection.events.finish();
+    await vi.waitFor(() => {
+      expect(
+        connection.streams.filter(({ endpoint }) => endpoint === "session/follow"),
+      ).toHaveLength(2);
+      expect(connection.streams.filter(({ endpoint }) => endpoint === "$events")).toHaveLength(2);
+    });
+
+    now += 30_000;
+    const secondFollow = connection.follows.get(sessionId);
+    secondFollow?.finish();
+    replacementEvents1.finish();
+    await vi.waitFor(() => {
+      expect(
+        connection.streams.filter(({ endpoint }) => endpoint === "session/follow"),
+      ).toHaveLength(3);
+      expect(connection.streams.filter(({ endpoint }) => endpoint === "$events")).toHaveLength(3);
+    });
+    await expect(adapter.inspect()).resolves.toMatchObject({ status: "ready" });
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({ ok: true });
+    await opened.value.close();
+    await adapter.close();
   });
 });

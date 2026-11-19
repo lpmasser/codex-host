@@ -64,6 +64,7 @@ interface DelegateOwner {
   readonly adapter: ModernDelegateAdapter;
   readonly version: DeepSeekExecutableGeneration["version"];
   inspection: HarnessInspection;
+  faulted: boolean;
   closePromise?: Promise<void>;
 }
 
@@ -131,6 +132,8 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   #closed = false;
   #delegate: DelegateOwner | undefined;
   #failure: HarnessError | undefined;
+  #retireCleanupFailed = false;
+  #retiring: Promise<void> | undefined;
   #selection: ActiveSelection | undefined;
   #terminalFailure: HarnessError | undefined;
 
@@ -150,7 +153,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
 
   async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
     if (this.#closed) return { status: "unavailable", error: closedError() };
-    if (this.#delegate) return this.#delegate.adapter.inspect(input);
+    if (this.#delegate && !this.#delegate.faulted) return this.#delegate.adapter.inspect(input);
     try {
       return (await this.#select(input.refresh === true)).inspection;
     } catch (error) {
@@ -191,7 +194,8 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
 
   #openWebUi(): Promise<HarnessResult<void>> {
     if (this.#closed) return Promise.resolve({ ok: false, error: closedError() });
-    const webUi = this.#delegate?.adapter.webUi;
+    const webUi =
+      this.#delegate && !this.#delegate.faulted ? this.#delegate.adapter.webUi : undefined;
     return webUi
       ? webUi.open()
       : Promise.resolve({
@@ -209,7 +213,7 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
     if (this.#terminalFailure) {
       return Promise.reject(new DelegateSelectionError(this.#terminalFailure));
     }
-    if (this.#delegate) return Promise.resolve(this.#delegate);
+    if (this.#delegate && !this.#delegate.faulted) return Promise.resolve(this.#delegate);
     if (this.#selection) return this.#selection.promise;
     if (this.#failure && !refresh) {
       return Promise.reject(new DelegateSelectionError(this.#failure));
@@ -224,6 +228,14 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
           throw new DelegateSelectionError(closedError());
         }
         this.#candidate = undefined;
+        if (selected.faulted) {
+          await this.#closeFailedCandidate(selected);
+          throw new DelegateSelectionError({
+            code: "unavailable",
+            message: "DeepSeek Harness managed Web faulted during startup",
+            retryable: true,
+          });
+        }
         this.#delegate = selected;
         return selected;
       })
@@ -241,6 +253,11 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
   }
 
   async #performSelection(signal: AbortSignal): Promise<DelegateOwner> {
+    while (this.#retiring) {
+      await this.#retiring;
+    }
+    if (this.#closed || signal.aborted) throw new DelegateSelectionError(closedError());
+    if (this.#terminalFailure) throw new DelegateSelectionError(this.#terminalFailure);
     const startedAt = Date.now();
     let endpoint: string;
     try {
@@ -314,17 +331,26 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
     executable: DeepSeekExecutableGeneration,
     signal: AbortSignal,
   ): Promise<DelegateOwner> {
+    const ownerRef: { current?: DelegateOwner } = {};
     const adapter = this.#createModernAdapter({
       ...modernOptions(this.#options),
       version: executable.version,
       command: executable.command.command,
       commandArguments: executable.command.arguments,
+      onFault: () => {
+        const current = ownerRef.current;
+        if (!current) return;
+        current.faulted = true;
+        if (this.#delegate === current) this.#retireFaultedDelegate(current);
+      },
     });
     const owner: DelegateOwner = {
       adapter,
       version: executable.version,
       inspection: unavailableInspection("DeepSeek Harness Modern selection is incomplete"),
+      faulted: false,
     };
+    ownerRef.current = owner;
     this.#candidate = owner;
     try {
       const inspectionPromise = adapter.inspect();
@@ -342,11 +368,34 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
     }
   }
 
+  #retireFaultedDelegate(owner: DelegateOwner): void {
+    if (this.#closed || this.#delegate !== owner) return;
+    this.#delegate = undefined;
+    this.#failure = undefined;
+    const previous = this.#retiring ?? Promise.resolve();
+    const retiring = previous
+      .then(async () => {
+        try {
+          await this.#closeOwner(owner);
+        } catch {
+          this.#retireCleanupFailed = true;
+          this.#recordCleanupFailure();
+        }
+      })
+      .finally(() => {
+        if (this.#retiring === retiring) this.#retiring = undefined;
+      });
+    this.#retiring = retiring;
+  }
+
   async #performClose(): Promise<void> {
     this.#closed = true;
     let cleanupFailed = false;
     const selection = this.#selection;
     selection?.abort.abort(new Error("DeepSeek Harness generation selection closed"));
+    while (this.#retiring) {
+      await this.#retiring;
+    }
     const candidate = this.#candidate;
     if (candidate) {
       await this.#closeOwner(candidate).catch(() => {
@@ -366,7 +415,10 @@ export class DeepSeekHarnessAdapter implements HarnessAdapter {
         cleanupFailed = true;
       });
     }
-    if (cleanupFailed || this.#cleanupFailedDuringClose) {
+    while (this.#retiring) {
+      await this.#retiring;
+    }
+    if (cleanupFailed || this.#cleanupFailedDuringClose || this.#retireCleanupFailed) {
       throw new Error("DeepSeek Harness Adapter cleanup did not complete");
     }
   }

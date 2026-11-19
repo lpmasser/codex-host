@@ -424,6 +424,36 @@ describe("Modern replacement baselines", () => {
     await store.close();
   });
 
+  it("reopens again after the replacement cooldown window elapses", async () => {
+    let now = 1_000;
+    const first = new ControlFeed();
+    const second = new ControlFeed();
+    const third = new ControlFeed();
+    const source = new ControlGenerations([first, second, third]);
+    const store = new ModernControlStore(source, { now: () => now, replacementCooldownMs: 30_000 });
+    const ready = store.start();
+    first.push(baseline());
+    await ready;
+    store.attach("loaded", { asOfSeq: 1, values: { key: "seeded" } });
+
+    first.end();
+    await vi.waitFor(() => expect(source.calls).toHaveLength(2));
+    second.push(baseline({ loaded: projectionBlock(2, { key: "second" }) }));
+    await vi.waitFor(() =>
+      expect(store.snapshot("loaded")?.key).toEqual({ value: "second", seq: 2 }),
+    );
+
+    now += 30_000;
+    second.end();
+    await vi.waitFor(() => expect(source.calls).toHaveLength(3));
+    third.push(baseline({ loaded: projectionBlock(3, { key: "third" }) }));
+    await vi.waitFor(() =>
+      expect(store.snapshot("loaded")?.key).toEqual({ value: "third", seq: 3 }),
+    );
+    expect(store.fault).toBeUndefined();
+    await store.close();
+  });
+
   it("faults atomically when a physical replacement omits a journal-seeded Session", async () => {
     const first = new ControlFeed();
     const second = new ControlFeed();

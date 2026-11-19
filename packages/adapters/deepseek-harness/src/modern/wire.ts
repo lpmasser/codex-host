@@ -20,6 +20,7 @@ export type ModernRemoteStreamFrame =
   | { readonly type: "end"; readonly streamId: string };
 
 export const MODERN_REMOTE_MUX_PATH = "/api/remote.mux";
+export const MODERN_STREAM_REPLACEMENT_COOLDOWN_MS = 30_000;
 
 const ENDPOINT_SEGMENT = /^[A-Za-z0-9_$.-]+$/u;
 const COOKIE_NAME = /^dsh-auth-[A-Za-z0-9_-]+$/u;

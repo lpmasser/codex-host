@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import { ModernRemoteConnectionError } from "./remote-connection.js";
-import { redactModernCredential } from "./wire.js";
+import { MODERN_STREAM_REPLACEMENT_COOLDOWN_MS, redactModernCredential } from "./wire.js";
 
 export type ModernControlJsonValue =
   | null
@@ -59,6 +59,8 @@ export interface ModernControlStoreOptions {
   readonly maxWaiters?: number;
   readonly waitTimeoutMs?: number;
   readonly recoveryOpenTimeoutMs?: number;
+  readonly replacementCooldownMs?: number;
+  readonly now?: () => number;
   readonly onFault?: (error: ModernControlStoreError) => void;
 }
 
@@ -524,7 +526,9 @@ export class ModernControlStore {
   readonly #maxKeys: number;
   readonly #maxSessions: number;
   readonly #maxWaiters: number;
+  readonly #now: () => number;
   readonly #onFault: ((error: ModernControlStoreError) => void) | undefined;
+  readonly #replacementCooldownMs: number;
   readonly #sessions = new Map<string, SessionState>();
   readonly #source: ModernControlStreamSource;
   readonly #waiters = new Set<ProjectionWaiter>();
@@ -558,6 +562,12 @@ export class ModernControlStore {
       "recoveryOpenTimeoutMs",
       MAX_TIMER_MILLISECONDS,
     );
+    this.#replacementCooldownMs = positiveInteger(
+      options.replacementCooldownMs ?? MODERN_STREAM_REPLACEMENT_COOLDOWN_MS,
+      "replacementCooldownMs",
+      MAX_TIMER_MILLISECONDS,
+    );
+    this.#now = options.now ?? Date.now;
     this.#onFault = options.onFault;
   }
 
@@ -773,7 +783,7 @@ export class ModernControlStore {
   }
 
   async #run(): Promise<void> {
-    let replacementUsed = false;
+    let lastReplacementAt: number | undefined;
     while (!this.#closing) {
       let iterator: AsyncIterator<unknown> | undefined;
       try {
@@ -836,8 +846,14 @@ export class ModernControlStore {
                   "unavailable",
                   "DeepSeek Harness control stream failed",
                 );
-        if (this.#opened && !replacementUsed && failure.code === "unavailable") {
-          replacementUsed = true;
+        const now = this.#now();
+        if (
+          this.#opened &&
+          failure.code === "unavailable" &&
+          (lastReplacementAt === undefined ||
+            now - lastReplacementAt >= this.#replacementCooldownMs)
+        ) {
+          lastReplacementAt = now;
           continue;
         }
         this.#fail(failure);
