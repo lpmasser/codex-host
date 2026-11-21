@@ -128,6 +128,7 @@ import { loadCodexNativeServices } from "./codex-native-services.js";
 import { openCodexSchedules, openCodexThread } from "./codex-schedule-navigation.js";
 import { createDesktopTreeRelay, openLocalExtensionThread } from "./desktop-extension-api.js";
 import { installDesktopExtensionHost } from "./desktop-extension-host.js";
+import { installRendererSidebarDelegationBadges } from "./renderer-sidebar-delegation-badges.js";
 import { openRendererThread } from "./renderer-fork-control.js";
 import type {
   RendererConnectionDiagnostics,
@@ -887,6 +888,17 @@ export function installRendererBindingProbe(
         : undefined;
     },
     getLocalAgent: localAgentForSidebarThread,
+  });
+  const sidebarDelegationNavigation = new AbortController();
+  const sidebarDelegationBadges = installRendererSidebarDelegationBadges({
+    getClient: (hostId) => modelClientForHost(hostId),
+    getPlugins: (hostId) => {
+      const state = hostHarnessAvailabilityState(hostId);
+      return state.directoryClient === modelClientForHost(hostId)
+        ? (state.plugins ?? undefined)
+        : undefined;
+    },
+    openThread: (threadId) => openCodexThread(threadId, sidebarDelegationNavigation.signal),
   });
   let connectionDiagnostics: RendererConnectionDiagnostics | null = null;
   const remoteConnections = createRemoteConnectionsControl(window, modelClientForHost);
@@ -3897,6 +3909,8 @@ export function installRendererBindingProbe(
       skillLibrary.dispose();
       disposeSkillReferences();
       sidebarAgentIcons.dispose();
+      sidebarDelegationNavigation.abort();
+      sidebarDelegationBadges.dispose();
       sidebarThreadState.dispose();
       nativeScheduleControls.dispose();
       settingsLifecycle.dispose();
