@@ -53,6 +53,7 @@ import { DevinInteractions } from "./interactions.js";
 import {
   DevinHistoryError,
   deriveDevinHistory,
+  devinAddedPromptKey,
   devinCheckpoint,
   devinHistorySteps,
   readDevinHistory,
@@ -606,30 +607,30 @@ export class DevinSession implements HarnessSession {
     };
     let nativeTurnRef: ReturnType<typeof nativeTurnRefSchema.parse> | undefined;
     try {
-      const result = await this.transport.prompt(
-        command.input.map((part) => part.text).join("\n"),
-        {
-          update: (event) => {
-            if (event.update.sessionUpdate === "current_mode_update") {
-              this.initialState.effectivePermissionModeId = harnessPermissionModeIdSchema.parse(
-                event.update.currentModeId,
-              );
-              if (this.info.modes)
-                this.info.modes.currentModeId = this.initialState.effectivePermissionModeId;
-              this.#channel.emit({
-                kind: "event",
-                event: {
-                  type: "session.state.changed",
-                  state: { ...this.initialState },
-                },
-              });
-            }
-            output.update(event);
-          },
-          permission: (request) => this.#interactions.permission(command.turnId, request),
-          extension: () => this.#interactions.extension(),
-        },
-      );
+      const before = await this.#promptStepIds();
+      const result = this.#active?.cancelled
+        ? { stopReason: "cancelled" as const }
+        : await this.transport.prompt(command.input.map((part) => part.text).join("\n"), {
+            update: (event) => {
+              if (event.update.sessionUpdate === "current_mode_update") {
+                this.initialState.effectivePermissionModeId = harnessPermissionModeIdSchema.parse(
+                  event.update.currentModeId,
+                );
+                if (this.info.modes)
+                  this.info.modes.currentModeId = this.initialState.effectivePermissionModeId;
+                this.#channel.emit({
+                  kind: "event",
+                  event: {
+                    type: "session.state.changed",
+                    state: { ...this.initialState },
+                  },
+                });
+              }
+              output.update(event);
+            },
+            permission: (request) => this.#interactions.permission(command.turnId, request),
+            extension: () => this.#interactions.extension(),
+          });
       outcome =
         this.#active?.cancelled || result.stopReason === "cancelled"
           ? { status: "cancelled" }
@@ -643,7 +644,18 @@ export class DevinSession implements HarnessSession {
                   retryable: false,
                 },
               };
-      const key = devinPromptTurnKey(result);
+      let key = devinPromptTurnKey(result);
+      if (this.transport.nativeHistory && (key || before)) {
+        try {
+          const steps = devinHistorySteps(await this.transport.historyRequest("listSteps"));
+          key ??= before ? devinAddedPromptKey(before, steps) : undefined;
+          const checkpoint = key && devinCheckpoint(this.transport.sessionId, key, steps);
+          if (checkpoint) outcome = { ...outcome, checkpoint };
+        } catch (error) {
+          // Optional checkpoint errors do not make a healthy transport unusable.
+          if (this.transport.isClosedOrFaulted) fault = devinError(error);
+        }
+      }
       if (key) {
         nativeTurnRef = nativeTurnRefSchema.parse({
           harnessId: "devin",
@@ -653,19 +665,6 @@ export class DevinSession implements HarnessSession {
         });
         this.#turns += 1;
         this.#fresh = false;
-        if (this.transport.nativeHistory) {
-          try {
-            const checkpoint = devinCheckpoint(
-              this.transport.sessionId,
-              key,
-              devinHistorySteps(await this.transport.historyRequest("listSteps")),
-            );
-            if (checkpoint) outcome = { ...outcome, checkpoint };
-          } catch (error) {
-            // Optional checkpoint errors do not make a healthy transport unusable.
-            if (this.transport.isClosedOrFaulted) fault = devinError(error);
-          }
-        }
       } else if (outcome.status === "succeeded") {
         // Never publish a success terminal with guessed identity.
         outcome = {
@@ -698,6 +697,16 @@ export class DevinSession implements HarnessSession {
     if (fault && !this.#closed) {
       this.#channel.emit({ kind: "event", event: { type: "session.faulted", error: fault } });
       void this.close().catch(() => {});
+    }
+  }
+  /** Prompt steps before a Turn, so a result without its user message ID can be matched exactly. */
+  async #promptStepIds(): Promise<Set<string> | undefined> {
+    if (!this.transport.nativeHistory) return undefined;
+    try {
+      const steps = devinHistorySteps(await this.transport.historyRequest("listSteps"));
+      return new Set(steps.filter((step) => step.kind === "prompt").map((step) => step.stepId));
+    } catch {
+      return undefined;
     }
   }
   async close() {
