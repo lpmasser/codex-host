@@ -17,7 +17,7 @@ const SUB2API_USAGE_PATH = "/v1/usage";
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_PI_ACCOUNTS = 8;
 
-function agentDirectory(environment: NodeJS.ProcessEnv): string {
+export function agentDirectory(environment: NodeJS.ProcessEnv): string {
   const configured = environment.PI_CODING_AGENT_DIR?.trim();
   if (configured) return configured;
   return path.join(environment.HOME ?? environment.USERPROFILE ?? homedir(), ".pi", "agent");
