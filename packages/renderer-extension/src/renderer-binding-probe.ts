@@ -1888,10 +1888,12 @@ export function installRendererBindingProbe(
         return;
       }
       if (current.phase === "locked" && previousModel && !previousModelAvailable) {
+        const resolvedModelLabel = mounted.threadConfiguration?.resolvedModelLabel;
         mounted.modelView = {
           status: "error",
           catalog: modelCatalog,
           selected: previousModel,
+          ...(resolvedModelLabel ? { resolvedModelLabel } : {}),
           thinkingSelectionSupported: inspection.capabilities.configuration.selectThinkingOption,
           error: "Existing Thread Model is absent from the current Catalog",
         };
