@@ -685,6 +685,8 @@ export interface HarnessSession {
    * when that Model is more specific than the Adapter's separate inspection catalog.
    */
   modelCatalog?(): HarnessModelCatalog;
+  /** A label for a saved Model the Adapter validates with the native Session before sending input. */
+  restoredModelLabel?(model: HarnessModelRef): string | undefined;
   refreshUsage?(): Promise<void>;
   /** Account quota attributed to this Session, rather than shared across the Adapter. */
   readAccountCredits?(): Promise<AccountCreditsSnapshot | null>;
@@ -802,6 +804,8 @@ export interface HarnessAdapter {
   inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[]>;
 
   inspect(input?: InspectHarnessInput): Promise<HarnessInspection>;
+  /** Restores a saved native Session selection whose validity is checked by the Adapter on input. */
+  restoreSessionModelRef?(ref: HarnessModelRef): HarnessModelRef | undefined;
   /**
    * Maps a Model Ref saved by an earlier release to the matching entry of `catalog`.
    * Host calls it only for a saved Ref that the catalog does not contain. Return

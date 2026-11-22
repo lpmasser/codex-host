@@ -109,6 +109,7 @@ import { readClaudeTranscript } from "./claude-transcript.js";
 import { readClaudeQueuedCommand } from "./claude-queued-command.js";
 import {
   CLAUDE_DEFAULT_MODEL_REF,
+  claudeModelRef,
   claudeModelValue,
   normalizeClaudeModelCatalog,
   normalizeStoredClaudeModelRef,
@@ -155,6 +156,24 @@ import type {
   ClaudeTurnEvent,
   ClaudeTurnTransport,
 } from "./transport.js";
+
+const CLAUDE_FABLE_ALIAS = "fable";
+const CLAUDE_FABLE_ALIAS_REF = claudeModelRef(CLAUDE_FABLE_ALIAS);
+const CLAUDE_FABLE_ALIAS_ID = CLAUDE_FABLE_ALIAS_REF.id;
+const CLAUDE_FABLE_LABEL = "Fable";
+
+class ClaudeRestoredModelError extends Error {}
+
+function claudeModelState(
+  effectiveModel: HarnessModelRef | undefined,
+  observedModel?: string,
+): Pick<HarnessSessionState, "effectiveModel" | "resolvedModelLabel"> {
+  if (!effectiveModel) return {};
+  // The SDK can list only concrete Fable versions while the session uses the provider's alias.
+  return effectiveModel.id === CLAUDE_FABLE_ALIAS_ID
+    ? { effectiveModel, resolvedModelLabel: observedModel ?? CLAUDE_FABLE_LABEL }
+    : { effectiveModel };
+}
 
 export interface ClaudeCodeAdapterOptions {
   command?: string;
@@ -441,6 +460,9 @@ function transportFailure(kind: ClaudeTransportFailureKind): HarnessError {
 }
 
 function startupFailure(error: unknown): HarnessError {
+  if (error instanceof ClaudeRestoredModelError) {
+    return { code: "invalidRequest", message: error.message, retryable: false };
+  }
   if (error instanceof ClaudeCodeExecutableError) {
     return { code: "notInstalled", message: error.message, retryable: false };
   }
@@ -810,7 +832,7 @@ class ClaudeHarnessSession implements HarnessSession {
           nativeRef: this.#nativeRef,
           ...(options.knownConfiguration
             ? {
-                ...(options.requestedModel ? { effectiveModel: options.requestedModel } : {}),
+                ...claudeModelState(options.requestedModel),
                 effectiveThinkingOptionId: this.#requestedThinkingOptionId,
                 effectivePermissionModeId: this.#requestedPermissionModeId,
               }
@@ -828,6 +850,11 @@ class ClaudeHarnessSession implements HarnessSession {
 
   get nativeWriterRef(): NativeSessionRef {
     return this.#nativeRef;
+  }
+
+  restoredModelLabel(model: HarnessModelRef): string | undefined {
+    if (this.#openMode === "resume" && model.id === CLAUDE_FABLE_ALIAS_ID)
+      return CLAUDE_FABLE_LABEL;
   }
 
   #subagentConfiguration(): SubagentConfiguration {
@@ -1981,6 +2008,17 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       });
       await transport.start();
+      if (selectedModel && this.restoredModelLabel(selectedModel)) {
+        try {
+          await transport.setModel(model, this.#requestedThinkingOptionId);
+        } catch (error) {
+          const reason = error instanceof Error ? sanitizeDiagnosticTail(error.message) : "";
+          throw new ClaudeRestoredModelError(
+            `Claude Code rejected the saved Model. No input was sent. Choose a Model from the current catalog.${reason ? ` Claude Code reported: ${reason}` : ""}`,
+            { cause: error },
+          );
+        }
+      }
       this.#state = {
         ...this.#configuredState(true),
         effectivePermissionModeId: encodeClaudePermissionModeId(transport.getPermissionMode()),
@@ -2034,7 +2072,12 @@ class ClaudeHarnessSession implements HarnessSession {
     const supported = this.#supportedThinkingOptionIds(effectiveModel);
     return {
       ...(nativeReady ? { nativeRef: this.#nativeRef } : {}),
-      ...(effectiveModel ? { effectiveModel } : {}),
+      ...claudeModelState(
+        effectiveModel,
+        effectiveModel?.id === this.#state.effectiveModel?.id
+          ? this.#state.resolvedModelLabel
+          : undefined,
+      ),
       effectiveThinkingOptionId: this.#requestedThinkingOptionId,
       // A live Claude Code keeps running a choice made before the catalog arrived; it stays
       // listed until the next Model switch fits it.
@@ -2102,6 +2145,14 @@ class ClaudeHarnessSession implements HarnessSession {
     switch (event.type) {
       case "segment.started":
         if (event.mcpServers) this.#mcpServers = event.mcpServers;
+        if (
+          this.#state.effectiveModel?.id === CLAUDE_FABLE_ALIAS_ID &&
+          event.model &&
+          event.model !== CLAUDE_FABLE_ALIAS &&
+          event.model !== this.#state.resolvedModelLabel
+        ) {
+          this.#publishState({ ...this.#state, resolvedModelLabel: event.model });
+        }
         this.#observeRootOutput(active);
         if (active.cancellation && !active.cancellation.interrupting) {
           this.#interruptCancelledSegment(active).catch(() => this.#hardCancel(active));
@@ -3235,6 +3286,14 @@ class ClaudeHarnessSession implements HarnessSession {
 
 export class ClaudeCodeAdapter implements HarnessAdapter {
   readonly normalizeStoredModelRef = normalizeStoredClaudeModelRef;
+  restoreSessionModelRef(ref: HarnessModelRef): HarnessModelRef | undefined {
+    if (
+      ref.serviceTier === undefined &&
+      (ref.id === CLAUDE_FABLE_ALIAS_ID || ref.id === "claude-model-v1.ZmFibGU")
+    )
+      return CLAUDE_FABLE_ALIAS_REF;
+    return undefined;
+  }
   readonly commandCatalog = claudeCommandCatalog;
   readonly liveCommandCatalog = true;
   readonly harnessId: HarnessId = claudeCodeHarnessId;

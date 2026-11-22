@@ -15,6 +15,7 @@ import {
 
 import {
   isRendererModelPickerDisabled,
+  isRendererModelReady,
   mountRendererModelPicker,
   renderRendererModelPicker,
   rendererModelPickerPresentation,
@@ -430,6 +431,30 @@ describe("Renderer combined Model and Thinking picker presentation", () => {
       showThinkingSection: false,
       thinkingSelectionEnabled: false,
     });
+  });
+
+  it("shows a Thread's confirmed Model label even when the selectable catalog omits it", () => {
+    const view: RendererModelControlView = {
+      status: "error",
+      catalog: catalog([]),
+      selected: harnessModelRefSchema.parse({ id: "claude-model-v1.ZmFibGU" }),
+      resolvedModelLabel: "Fable",
+    };
+    expect(rendererModelPickerPresentation(view)).toMatchObject({ modelLabel: "Fable" });
+    expect(isRendererModelPickerDisabled(view)).toBe(false);
+    expect(isRendererModelReady(view)).toBe(false);
+    const restored = {
+      ...view,
+      status: "ready" as const,
+      restoredModelLabel: "Fable",
+      resolvedModelLabel: "claude-fable-current",
+    };
+    expect(isRendererModelReady(restored)).toBe(true);
+    expect(rendererModelPickerPresentation(restored)).toMatchObject({
+      modelLabel: "Fable",
+      resolvedModelLabel: "claude-fable-current",
+    });
+    expect(isRendererModelReady({ ...restored, status: "selecting" })).toBe(false);
   });
 });
 

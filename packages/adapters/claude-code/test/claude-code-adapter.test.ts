@@ -6350,6 +6350,107 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
+  it("preserves the native Fable alias and exposes its label on resume and selection", async () => {
+    const { adapter } = fixture();
+    const fable = encodeClaudeModelRef("fable");
+    const opened = await adapter.open({
+      kind: "resume",
+      cwd: "/synthetic",
+      model: fable,
+      nativeRef: nativeSessionRefSchema.parse({
+        harnessId: "claude-code",
+        nativeSessionId: "restored-fable",
+        formatVersion: 1,
+      }),
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const session = opened.value;
+    const fableState = { effectiveModel: fable, resolvedModelLabel: "Fable" };
+    expect(session.initialState).toMatchObject(fableState);
+
+    const events = session.outputs[Symbol.asyncIterator]();
+    await expect(session.execute({ type: "model.select", model: fable })).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(nextEvent(events)).resolves.toMatchObject({
+      type: "session.state.changed",
+      state: fableState,
+    });
+    await session.close();
+  });
+
+  it.each([true, false])(
+    "sends restored Fable input only if Claude accepts it (%s)",
+    async (accepted) => {
+      const { adapter, dependencies, transports } = fixture();
+      const validation = Promise.withResolvers<undefined>();
+      const factory = vi.mocked(dependencies.createTransport);
+      const create = factory.getMockImplementation();
+      if (!create) throw new Error("Missing fake Claude transport factory");
+      factory.mockImplementationOnce((input) => {
+        const transport = create(input);
+        const fake = transports.at(-1);
+        if (!fake) throw new Error("Missing fake Claude transport");
+        fake.setModel.mockReturnValueOnce(validation.promise);
+        return transport;
+      });
+      const fable = encodeClaudeModelRef("fable");
+      expect(
+        adapter.restoreSessionModelRef(encodeClaudeModelRef("claude-model-v1.ZmFibGU")),
+      ).toEqual(fable);
+      const opened = await adapter.open({
+        kind: "resume",
+        cwd: "/synthetic",
+        model: fable,
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "claude-code",
+          nativeSessionId: "restored-fable",
+          formatVersion: 1,
+        }),
+      });
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      expect(session.restoredModelLabel?.(fable)).toBe("Fable");
+      const sending = session.execute(textTurn("resume the session"));
+      await vi.waitFor(() =>
+        expect(transports.at(-1)?.setModel).toHaveBeenCalledWith("fable", "auto"),
+      );
+      const transport = transports.at(-1);
+      if (!transport) throw new Error("Missing fake Claude transport");
+      expect(transport.turns).toHaveLength(0);
+
+      if (accepted) {
+        validation.resolve(undefined);
+        await expect(sending).resolves.toMatchObject({ ok: true });
+        expect(transport.turns).toHaveLength(1);
+        transport.event({ type: "segment.started", model: "claude-fable-current" });
+        transport.finish({ status: "succeeded" });
+        const events = session.outputs[Symbol.asyncIterator]();
+        await expect(nextEvent(events)).resolves.toMatchObject({
+          type: "session.state.changed",
+          state: { effectiveModel: fable, resolvedModelLabel: "Fable" },
+        });
+        let observation = await nextEvent(events);
+        while (observation.type !== "session.state.changed") observation = await nextEvent(events);
+        expect(observation.state).toMatchObject({
+          effectiveModel: fable,
+          resolvedModelLabel: "claude-fable-current",
+        });
+      } else {
+        validation.reject(new Error("Model is restricted"));
+        await expect(sending).resolves.toMatchObject({
+          ok: false,
+          error: {
+            code: "invalidRequest",
+            message: expect.stringContaining("Model is restricted"),
+          },
+        });
+        expect(transport.turns).toHaveLength(0);
+      }
+      await session.close();
+    },
+  );
+
   it("fits Thinking to the selected Model's catalog options", async () => {
     const { adapter, dependencies, transports } = fixture();
     await adapter.inspect({ cwd: "/synthetic" });

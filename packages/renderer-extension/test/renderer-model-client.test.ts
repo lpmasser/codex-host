@@ -3,6 +3,7 @@ import {
   HARNESS_LAUNCH_SETTINGS_GET_METHOD,
   HARNESS_LAUNCH_SETTINGS_SET_METHOD,
   HOST_EXTENSIONS_RPC,
+  THREAD_MODEL_RESUME_INSPECT_METHOD,
   harnessIdSchema,
   harnessModelRefSchema,
   harnessPermissionModeIdSchema,
@@ -76,6 +77,23 @@ const inspection = {
 };
 
 describe("Renderer fixed Model request client", () => {
+  it.each([true, false])(
+    "reads a saved Model without selecting it (Host supports method: %s)",
+    async (supported) => {
+      const threadId = hostThreadIdSchema.parse("11111111-1111-4111-8111-111111111111");
+      const input = { threadId, model };
+      const sendRequest = vi.fn();
+      if (supported) sendRequest.mockResolvedValue("Fable");
+      else sendRequest.mockRejectedValue({ code: -32601 });
+      const client = createRendererModelClient([{ sendRequest }]);
+      if (!client?.inspectThreadModelResume) throw new Error("Missing Model inspection client");
+      await expect(client.inspectThreadModelResume(input)).resolves.toBe(
+        supported ? "Fable" : null,
+      );
+      expect(sendRequest).toHaveBeenCalledWith(THREAD_MODEL_RESUME_INSPECT_METHOD, input);
+    },
+  );
+
   it("lists Host extensions and reports a stale selection revision without treating it as a save", async () => {
     const listing = {
       revision: 7,
@@ -492,6 +510,7 @@ describe("Renderer fixed Model request client", () => {
     const client = createRendererModelClient([{ addNotificationCallback, sendRequest }]);
     if (!client) throw new Error("Synthetic Model client was not created");
     expect(Object.keys(client).sort()).toEqual([
+      "acknowledgeReleaseAnnouncement",
       "checkUpdate",
       "credentialImports",
       "disableHostExtension",
@@ -503,6 +522,7 @@ describe("Renderer fixed Model request client", () => {
       "getHarnessLaunchSettings",
       "getHarnessPreferences",
       "getHostExtensionSettings",
+      "getReleaseAnnouncement",
       "hasDesktopThread",
       "importHarnessSession",
       "inspectCodexAccountUsage",
@@ -511,6 +531,7 @@ describe("Renderer fixed Model request client", () => {
       "inspectHarnessCommands",
       "inspectThread",
       "inspectThreadCommands",
+      "inspectThreadModelResume",
       "inspectThreadUsage",
       "installHostExtension",
       "installation",
@@ -547,6 +568,7 @@ describe("Renderer fixed Model request client", () => {
       "snapshotHostExtensions",
       "startUpdate",
       "subscribeCodexAccounts",
+      "subscribeCompletedTurns",
       "subscribeHarnessDisplaySettings",
       "subscribeHarnessPreferences",
       "subscribeHostExtensionsChanged",
