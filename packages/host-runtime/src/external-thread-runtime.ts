@@ -800,7 +800,9 @@ export class ExternalThreadRuntime {
     const saved = decodeExternalTransportSelection(record.harnessId, record.transportModelId);
     if (!saved?.model) return { selection: saved, migrated: false };
     const catalog = await storedModelCatalog(adapter, { cwd: record.cwd });
-    const model = await normalizeStoredModelRef(saved.model, catalog, record.harnessId, adapter);
+    const model =
+      adapter.restoreSessionModelRef?.(saved.model) ??
+      (await normalizeStoredModelRef(saved.model, catalog, record.harnessId, adapter));
     const selection: ExternalConfigurationSelection = model
       ? { ...saved, model }
       : saved.permissionModeId

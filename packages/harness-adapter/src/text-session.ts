@@ -804,6 +804,8 @@ export interface HarnessAdapter {
   inspectAccounts?(): Promise<readonly HarnessAccountSnapshot[]>;
 
   inspect(input?: InspectHarnessInput): Promise<HarnessInspection>;
+  /** Restores a saved native Session selection whose validity is checked by the Adapter on input. */
+  restoreSessionModelRef?(ref: HarnessModelRef): HarnessModelRef | undefined;
   /**
    * Maps a Model Ref saved by an earlier release to the matching entry of `catalog`.
    * Host calls it only for a saved Ref that the catalog does not contain. Return

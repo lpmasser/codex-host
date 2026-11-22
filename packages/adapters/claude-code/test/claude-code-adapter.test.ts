@@ -6395,6 +6395,9 @@ describe("Claude Code HarnessAdapter", () => {
         return transport;
       });
       const fable = encodeClaudeModelRef("fable");
+      expect(
+        adapter.restoreSessionModelRef(encodeClaudeModelRef("claude-model-v1.ZmFibGU")),
+      ).toEqual(fable);
       const opened = await adapter.open({
         kind: "resume",
         cwd: "/synthetic",

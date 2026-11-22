@@ -2139,7 +2139,7 @@ export function installRendererBindingProbe(
     const previousThinking = controller.thinkingOptionForAgent(mounted.composer, agent);
     const previousPermissionModeId = controller.permissionModeForAgent(mounted.composer, agent);
     const supportsThinkingSelection = mounted.modelView.thinkingSelectionSupported === true;
-    const previousView = mounted.modelView;
+    const previousModelLabel = mounted.modelView.resolvedModelLabel;
     const generation = controller.beginModelRequest(mounted.composer);
     const threadId = threadIdFromComposerModelTarget(mounted.modelTarget);
     const hostId = mounted.hostId;
@@ -2279,11 +2279,11 @@ export function installRendererBindingProbe(
         );
       }
       mounted.modelView = {
-        ...previousView,
         status: "error",
         catalog: confirmedCatalog,
         ...(previousModel ? { selected: previousModel } : {}),
         ...(previousThinking ? { selectedThinkingOptionId: previousThinking } : {}),
+        ...(previousModelLabel ? { resolvedModelLabel: previousModelLabel } : {}),
         thinkingSelectionSupported: supportsThinkingSelection,
         error: error instanceof Error ? error.message : String(error),
         selectionRejected: "model",

@@ -158,7 +158,8 @@ import type {
 } from "./transport.js";
 
 const CLAUDE_FABLE_ALIAS = "fable";
-const CLAUDE_FABLE_ALIAS_ID = claudeModelRef(CLAUDE_FABLE_ALIAS).id;
+const CLAUDE_FABLE_ALIAS_REF = claudeModelRef(CLAUDE_FABLE_ALIAS);
+const CLAUDE_FABLE_ALIAS_ID = CLAUDE_FABLE_ALIAS_REF.id;
 const CLAUDE_FABLE_LABEL = "Fable";
 
 class ClaudeRestoredModelError extends Error {}
@@ -3285,6 +3286,14 @@ class ClaudeHarnessSession implements HarnessSession {
 
 export class ClaudeCodeAdapter implements HarnessAdapter {
   readonly normalizeStoredModelRef = normalizeStoredClaudeModelRef;
+  restoreSessionModelRef(ref: HarnessModelRef): HarnessModelRef | undefined {
+    if (
+      ref.serviceTier === undefined &&
+      (ref.id === CLAUDE_FABLE_ALIAS_ID || ref.id === "claude-model-v1.ZmFibGU")
+    )
+      return CLAUDE_FABLE_ALIAS_REF;
+    return undefined;
+  }
   readonly commandCatalog = claudeCommandCatalog;
   readonly liveCommandCatalog = true;
   readonly harnessId: HarnessId = claudeCodeHarnessId;
