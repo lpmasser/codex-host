@@ -24,6 +24,15 @@ const modelSelectionProjectionStateSchema = z.object({
 const modelSelectionProjectionSchema = z.object({
   lastUsed: modelSelectionSchema.nullable(),
   next: modelSelectionSchema.nullable(),
+  currentModelDisplay: z
+    .object({
+      restoredLabel: z.string().min(1).optional(),
+      resolvedLabel: z.string().min(1).optional(),
+      thinkingOptions: z
+        .array(z.object({ id: z.string().min(1), name: z.string().min(1) }))
+        .optional(),
+    })
+    .optional(),
 }) as z.ZodType<ModelSelectionProjection>;
 
 /**

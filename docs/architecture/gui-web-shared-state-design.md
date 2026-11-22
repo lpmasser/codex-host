@@ -17,6 +17,7 @@ Rust 负责后台进程监管与正常退出时的子进程清理。生命周期
 - `@codexhost/session-runtime` 只提供共享的投影、会话日志、用量计量与展示类型；它不再拥有独立会话运行器或组织存储。
 - Host 通过安装插件公共契约加载 Adapter，不导入 web-server 应用代码或具体 Adapter。Web RPC/stream、认证、Push 与 UI 投影留在网关。
 - external AppServerHost/Mapping Store 是外部 Thread 的唯一所有者：Adapter、原生引用、元数据、交互、跟进队列与导入都走外部 Thread 运行时。原生历史仍在 Harness 自己的 home 中。插件在 Web 和 Desktop 使用同一目录，不声明界面过滤。
+- 已保存的模型名和 Thinking 档位取自会话配置。模型目录提供新的可选模型，目录缺少已保存的别名时仍保留原选择。可调 Thinking 档位由当前会话或其已匹配的目录项提供。
 - `codex` 是官方路径的保留身份，不是外部插件。Web 与 Desktop 通过同一官方 app-server 操作同一 Thread ID；官方历史无需导入，也不写入 Mapping Store。模型、Thinking、权限、队列和命令由 Host 转发官方协议，偏好可使用 `codex` 身份。
 - 其他 Harness 的通用会话导入保留。官方项目只读，置顶通过共享 Host 的原生分区协议读写，不要求 Desktop 窗口。
 

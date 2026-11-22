@@ -1528,7 +1528,10 @@ class ClaudeHarnessSession implements HarnessSession {
         },
       };
     }
-    const supported = this.#supportedThinkingOptionIds(this.#effectiveModelRef());
+    const supported = this.#supportedThinkingOptionIds(
+      this.#effectiveModelRef(),
+      this.#state.resolvedModelLabel,
+    );
     if (supported && !supported.includes(thinkingOptionId)) {
       return {
         ok: false,
@@ -2065,23 +2068,31 @@ class ClaudeHarnessSession implements HarnessSession {
     }
   }
 
-  #configuredState(nativeReady = this.#state.nativeRef !== undefined): HarnessSessionState {
+  #configuredState(
+    nativeReady = this.#state.nativeRef !== undefined,
+    observedModel?: string,
+  ): HarnessSessionState {
     const effectiveModel = this.#effectiveModelRef();
-    const supported = this.#supportedThinkingOptionIds(effectiveModel);
+    const resolvedModelLabel =
+      observedModel ??
+      (effectiveModel?.id === this.#state.effectiveModel?.id
+        ? this.#state.resolvedModelLabel
+        : undefined);
+    const supported = this.#supportedThinkingOptionIds(effectiveModel, resolvedModelLabel);
     return {
       ...(nativeReady ? { nativeRef: this.#nativeRef } : {}),
-      ...claudeModelState(
-        effectiveModel,
-        effectiveModel?.id === this.#state.effectiveModel?.id
-          ? this.#state.resolvedModelLabel
-          : undefined,
-      ),
+      ...claudeModelState(effectiveModel, resolvedModelLabel),
       effectiveThinkingOptionId: this.#requestedThinkingOptionId,
       // A live Claude Code keeps running a choice made before the catalog arrived; it stays
       // listed until the next Model switch fits it.
-      availableThinkingOptions: CLAUDE_THINKING_OPTIONS.filter(
-        ({ id }) => !supported || supported.includes(id) || id === this.#requestedThinkingOptionId,
-      ),
+      ...(effectiveModel?.id !== CLAUDE_FABLE_ALIAS_ID || supported !== undefined
+        ? {
+            availableThinkingOptions: CLAUDE_THINKING_OPTIONS.filter(
+              ({ id }) =>
+                !supported || supported.includes(id) || id === this.#requestedThinkingOptionId,
+            ),
+          }
+        : {}),
       effectivePermissionModeId: this.#requestedPermissionModeId,
     };
   }
@@ -2095,8 +2106,20 @@ class ClaudeHarnessSession implements HarnessSession {
 
   #supportedThinkingOptionIds(
     model: HarnessModelRef | undefined,
+    observedModel?: string,
   ): readonly HarnessThinkingOptionId[] | undefined {
-    return catalogModelForRef(this.#modelCatalog(), model)?.supportedThinkingOptionIds;
+    const catalog = this.#modelCatalog();
+    const entry = catalogModelForRef(catalog, model);
+    if (entry) return entry.supportedThinkingOptionIds;
+    if (
+      model?.id === CLAUDE_FABLE_ALIAS_ID &&
+      observedModel &&
+      observedModel !== CLAUDE_FABLE_LABEL
+    ) {
+      return catalogModelForRef(catalog, encodeClaudeModelRef(observedModel))
+        ?.supportedThinkingOptionIds;
+    }
+    return undefined;
   }
 
   /**
@@ -2149,7 +2172,7 @@ class ClaudeHarnessSession implements HarnessSession {
           event.model !== CLAUDE_FABLE_ALIAS &&
           event.model !== this.#state.resolvedModelLabel
         ) {
-          this.#publishState({ ...this.#state, resolvedModelLabel: event.model });
+          this.#publishState(this.#configuredState(undefined, event.model));
         }
         this.#observeRootOutput(active);
         if (active.cancellation && !active.cancellation.interrupting) {

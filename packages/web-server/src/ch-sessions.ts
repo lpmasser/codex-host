@@ -25,6 +25,7 @@ import { projectGroupRoot } from "./ch-project-groups.ts";
 import { projectRootTitles } from "./workspaces.ts";
 import { threadListTitle } from "./ch-thread-title.ts";
 import { ChThreadHistory } from "./ch-thread-history.ts";
+import { threadModelProjection } from "./thread-model-projection.ts";
 import { WebThreadStates, type UsageLoad } from "./web-thread-state.ts";
 import { ChHarnessCommands } from "./ch-harness-commands.ts";
 import { WebSkills } from "./skills.ts";
@@ -653,14 +654,16 @@ export class ChSessions {
           "nativePermissions",
           nativePermissionView(harnessId, inspection as Inspection, true),
         );
-        const selection = {
-          provider: harnessId,
-          model: owner.effectiveModel?.id ?? "harness",
-          ...(owner.effectiveThinkingOptionId
-            ? { reasoningEffort: owner.effectiveThinkingOptionId }
-            : {}),
-        };
-        view.log.setProjection("modelSelection", { lastUsed: selection, next: selection });
+        view.log.setProjection(
+          "modelSelection",
+          threadModelProjection(harnessId, owner, {
+            fallbackModel: "harness",
+            selectThinking:
+              inspection.status === "ready"
+                ? inspection.capabilities.configuration.selectThinkingOption
+                : undefined,
+          }),
+        );
       })
       .catch(() => {
         // Controls remain absent on failure; history stays usable and later reads retry.
@@ -1236,21 +1239,26 @@ export class ChSessions {
         const state = this.threads.ensure(id);
         // Reads started before this acknowledgement cannot replace its confirmed state.
         state.configurationRevision = (state.configurationRevision ?? 0) + 1;
-        const selection = {
-          provider: owner.harnessId,
-          model: configuration.effectiveModel.id,
-          ...(configuration.effectiveThinkingOptionId
-            ? { reasoningEffort: configuration.effectiveThinkingOptionId }
-            : {}),
-        };
-        state.view?.log.setProjection("modelSelection", { lastUsed: selection, next: selection });
+        const saved = state.view?.ownerSnapshot?.configuration;
+        state.view?.log.setProjection(
+          "modelSelection",
+          threadModelProjection(owner.harnessId, {
+            ...configuration,
+            ...(saved?.effectiveModel?.id === configuration.effectiveModel.id
+              ? { restoredModelLabel: saved.restoredModelLabel }
+              : {}),
+          }),
+        );
         return configuration;
       };
       // Unchanged native settings may not emit a confirmation notification.
       const configuration = publish(
-        owner.owner === "codex" && owner.effectiveModel?.id === request.model
+        owner.effectiveModel?.id === request.model
           ? {
               effectiveModel: owner.effectiveModel,
+              resolvedModelLabel: owner.resolvedModelLabel,
+              availableThinkingOptions:
+                owner.owner === "external" ? owner.availableThinkingOptions : undefined,
               effectiveThinkingOptionId: owner.effectiveThinkingOptionId,
             }
           : await this.host.request("codexhost/thread/model/select", {
