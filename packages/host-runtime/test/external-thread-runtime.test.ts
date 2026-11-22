@@ -7,6 +7,7 @@ import { FakeHarnessAdapter, FakeHarnessSession } from "@codexhost/harness-adapt
 import type { StoredThreadRecordV1 } from "@codexhost/mapping-store";
 import {
   harnessIdSchema,
+  harnessModelRefSchema,
   encodeHarnessPluginRoute,
   harnessPermissionModeCatalogSchema,
   harnessPermissionModeIdSchema,
@@ -182,7 +183,7 @@ describe("ExternalThreadRuntime register", () => {
     });
   });
 
-  it.each(["current", "legacy", "unavailable", "catalog offline"])(
+  it.each(["current", "legacy", "unavailable", "catalog offline", "native restore"])(
     "restores an OMP Thread with a saved Model (%s)",
     async (storedModel) => {
       const ompHarnessId = harnessIdSchema.parse("omp");
@@ -218,10 +219,13 @@ describe("ExternalThreadRuntime register", () => {
       if (!nativeRef || !actualModel || !actualThinking || !staleModel) {
         throw new Error("Fake OMP Session did not expose the expected configuration state");
       }
+      const nativeRestore = harnessModelRefSchema.parse({ id: "native-resume-model" });
 
       Object.assign(adapter, {
         normalizeStoredModelRef: (ref: { id: string }) =>
           ref.id === "legacy-model" ? staleModel : undefined,
+        restoreSessionModelRef: (ref: { id: string }) =>
+          ref.id === "legacy-resume-model" ? nativeRestore : undefined,
       });
       const open = vi.spyOn(adapter, "open");
       if (storedModel === "catalog offline") {
@@ -235,7 +239,9 @@ describe("ExternalThreadRuntime register", () => {
           })
         : storedModel === "legacy"
           ? "codexhost/omp-native@legacy-model@low"
-          : "codexhost/omp-native@retired-model@low";
+          : storedModel === "native restore"
+            ? "codexhost/omp-native@legacy-resume-model@low"
+            : "codexhost/omp-native@retired-model@low";
       let stored: StoredThreadRecordV1 = {
         ...record(),
         harnessId: ompHarnessId,
@@ -280,7 +286,13 @@ describe("ExternalThreadRuntime register", () => {
       const resumed = open.mock.calls[0]?.[0];
       expect(resumed?.kind).toBe("resume");
       if (resumed?.kind !== "resume") throw new Error("Expected to resume the Thread");
-      expect(resumed.model).toEqual(storedModel === "unavailable" ? undefined : staleModel);
+      expect(resumed.model).toEqual(
+        storedModel === "unavailable"
+          ? undefined
+          : storedModel === "native restore"
+            ? nativeRestore
+            : staleModel,
+      );
       expect(resumed.thinkingOptionId).toBe(storedModel === "unavailable" ? undefined : "low");
       if (savedModelIsCurrent) {
         expect(resolved.thread.record.transportModelId).toBe(effectiveTransportModelId);
