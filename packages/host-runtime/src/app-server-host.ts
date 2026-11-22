@@ -129,6 +129,7 @@ import {
   harnessWebUiOpenParamsSchema,
   harnessWebUiOpenResultSchema,
   harnessModelSelectionStateSchema,
+  sameHarnessModelRef,
   HARNESS_MODEL_LABEL_MAX_LENGTH,
   harnessThinkingOptionIdSchema,
   hostItemIdSchema,
