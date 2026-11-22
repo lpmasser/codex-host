@@ -1507,7 +1507,10 @@ export class AppServerHost {
     this.#plugins = plugins;
     this.#pluginDescriptors = plugins.list();
     this.#usageOnlyAdapters = [...plugins.usageAdapters.values()];
-    for (const [id, adapter] of plugins.adapters) this.#externalAdapters.set(id, adapter);
+    for (const [id, adapter] of plugins.adapters) {
+      this.#externalAdapters.set(id, adapter);
+      adapter.subscribeInspectionChanges?.(() => this.clientEvents.harnessInspectionChanged(id));
+    }
   }
 
   async #closeAdapters(): Promise<void> {

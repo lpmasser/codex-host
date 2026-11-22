@@ -812,6 +812,12 @@ export interface HarnessAdapter {
     ref: HarnessModelRef,
     catalog: HarnessModelCatalog,
   ): HarnessModelRef | undefined | Promise<HarnessModelRef | undefined>;
+  /**
+   * Notifies after native configuration that {@link inspect} reads changed outside codexhost.
+   * The Adapter has already dropped its cached inspection; Host tells clients to read again.
+   * Returns the function that ends the subscription; {@link close} ends all of them.
+   */
+  subscribeInspectionChanges?(listener: () => void): () => void;
   open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>>;
   close(): Promise<void>;
 }
