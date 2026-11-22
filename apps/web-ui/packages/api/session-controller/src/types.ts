@@ -127,6 +127,12 @@ export interface ModelSelectionProjection {
   readonly lastUsed: ModelSelection | null;
   /** Selection the next request should use, falling back to {@link lastUsed}. */
   readonly next: ModelSelection | null;
+  /** Adapter-reported display for the current selection, independent of its catalog row. */
+  readonly currentModelDisplay?: {
+    readonly restoredLabel?: string;
+    readonly resolvedLabel?: string;
+    readonly thinkingOptions?: readonly ModelReasoningEffort[];
+  };
 }
 
 /** One adapter-owned reasoning effort for an exact model route. */
