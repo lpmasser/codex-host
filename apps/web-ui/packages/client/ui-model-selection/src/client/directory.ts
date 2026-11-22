@@ -22,6 +22,7 @@ import { isModelRoute } from "./fast-model.ts";
 export interface ModelDirectoryState {
   /** Saved selection, retained even when its provider or model leaves the catalog. */
   current: ModelSelection | null;
+  currentModelDisplay?: ModelSelectionProjection["currentModelDisplay"];
   /** Saved effort caption retained when the selected model is unavailable. */
   retainedEffort?: string;
   /** Whether the current selection is present in the available catalog; null while unresolved. */
@@ -202,6 +203,7 @@ export class ModelDirectory {
     if (this.disposed) return;
     const catalog = this.catalog.store.getSnapshot();
     const projected = modelSelectionProjection(this.projected.getSnapshot());
+    const currentModelDisplay = projected?.currentModelDisplay;
     const intended = projected?.next ?? catalog.value?.default;
     const boundHarnessId = projected?.lastUsed?.provider ?? null;
     const harnesses = catalog.value?.groups ?? [];
@@ -211,10 +213,14 @@ export class ModelDirectory {
     const retainedEffort =
       effort === undefined
         ? undefined
-        : (reasoning?.efforts.find((level) => level.id === effort)?.name ?? effort);
+        : ((currentModelDisplay?.thinkingOptions ?? reasoning?.efforts)?.find(
+            (level) => level.id === effort,
+          )?.name ?? effort);
     if (catalog.status !== "ready" || catalog.value === null || projected === undefined) {
       this.store.set({
-        current: catalog.value === null ? null : this.store.getSnapshot().current,
+        current:
+          projected?.next ?? (catalog.value === null ? null : this.store.getSnapshot().current),
+        ...(currentModelDisplay ? { currentModelDisplay } : {}),
         ...(retainedEffort === undefined ? {} : { retainedEffort }),
         routable: null,
         groups,
@@ -241,6 +247,7 @@ export class ModelDirectory {
     );
     this.store.set({
       current: selection,
+      ...(currentModelDisplay ? { currentModelDisplay } : {}),
       ...(retainedEffort === undefined ? {} : { retainedEffort }),
       routable,
       groups,

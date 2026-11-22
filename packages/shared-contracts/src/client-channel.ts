@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { DESKTOP_EXTENSION_MANAGEMENT_METHODS } from "./desktop-extension-management.js";
-import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "./harness-models.js";
+import {
+  harnessConfigurationStateSchema,
+  harnessModelRefSchema,
+  harnessResolvedModelLabelSchema,
+  harnessThinkingOptionIdSchema,
+} from "./harness-models.js";
 import { harnessPermissionModeIdSchema } from "./harness-permission-modes.js";
 import { THREAD_ARCHIVE_CONFIRM_METHOD } from "./thread-archive-confirm.js";
 
@@ -305,6 +310,9 @@ export const clientThreadSnapshotSchema = z.object({
       })
       .optional(),
     effectiveModel: harnessModelRefSchema.optional(),
+    restoredModelLabel: harnessResolvedModelLabelSchema.optional(),
+    resolvedModelLabel: harnessConfigurationStateSchema.shape.resolvedModelLabel,
+    availableThinkingOptions: harnessConfigurationStateSchema.shape.availableThinkingOptions,
     effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
     effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
   }),

@@ -503,6 +503,11 @@ export class ClientChannelHost {
           }),
           configuration: {
             effectiveModel: state.effectiveModel,
+            restoredModelLabel: state.effectiveModel
+              ? thread.session.restoredModelLabel?.(state.effectiveModel)
+              : undefined,
+            resolvedModelLabel: state.resolvedModelLabel,
+            availableThinkingOptions: state.availableThinkingOptions,
             effectiveThinkingOptionId: state.effectiveThinkingOptionId,
             effectivePermissionModeId: state.effectivePermissionModeId,
           },

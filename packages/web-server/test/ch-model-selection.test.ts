@@ -26,14 +26,24 @@ class Streams extends StreamRegistry {
   }
 }
 
-async function fixture(t: TestContext, native = false) {
+async function fixture(t: TestContext, native = false, restored = false) {
   const root = mkdtempSync(join(tmpdir(), "ch-model-selection-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const host = native ? nativeCodex(new FakeChChannel()) : new FakeChChannel();
   const source = host.add(native ? "native-source" : "source", root);
+  if (restored) host.inspection.capabilities.configuration.selectThinkingOption = true;
   let configuration = harnessModelSelectionStateSchema.parse({
-    effectiveModel: { id: "native" },
+    effectiveModel: { id: restored ? "saved-fable" : "native" },
     effectiveThinkingOptionId: "auto",
+    ...(restored
+      ? {
+          resolvedModelLabel: "claude-fable-current",
+          availableThinkingOptions: [
+            { id: "auto", label: "Auto" },
+            { id: "high", label: "High" },
+          ],
+        }
+      : {}),
   });
   const behavior = { rejectModel: false, rejectThinking: false, modelId: "confirmed-model" };
   const request = host.request.bind(host);
@@ -66,7 +76,13 @@ async function fixture(t: TestContext, native = false) {
   const snapshot = host.snapshot.bind(host);
   host.snapshot = async (...args) => {
     const captured = structuredClone(configuration);
-    return { ...(await snapshot(...args)), configuration: captured };
+    return {
+      ...(await snapshot(...args)),
+      configuration: {
+        ...captured,
+        ...(captured.effectiveModel?.id === "saved-fable" ? { restoredModelLabel: "Fable" } : {}),
+      },
+    };
   };
   const sessions = new ChSessions(
     host,
@@ -162,6 +178,27 @@ it("changes native Thinking without resubmitting the unchanged Model", async (t)
     f.host.requests.slice(confirmed).map(({ method }) => method),
     ["codexhost/thread/inspect"],
   );
+});
+
+it("keeps a saved model outside the catalog and edits only its confirmed Thinking", async (t) => {
+  const f = await fixture(t, false, true);
+  const before = f.host.requests.length;
+  assert.ok((await f.select("high", "saved-fable")).ok);
+  assert.deepEqual(
+    f.host.requests.slice(before).map(({ method }) => method),
+    ["codexhost/thread/inspect", "codexhost/thread/thinking/select"],
+  );
+  assert.deepEqual(f.selections().at(-1)?.value, {
+    ...expectedSelection("saved-fable", "high"),
+    currentModelDisplay: {
+      restoredLabel: "Fable",
+      resolvedLabel: "claude-fable-current",
+      thinkingOptions: [
+        { id: "auto", name: "Auto" },
+        { id: "high", name: "High" },
+      ],
+    },
+  });
 });
 
 it("does not submit settings when native Model and Thinking are already selected", async (t) => {
