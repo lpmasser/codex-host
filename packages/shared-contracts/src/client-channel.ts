@@ -1,6 +1,11 @@
 import { jsonObjectSchema } from "./json-value.js";
 import { z } from "zod";
-import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "./harness-models.js";
+import {
+  harnessConfigurationStateSchema,
+  harnessModelRefSchema,
+  harnessResolvedModelLabelSchema,
+  harnessThinkingOptionIdSchema,
+} from "./harness-models.js";
 import { harnessPermissionModeIdSchema } from "./harness-permission-modes.js";
 import {
   HOST_EXTENSION_MANAGEMENT_METHODS,
@@ -342,6 +347,9 @@ export const clientThreadSnapshotSchema = z.object({
       })
       .optional(),
     effectiveModel: harnessModelRefSchema.optional(),
+    restoredModelLabel: harnessResolvedModelLabelSchema.optional(),
+    resolvedModelLabel: harnessConfigurationStateSchema.shape.resolvedModelLabel,
+    availableThinkingOptions: harnessConfigurationStateSchema.shape.availableThinkingOptions,
     effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
     effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
   }),

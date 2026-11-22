@@ -15,6 +15,7 @@ import type { ChThreadView } from "./ch-thread-view.ts";
 import { groupOf, type Inspection } from "./harnesses.ts";
 import { nativePermissionView } from "./session-presentation.ts";
 import { RpcError } from "./transport.ts";
+import { threadModelProjection } from "./thread-model-projection.ts";
 
 const remoteHarnessDescriptorSchema = z
   .object({
@@ -189,17 +190,15 @@ export function applyRemoteControls(entry: RemoteControlsEntry, view: ChThreadVi
   view.log.setProjection("permissions", {
     currentValue: external?.effectivePermissionModeId ?? "",
   });
-  const selection =
-    configuration?.effectiveModel === undefined
-      ? null
-      : {
-          provider: configuration.owner === "external" ? configuration.harnessId : "codex",
-          model: harnessModelRefKey(configuration.effectiveModel),
-          ...(configuration.effectiveThinkingOptionId
-            ? { reasoningEffort: configuration.effectiveThinkingOptionId }
-            : {}),
-        };
-  view.log.setProjection("modelSelection", { lastUsed: selection, next: selection });
+  view.log.setProjection(
+    "modelSelection",
+    threadModelProjection(external?.harnessId ?? "codex", configuration ?? {}, {
+      selectThinking:
+        inspection?.status === "ready"
+          ? inspection.capabilities.configuration.selectThinkingOption
+          : undefined,
+    }),
+  );
 }
 
 export function externalConfiguration(entry: RemoteControlsEntry): ExternalThreadInspection {

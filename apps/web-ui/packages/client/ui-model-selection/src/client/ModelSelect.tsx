@@ -213,16 +213,20 @@ export function ModelSelect({
         );
   const currentChoice = choices[selectedIndex];
   const reasoning = currentChoice?.model.reasoning;
+  const sessionEfforts = state.currentModelDisplay?.thinkingOptions;
+  const availableEfforts = sessionEfforts ?? reasoning?.efforts;
   const effectiveEffort = state.current?.reasoningEffort ?? reasoning?.defaultEffort;
   const effortChoices = useMemo<readonly EffortChoice[]>(
     () =>
-      reasoning === undefined
+      availableEfforts === undefined
         ? []
         : [
-            ...(reasoning.defaultEffort === undefined && currentChoice?.group.id !== "codex"
+            ...(sessionEfforts === undefined &&
+            reasoning?.defaultEffort === undefined &&
+            currentChoice?.group.id !== "codex"
               ? [{ key: "provider-default", effort: undefined, label: t("effort.providerDefault") }]
               : []),
-            ...reasoning.efforts.map((effort: ModelReasoningEffort) => {
+            ...availableEfforts.map((effort: ModelReasoningEffort) => {
               const key = `codex.effort.${effort.id}` as ModelKey;
               return {
                 key: `effort:${effort.id}`,
@@ -234,12 +238,16 @@ export function ModelSelect({
               };
             }),
           ],
-    [reasoning, currentChoice?.group.id, t],
+    [availableEfforts, sessionEfforts, reasoning?.defaultEffort, currentChoice?.group.id, t],
   );
+  const retainedEffortKey = `codex.effort.${state.retainedEffort}` as ModelKey;
+  const retainedEffortLabel = Object.hasOwn(en, retainedEffortKey)
+    ? en[retainedEffortKey]
+    : state.retainedEffort;
   const effortLabel =
-    reasoning === undefined
-      ? state.retainedEffort
-      : (effortChoices.find((level) => level.effort === effectiveEffort)?.label ?? effectiveEffort);
+    effortChoices.find((level) => level.effort === effectiveEffort)?.label ??
+    retainedEffortLabel ??
+    effectiveEffort;
   const { pending } = state;
   const busy = pending !== null;
 
@@ -604,11 +612,16 @@ export function ModelSelect({
   const waiting = state.current === null && state.status === "loading";
   const modelLabel = waiting
     ? t("trigger.loading")
-    : (currentChoice?.model.name ??
-      (state.current === null
-        ? t("trigger.fallback")
-        : `${state.current.provider}/${state.current.model}`));
+    : (state.currentModelDisplay?.restoredLabel ??
+      currentChoice?.model.name ??
+      state.currentModelDisplay?.resolvedLabel ??
+      (state.current === null ? t("trigger.fallback") : t("trigger.savedModel")));
   const triggerLabel = effortLabel === undefined ? modelLabel : `${modelLabel} · ${effortLabel}`;
+  const resolvedLabel = state.currentModelDisplay?.resolvedLabel;
+  const triggerTitle =
+    resolvedLabel && resolvedLabel !== modelLabel
+      ? `${triggerLabel} (${resolvedLabel})`
+      : triggerLabel;
   const triggerAria = waiting
     ? t("trigger.loading")
     : state.current === null
@@ -650,7 +663,7 @@ export function ModelSelect({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? `${id}-menu` : undefined}
-        title={triggerLabel}
+        title={triggerTitle}
         aria-busy={busy}
         data-selection-focus={selectionFocus ? "" : undefined}
         onBlur={() => {
@@ -945,7 +958,13 @@ export function ModelSelect({
                   </div>
                 )}
                 {effortChoices.length === 0 ? (
-                  <div className={css.empty}>{t("empty.efforts")}</div>
+                  <div className={css.empty}>
+                    {t(
+                      state.current && !currentChoice && sessionEfforts === undefined
+                        ? "empty.unconfirmedEfforts"
+                        : "empty.efforts",
+                    )}
+                  </div>
                 ) : (
                   effortChoices.map((level) => (
                     <button
