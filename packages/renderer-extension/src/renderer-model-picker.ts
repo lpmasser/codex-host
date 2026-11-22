@@ -69,6 +69,7 @@ export interface RendererModelControlView {
   selected?: HarnessModelRef;
   selectedThinkingOptionId?: HarnessThinkingOptionId;
   resolvedModelLabel?: string;
+  restoredModelLabel?: string;
   thinkingSelectionSupported?: boolean;
   error?: string;
   /**
@@ -224,6 +225,16 @@ export function isRendererModelPickerDisabled(view: RendererModelControlView): b
   );
 }
 
+export function isRendererModelReady(view: RendererModelControlView): boolean {
+  return (
+    view.status !== "selecting" &&
+    (catalogModelForRef(view.catalog, view.selected) !== undefined ||
+      ((view.status === "ready" || view.status === "error") &&
+        view.selected !== undefined &&
+        view.restoredModelLabel !== undefined))
+  );
+}
+
 export function shouldCloseRendererModelPicker(view: RendererModelControlView): boolean {
   return isRendererModelPickerDisabled(view) && view.status !== "selecting";
 }
@@ -285,6 +296,7 @@ export function rendererModelPickerPresentation(
     modelLabel = "Loading models...";
   } else if (view.status === "selecting") modelLabel = "Selecting...";
   else if (view.status === "empty") modelLabel = "No models";
+  else if (view.restoredModelLabel) modelLabel = view.restoredModelLabel;
   else if (view.catalog && view.selected && resolvedModelLabel) modelLabel = resolvedModelLabel;
   else if (view.status === "error") modelLabel = "Models unavailable";
   return {
