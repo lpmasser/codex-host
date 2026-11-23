@@ -130,6 +130,7 @@ import {
   isNativeProjectThreadCreator,
 } from "@codexhost/desktop-control/renderer-bindings";
 import { loadCodexNativeServices } from "./codex-native-services.js";
+import { installRendererTranscriptDiagnostics } from "./renderer-transcript-diagnostics.js";
 import {
   loadSidebarCatalog,
   sidebarCatalogForWindow,
@@ -837,6 +838,7 @@ export function installRendererBindingProbe(
   const pendingReplacements = new Map<Element, PendingComposerReplacement>();
   let disposed = false;
   const disposeReasoningSoftWrap = installReasoningTranscriptSoftWrap(document);
+  const disposeTranscriptDiagnostics = installRendererTranscriptDiagnostics(window);
   let motionReentry: ReturnType<typeof installRendererMotionReentry> | undefined;
   const installMotionReentryWhenReady = (): void => {
     if (adapterStatus.state !== "ready" || motionReentry) return;
@@ -4071,6 +4073,7 @@ export function installRendererBindingProbe(
       modelControl = null;
       mutationObserver.disconnect();
       disposeReasoningSoftWrap();
+      disposeTranscriptDiagnostics();
       motionReentry?.dispose();
       delegationMention?.dispose();
       skillLibrary.dispose();
