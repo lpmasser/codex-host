@@ -35,6 +35,7 @@ async function fixture(
   ) => Promise<string | undefined | { cwd?: string; title?: string }> = async () => undefined,
   environment: NodeJS.ProcessEnv = {},
   externalThreadBusy: (thread: ExternalThread) => boolean = (thread) => thread.running,
+  externalThreadActive?: (thread: ExternalThread) => boolean,
 ) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-delegation-coordinator-"));
   const store = new MappingStore({ directory });
@@ -49,6 +50,7 @@ async function fixture(
   const treeChanged = vi.fn<(threadId: string) => void>();
   const delivered: string[] = [];
   const pending: DelegationPendingQuestion[] = [];
+  const activeOfficial = new Set<string>();
   const runtime = new ExternalThreadRuntime({
     adapters,
     environment,
@@ -96,11 +98,13 @@ async function fixture(
       const metadata = await officialThreadCwd(threadId);
       return typeof metadata === "string" ? { cwd: metadata } : (metadata ?? {});
     },
-    activeOfficialParents: () => [],
+    activeOfficialParents: () => [...activeOfficial],
     externalThreadBusy,
+    ...(externalThreadActive ? { externalThreadActive } : {}),
     pendingQuestions: () => [...pending],
   });
   return {
+    activeOfficial,
     adapter,
     coordinator,
     directory,
@@ -877,6 +881,114 @@ describe("HarnessDelegationCoordinator", () => {
           expect.objectContaining({ harnessId: "pi" }),
           expect.objectContaining({ threadId: "native-child", harnessId: "codex" }),
         ]),
+      });
+    } finally {
+      await value.close();
+    }
+  });
+
+  it("reports running in list and duplicate start while a settled child is active again", async () => {
+    const value = await fixture();
+    try {
+      const startInput = {
+        harnessId: "pi" as const,
+        task: "external child",
+        cwd: "/synthetic",
+        parentThreadId: "parent-thread",
+        requestId: "req-live-status",
+      };
+      const started = await value.coordinator.start(startInput);
+      await value.repository.setDelegationStatus(
+        hostThreadIdSchema.parse(started.delegationId),
+        "interrupted",
+      );
+      await value.repository.createDelegation({
+        delegationId: hostThreadIdSchema.parse("native-delegation"),
+        parentHostThreadId: hostThreadIdSchema.parse("parent-thread"),
+        childHostThreadId: hostThreadIdSchema.parse("native-child"),
+        sourceHarnessId: harnessIdSchema.parse("pi"),
+        targetHarnessId: harnessIdSchema.parse("codex"),
+        status: "completed",
+        taskDigest: "a".repeat(64),
+      });
+      value.activeOfficial.add("native-child");
+
+      await expect(
+        value.coordinator.list({
+          parentThreadId: "parent-thread",
+          limit: 25,
+          sort: "created-desc",
+        }),
+      ).resolves.toMatchObject({
+        threads: expect.arrayContaining([
+          expect.objectContaining({ threadId: started.threadId, status: "running" }),
+          expect.objectContaining({ threadId: "native-child", status: "running" }),
+        ]),
+      });
+      await expect(value.coordinator.start(startInput)).resolves.toMatchObject({
+        threadId: started.threadId,
+        status: "running",
+      });
+
+      const thread = value.registered[0];
+      if (!thread) throw new Error("Missing registered Thread");
+      thread.running = false;
+      value.activeOfficial.clear();
+      await expect(
+        value.coordinator.list({
+          parentThreadId: "parent-thread",
+          limit: 25,
+          sort: "created-desc",
+        }),
+      ).resolves.toMatchObject({
+        threads: expect.arrayContaining([
+          expect.objectContaining({ threadId: started.threadId, status: "interrupted" }),
+          expect.objectContaining({ threadId: "native-child", status: "completed" }),
+        ]),
+      });
+    } finally {
+      await value.close();
+    }
+  });
+
+  it("uses externalThreadActive instead of externalThreadBusy for live status overlay", async () => {
+    const value = await fixture(
+      undefined,
+      async () => undefined,
+      {},
+      () => true,
+      (thread) => thread.running,
+    );
+    try {
+      const startInput = {
+        harnessId: "pi" as const,
+        task: "external child",
+        cwd: "/synthetic",
+        parentThreadId: "parent-thread",
+        requestId: "req-busy-vs-active",
+      };
+      const started = await value.coordinator.start(startInput);
+      await value.repository.setDelegationStatus(
+        hostThreadIdSchema.parse(started.delegationId),
+        "completed",
+      );
+      const thread = value.registered[0];
+      if (!thread) throw new Error("Missing registered Thread");
+      thread.running = false;
+      thread.activeTurnId = null;
+
+      await expect(
+        value.coordinator.list({
+          parentThreadId: "parent-thread",
+          limit: 25,
+          sort: "created-desc",
+        }),
+      ).resolves.toMatchObject({
+        threads: [expect.objectContaining({ threadId: started.threadId, status: "completed" })],
+      });
+      await expect(value.coordinator.start(startInput)).resolves.toMatchObject({
+        threadId: started.threadId,
+        status: "completed",
       });
     } finally {
       await value.close();
