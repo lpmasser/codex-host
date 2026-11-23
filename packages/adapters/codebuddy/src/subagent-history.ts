@@ -8,7 +8,7 @@ import {
   record,
   type CodeBuddyRuntimeProfile,
 } from "./common.js";
-import { codeBuddyLiveNativeHistory, snapshotFromHistory } from "./history.js";
+import { codeBuddyConfigRoot, codeBuddyLiveNativeHistory, snapshotFromHistory } from "./history.js";
 import { validCodeBuddyChildId } from "./subagent-tool.js";
 import { CODEBUDDY_CHILD_MAX_BYTES, validateCodeBuddyChildContents } from "./child-provenance.js";
 import {
@@ -88,6 +88,7 @@ export class CodeBuddyChildObserver {
         throw error;
       });
       if (sameCodeBuddyFileVersion(current, this.#parent.version)) {
+        codeBuddyConfigRoot(this.environment, this.profile);
         await this.#validateWorkspaces(this.#parent.historicalCwds);
         this.#assertOpen();
         return this.#parent;
