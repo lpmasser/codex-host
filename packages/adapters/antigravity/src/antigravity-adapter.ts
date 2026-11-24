@@ -117,6 +117,7 @@ import { antigravityHome, createAntigravityUsageStatistics } from "./usage-stati
 
 const harnessId = harnessIdSchema.parse("antigravity");
 const SKIP = "dangerously-skip-permissions";
+const QUOTA_REFRESH_COOLDOWN_MS = 60_000;
 
 export const antigravitySessionCapabilities: HarnessSessionCapabilities = {
   configuration: {
@@ -1538,6 +1539,7 @@ export class AntigravityAdapter implements HarnessAdapter {
   readonly #abort = new AbortController();
   #closed = false;
   #quota: AntigravityQuotaSnapshot | null = null;
+  #quotaFetchedAt = Number.NEGATIVE_INFINITY;
   #quotaRefresh: Promise<AntigravityQuotaSnapshot | null> | undefined;
   #quotaCwd = process.cwd();
   constructor(readonly options: AntigravityAdapterOptions = {}) {
@@ -1774,7 +1776,17 @@ export class AntigravityAdapter implements HarnessAdapter {
     return this.#quota;
   }
   refreshCredits(): Promise<AntigravityQuotaSnapshot | null> {
+    return this.#refreshQuota();
+  }
+  #refreshQuota(force = false): Promise<AntigravityQuotaSnapshot | null> {
     if (this.#closed) return Promise.resolve(null);
+    if (
+      !force &&
+      !this.#quotaRefresh &&
+      Date.now() - this.#quotaFetchedAt < QUOTA_REFRESH_COOLDOWN_MS
+    ) {
+      return Promise.resolve(this.#quota);
+    }
     return (this.#quotaRefresh ??= (async () => {
       const command = resolveAntigravityExecutable({
         ...(this.options.command ? { command: this.options.command } : {}),
@@ -1795,11 +1807,12 @@ export class AntigravityAdapter implements HarnessAdapter {
       if (!this.#closed) this.#quota = quota;
       return this.#closed ? null : quota;
     })().finally(() => {
+      if (!this.#closed) this.#quotaFetchedAt = Date.now();
       this.#quotaRefresh = undefined;
     }));
   }
   async inspectAccount() {
-    const credits = await this.refreshCredits();
+    const credits = await this.#refreshQuota(true);
     if (!credits) return null;
     return {
       credits: {
@@ -1818,6 +1831,7 @@ export class AntigravityAdapter implements HarnessAdapter {
     this.#cache.clear();
     this.#inflight.clear();
     this.#quota = null;
+    this.#quotaFetchedAt = Number.NEGATIVE_INFINITY;
     await Promise.all([...this.#sessions].map((session) => session.close()));
     this.#sessions.clear();
   }

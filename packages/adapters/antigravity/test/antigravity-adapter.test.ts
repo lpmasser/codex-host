@@ -1623,24 +1623,45 @@ describe("inspection and errors", () => {
           },
         },
       };
-      await writeFile(
-        command,
-        `#!/bin/sh\necho 'diagnostic'\nprintf '%s\\n' '${JSON.stringify(quota)}'\n`,
-      );
-      await chmod(command, 0o755);
+      const writeQuota = async (script: string) => {
+        await writeFile(command, script);
+        await chmod(command, 0o755);
+      };
+      const quotaScript = `#!/bin/sh\necho 'diagnostic'\nprintf '%s\\n' '${JSON.stringify(quota)}'\n`;
+      await writeQuota(quotaScript);
+      let now = 100_000;
+      const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
       const { adapter, transports } = fixture({ command });
-      expect(adapter.credits()).toBeNull();
-      expect(await adapter.refreshCredits()).toMatchObject({
-        usedPercent: 25,
-        periodType: "five_hour",
-      });
-      const account = await adapter.inspectAccount();
-      expect(account?.credits).toMatchObject({ usedPercent: 25 });
-      expect(account?.credits).not.toHaveProperty("fetchedAt");
-      expect(transports).toHaveLength(0);
-      await writeFile(command, "#!/bin/sh\nexit 1\n");
-      expect(await adapter.refreshCredits()).toBeNull();
-      expect(adapter.credits()).toBeNull();
+      try {
+        expect(adapter.credits()).toBeNull();
+        expect(await adapter.refreshCredits()).toMatchObject({
+          usedPercent: 25,
+          periodType: "five_hour",
+        });
+        const account = await adapter.inspectAccount();
+        expect(account?.credits).toMatchObject({ usedPercent: 25 });
+        expect(account?.credits).not.toHaveProperty("fetchedAt");
+        await writeQuota("#!/bin/sh\nexit 1\n");
+        now = 110_000;
+        expect(await adapter.refreshCredits()).toMatchObject({
+          usedPercent: 25,
+          periodType: "five_hour",
+        });
+        expect(transports).toHaveLength(0);
+        expect(await adapter.inspectAccount()).toBeNull();
+        expect(adapter.credits()).toBeNull();
+        await writeQuota(quotaScript);
+        now = 140_000;
+        expect(await adapter.refreshCredits()).toBeNull();
+        now = 170_000;
+        expect(await adapter.refreshCredits()).toMatchObject({
+          usedPercent: 25,
+          periodType: "five_hour",
+        });
+      } finally {
+        clock.mockRestore();
+        await adapter.close();
+      }
     },
   );
   it("normalizes native faults and redacts diagnostics", () => {
