@@ -1215,8 +1215,9 @@ export class AppServerHost {
         this.#startOfficialDelegation(input, resolveConfiguration),
       listOfficial: (input) => this.#listDelegationThreads(input),
       officialThreadMetadata: (threadId) => this.#readOfficialThreadMetadata(threadId),
-      activeOfficialParents: () => [...this.#activeOfficialTurns.keys()],
+      activeOfficialParents: () => this.#activeOfficialThreadIds(),
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
+      externalThreadActive: (thread) => this.#externalThreadActive(thread),
       pendingQuestions: (threadId) => this.#pendingDelegationQuestions(threadId),
     });
     options.sharedThreads?.setLocalOwnershipProbe((threadId) => this.#hasLocalThread(threadId));
@@ -1709,7 +1710,12 @@ export class AppServerHost {
     this.#pendingOfficialTurnStarts.delete(value.id);
     const result = isRecord(value.result) ? value.result : null;
     const turn = result && isRecord(result.turn) ? result.turn : null;
-    if (turn && typeof turn.id === "string" && !pending.completedTurnIds.has(turn.id)) {
+    if (
+      turn &&
+      typeof turn.id === "string" &&
+      !pending.completedTurnIds.has(turn.id) &&
+      !this.#officialRuntimeScope.owner.isTurnCompleted(pending.threadId, turn.id)
+    ) {
       this.#activeOfficialTurns.set(pending.threadId, turn.id);
     }
     this.#signalActiveWorkChanged();
@@ -2507,6 +2513,18 @@ export class AppServerHost {
     this.#signalActiveWorkChanged();
   }
 
+  #activeOfficialThreadIds(): string[] {
+    return this.#officialRuntimeScope.owner.activeThreadIds();
+  }
+
+  #hasActiveOfficialTurn(threadId: string): boolean {
+    return this.#officialRuntimeScope.owner.hasActiveTurn(threadId);
+  }
+
+  #activeOfficialTurnId(threadId: string): string | undefined {
+    return this.#officialRuntimeScope.owner.activeTurnId(threadId) ?? undefined;
+  }
+
   async #requestOfficial(method: string, params: JsonObject, refresh = true): Promise<JsonObject> {
     if (this.#options.externalOnly) await this.#initializeSharedOfficial(refresh);
     const options = this.#observedSessionUsage.requestOptions(method, params);
@@ -2658,7 +2676,11 @@ export class AppServerHost {
     }
     if (value.method === "turn/started" && typeof params.threadId === "string") {
       const turn = isRecord(params.turn) ? params.turn : null;
-      if (turn && typeof turn.id === "string") {
+      if (
+        turn &&
+        typeof turn.id === "string" &&
+        !this.#officialRuntimeScope.owner.isTurnCompleted(params.threadId, turn.id)
+      ) {
         this.#activeOfficialTurns.set(params.threadId, turn.id);
       }
     }
@@ -2902,14 +2924,16 @@ export class AppServerHost {
       );
     }
     if (existing) {
-      const turnId = this.#activeOfficialTurns.get(existing.childHostThreadId) ?? "pending";
+      const turnId = this.#activeOfficialTurnId(existing.childHostThreadId) ?? "pending";
       return {
         delegationId: existing.delegationId,
         threadId: existing.childHostThreadId,
         turnId,
         harnessId: "codex",
         deepLink: `codex://threads/${existing.childHostThreadId}`,
-        status: existing.status,
+        status: this.#hasActiveOfficialTurn(existing.childHostThreadId)
+          ? "running"
+          : existing.status,
         next: {
           read: `codexhost thread read ${existing.childHostThreadId}`,
           wait: `codexhost thread wait ${existing.childHostThreadId} --timeout-ms 30000`,
@@ -2955,7 +2979,9 @@ export class AppServerHost {
       await this.#requestOfficial("thread/delete", { threadId }).catch(() => undefined);
       throw error;
     }
-    this.#activeOfficialTurns.set(threadId, turnId);
+    if (!this.#officialRuntimeScope.owner.isTurnCompleted(threadId, turnId)) {
+      this.#activeOfficialTurns.set(threadId, turnId);
+    }
     const delegationId = hostThreadIdSchema.parse(randomUUID());
     try {
       const source = await this.#repository.find(input.parentThreadId);
@@ -3018,7 +3044,7 @@ export class AppServerHost {
     if (!input.message?.trim()) {
       throw new DelegationControlError("INVALID_ARGUMENT", "Message must not be empty");
     }
-    if (!input.steer && this.#activeOfficialTurns.has(input.threadId)) {
+    if (!input.steer && this.#hasActiveOfficialTurn(input.threadId)) {
       throw new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
     }
     const current = await this.#requestOfficial("thread/read", {
@@ -3038,7 +3064,7 @@ export class AppServerHost {
         typeof latestTurn.id === "string" &&
         (latestTurn.status === "inProgress" || latestTurn.status === "running")
           ? latestTurn.id
-          : this.#activeOfficialTurns.get(input.threadId);
+          : this.#activeOfficialTurnId(input.threadId);
       if (!input.steer || !turnId) {
         throw new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
       }
@@ -3109,12 +3135,14 @@ export class AppServerHost {
     const turn = result && isRecord(result.turn) ? result.turn : null;
     const turnId = turn && typeof turn.id === "string" ? turn.id : null;
     if (!turnId) throw new Error("Official turn/start returned no Turn identity");
-    this.#activeOfficialTurns.set(input.threadId, turnId);
+    if (!this.#officialRuntimeScope.owner.isTurnCompleted(input.threadId, turnId)) {
+      this.#activeOfficialTurns.set(input.threadId, turnId);
+    }
     return officialSendResult(input.threadId, turnId);
   }
 
   async #cancelOfficialDelegationThread(input: ThreadCancelInput): Promise<ThreadCancelResult> {
-    let turnId = this.#activeOfficialTurns.get(input.threadId);
+    let turnId = this.#activeOfficialTurnId(input.threadId);
     if (!turnId) {
       const current = await this.#requestOfficial("thread/read", {
         threadId: input.threadId,
@@ -3133,7 +3161,9 @@ export class AppServerHost {
         (latestTurn.status === "inProgress" || latestTurn.status === "running")
       ) {
         turnId = latestTurn.id;
-        this.#activeOfficialTurns.set(input.threadId, turnId);
+        if (!this.#officialRuntimeScope.owner.isTurnCompleted(input.threadId, turnId)) {
+          this.#activeOfficialTurns.set(input.threadId, turnId);
+        }
       } else {
         return { threadId: input.threadId, turnId: null, harnessId: "codex", cancelled: false };
       }
@@ -3165,7 +3195,7 @@ export class AppServerHost {
       ? thread.turns.filter((turn): turn is JsonObject => isRecord(turn))
       : [];
     const running =
-      this.#activeOfficialTurns.has(threadId) ||
+      this.#hasActiveOfficialTurn(threadId) ||
       (isRecord(thread.status) && thread.status.type === "active");
     return { threadId, harnessId: "codex" as const, thread, turns, running };
   }
@@ -5747,6 +5777,10 @@ export class AppServerHost {
 
   #externalThreadBusy(thread: ExternalThread): boolean {
     return thread.running || this.#externalSteering.hasPending(thread.id);
+  }
+
+  #externalThreadActive(thread: ExternalThread): boolean {
+    return thread.running || this.#externalSteering.hasActiveReplacement(thread.id);
   }
 
   #externalSessionAvailable(thread: ExternalThread): boolean {
