@@ -1,4 +1,6 @@
 // Browser-safe public contracts shared with the injected Renderer extension.
+export const NATIVE_MODULE_CATALOG_UPDATED_EVENT = "codexhost:native-module-catalog-updated";
+
 export {
   committedReactAncestors,
   REACT_FIBER_WALK_LIMIT_EVENT,
