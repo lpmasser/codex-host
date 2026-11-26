@@ -1,3 +1,5 @@
+import { NATIVE_MODULE_CATALOG_UPDATED_EVENT } from "./renderer-bindings.js";
+
 /** CDP's parsed ES modules are the allowlist for native-service imports. Import
  * edges and modulepreload hints alone do not prove a lazy chunk has been loaded.
  */
@@ -24,7 +26,7 @@ export function nativeModuleCatalogExpression(
   return `Object.defineProperty(globalThis, '__codexhostLoadedModulesV1', {
     configurable: true,
     value: Object.freeze({ owner: ${JSON.stringify(owner)}, documentUrl: location.href, complete: ${complete}, urls: Object.freeze(${JSON.stringify(urls)}) })
-  }); void 0`;
+  }); globalThis.dispatchEvent(new Event(${JSON.stringify(NATIVE_MODULE_CATALOG_UPDATED_EVENT)})); void 0`;
 }
 
 /** Subscribe before enabling Debugger: enable replays scripts already loaded in
