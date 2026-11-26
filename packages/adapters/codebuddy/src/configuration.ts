@@ -88,6 +88,7 @@ export function configuration(
     })),
     defaultModel: currentModel.ref,
     thinkingOptions,
+    thinkingOptionsScope: "activeModel",
     ...(currentThinking ? { defaultThinkingOptionId: currentThinking.id } : {}),
   });
   const permissionModes = harnessPermissionModeCatalogSchema.parse({
