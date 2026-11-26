@@ -501,6 +501,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isUnacceptedSessionBusyError(error: unknown): boolean {
+  return (
+    (error instanceof ExternalSteerError || error instanceof ExternalCommandError) &&
+    error.notStarted &&
+    error.harnessErrorCode === "sessionBusy"
+  );
+}
+
 function isReasoningTranscript(
   preview: JsonObject,
   transcript: JsonObject | undefined,
@@ -1035,6 +1043,10 @@ export class AppServerHost {
       itemId: string;
       result: Promise<{ turnId: HostTurnId; turn: JsonObject; gate: TurnProjectionGate }>;
     }
+  >();
+  readonly #outputLoopStates = new WeakMap<
+    ExternalThread,
+    { processing: Promise<void> | null; delivered: number; ended: boolean }
   >();
   #manualCompactionTurns = new WeakMap<ExternalThread, HostTurnId>();
   #closeRequested = false;
@@ -1815,7 +1827,10 @@ export class AppServerHost {
       ...this.#activeOfficialTurns.keys(),
       ...this.#externalRuntime
         .values()
-        .filter((thread) => thread.running || thread.activeTurnId !== null)
+        .filter(
+          (thread) =>
+            thread.running || thread.activeTurnId !== null || thread.admittingTurnId !== null,
+        )
         .map((thread) => thread.id),
     ];
   }
@@ -1828,7 +1843,10 @@ export class AppServerHost {
       this.#runningSubagentsByParent.size > 0 ||
       this.#externalRuntime
         .values()
-        .some((thread) => thread.running || thread.activeTurnId !== null)
+        .some(
+          (thread) =>
+            thread.running || thread.activeTurnId !== null || thread.admittingTurnId !== null,
+        )
     );
   }
 
@@ -4883,6 +4901,7 @@ export class AppServerHost {
     arguments_: JsonObject | undefined,
     requestedTurnId?: HostTurnId,
     sourceHostId?: unknown,
+    assertActive?: () => void,
   ): Promise<{ turnId: HostTurnId; turn: JsonObject; gate: TurnProjectionGate }> {
     const commands = thread.session.commands;
     if (!commands) {
@@ -4893,8 +4912,13 @@ export class AppServerHost {
     }
     // Admission belongs to the caller. A steering replacement retains its
     // reservation until this command starts, after the old Turn has stopped.
-    if (thread.running || thread.activeTurnId) {
-      throw new ExternalCommandError(-32072, "External Thread already has an active operation");
+    if (thread.running || thread.activeTurnId || thread.admittingTurnId) {
+      throw new ExternalCommandError(
+        -32072,
+        "External Thread already has an active operation",
+        true,
+        "sessionBusy",
+      );
     }
     const turnId = requestedTurnId ?? hostTurnIdSchema.parse(randomUUID());
     const manualCompaction = descriptor.invocation === "/compact";
@@ -4921,9 +4945,7 @@ export class AppServerHost {
       }),
     };
     const gate = turnProjectionGate();
-    thread.running = true;
-    thread.activeTurnId = turnId;
-    thread.projectedTerminalTurnId = null;
+    thread.admittingTurnId = turnId;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
     thread.ephemeralTurnIds.add(turnId);
@@ -4938,12 +4960,26 @@ export class AppServerHost {
       if (!this.#externalSessionAvailable(thread)) {
         throw new ExternalCommandError(-32073, "External Thread is no longer available");
       }
+      if (thread.running || thread.activeTurnId) {
+        throw new ExternalCommandError(
+          -32072,
+          "External Thread already has an active operation",
+          true,
+          "sessionBusy",
+        );
+      }
+      assertActive?.();
       const result = await commands.execute({
         turnId,
         commandId: descriptor.id,
         ...(arguments_ ? { arguments: arguments_ } : {}),
       });
-      if (!result.ok) throw new ExternalCommandError(-32073, result.error.message);
+      if (!result.ok)
+        throw new ExternalCommandError(-32073, result.error.message, true, result.error.code);
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
+      thread.running = true;
+      thread.activeTurnId = turnId;
+      thread.projectedTerminalTurnId = null;
       thread.clientCommand = {
         name: descriptor.invocation.slice(1),
         turn: projection.projector.snapshotTurn(),
@@ -4951,12 +4987,12 @@ export class AppServerHost {
       return { turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       thread.ephemeralTurnIds.delete(turnId);
-      this.#manualCompactionTurns.delete(thread);
+      if (this.#manualCompactionTurns.get(thread) === turnId)
+        this.#manualCompactionTurns.delete(thread);
       gate.resolve();
       this.#signalActiveWorkChanged();
       throw error;
@@ -5885,7 +5921,7 @@ export class AppServerHost {
       );
       return;
     }
-    if (includeTurns && !thread.running && !historyFresh) {
+    if (includeTurns && !thread.running && !thread.admittingTurnId && !historyFresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -5923,7 +5959,7 @@ export class AppServerHost {
       (request.method === "thread/items/list" &&
         !thread.historyHydrated &&
         (headPage || (isRecord(params.cursor) && params.cursor.type === "item")));
-    if (!thread.running && !historyFresh && requiresRefresh) {
+    if (!thread.running && !thread.admittingTurnId && !historyFresh && requiresRefresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -5959,7 +5995,7 @@ export class AppServerHost {
     params: JsonObject,
     historyFresh: boolean,
   ): Promise<void> {
-    if (!thread.running && !historyFresh) {
+    if (!thread.running && !thread.admittingTurnId && !historyFresh) {
       const refreshed = await this.#refreshExternalThread(thread);
       if (refreshed) {
         await this.#writer.json(rpcError(request, refreshed.code, refreshed.message));
@@ -6188,7 +6224,12 @@ export class AppServerHost {
   }
 
   #externalThreadBusy(thread: ExternalThread): boolean {
-    return thread.running || this.#externalSteering.hasPending(thread.id);
+    return (
+      thread.running ||
+      thread.activeTurnId !== null ||
+      thread.admittingTurnId !== null ||
+      this.#externalSteering.hasPending(thread.id)
+    );
   }
 
   #externalSessionAvailable(thread: ExternalThread): boolean {
@@ -6217,18 +6258,20 @@ export class AppServerHost {
         initialInput: [{ type: "text", text }],
       }),
     };
-    thread.running = true;
-    thread.activeTurnId = turnId;
-    thread.projectedTerminalTurnId = null;
+    const gate = turnProjectionGate();
+    thread.admittingTurnId = turnId;
     thread.projectedTurns.set(turnId, projection);
-    thread.responseGates.set(turnId, {
-      promise: Promise.resolve(),
-      resolve: () => undefined,
-    });
+    thread.responseGates.set(turnId, gate);
     try {
       const stored = await this.#repository.find(thread.id);
       if (!this.#externalSessionAvailable(thread)) {
         throw new Error("External Harness Session is no longer available");
+      }
+      if (thread.running || thread.activeTurnId) {
+        throw new DelegationControlError(
+          "THREAD_BUSY",
+          "External Thread already has an active Turn",
+        );
       }
       const injected = withInjectedText(stored, text);
       const result = await thread.session.execute({
@@ -6242,12 +6285,17 @@ export class AppServerHost {
         }
         throw new Error(result.error.message);
       }
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
+      thread.running = true;
+      thread.activeTurnId = turnId;
+      thread.projectedTerminalTurnId = null;
+      gate.resolve();
       await this.#releaseInjectedText(thread, turnId, injected);
     } catch (error) {
-      thread.running = false;
-      thread.activeTurnId = null;
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
+      gate.resolve();
       this.#signalActiveWorkChanged();
       throw error;
     }
@@ -6383,6 +6431,29 @@ export class AppServerHost {
     await this.#writer.json({ method: "thread/queue/changed", params: { threadId } });
   }
 
+  async #waitForAutonomousOccupation(
+    thread: ExternalThread,
+    autonomousBefore: number,
+  ): Promise<boolean> {
+    const occupied = () =>
+      thread.running ||
+      thread.activeTurnId !== null ||
+      thread.autonomousTurnSequence !== autonomousBefore;
+    if (occupied()) return true;
+    const state = this.#outputLoopStates.get(thread);
+    if (!state) return false;
+    while (!occupied() && !state.ended) {
+      if (state.processing) {
+        await state.processing.catch(() => undefined);
+        continue;
+      }
+      const delivered = state.delivered;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (!state.processing && state.delivered === delivered) break;
+    }
+    return occupied();
+  }
+
   async #startNextQueuedExternalTurn(
     thread: ExternalThread,
     expectedItemId?: string,
@@ -6398,10 +6469,36 @@ export class AppServerHost {
       return;
     const next = this.#externalQueue.head(thread.id);
     if (!next || (expectedItemId !== undefined && next.id !== expectedItemId)) return;
+    const autonomousBefore = thread.autonomousTurnSequence;
     try {
-      const started = await this.#startQueuedExternalTurn(thread, next.id);
+      const started = await this.#startQueuedExternalTurn(thread, next.id, () => {
+        if (
+          thread.autonomousTurnSequence !== autonomousBefore ||
+          this.#externalQueue.isPaused(thread.id)
+        ) {
+          throw new ExternalSteerError(
+            -32072,
+            "External Thread already has an active Turn",
+            true,
+            "sessionBusy",
+          );
+        }
+      });
       started.gate.resolve();
     } catch (error) {
+      if (
+        isUnacceptedSessionBusyError(error) &&
+        (await this.#waitForAutonomousOccupation(thread, autonomousBefore))
+      ) {
+        if (
+          !thread.running &&
+          thread.activeTurnId === null &&
+          !this.#externalQueue.isPaused(thread.id)
+        ) {
+          void this.#startNextQueuedExternalTurn(thread, next.id);
+        }
+        return;
+      }
       this.#diagnose(`Queued External Turn failed to start: ${errorMessage(error)}`);
       if (this.#externalQueue.pause(thread.id, "failed"))
         await this.#publishExternalQueue(thread.id);
@@ -6544,6 +6641,7 @@ export class AppServerHost {
   async #startQueuedExternalTurn(
     thread: ExternalThread,
     itemId: string,
+    assertActive?: () => void,
   ): Promise<{ turnId: HostTurnId; turn: JsonObject; gate: TurnProjectionGate }> {
     const active = this.#queuedTurnStarts.get(thread.id);
     if (active) {
@@ -6552,14 +6650,19 @@ export class AppServerHost {
       return active.result;
     }
     if (this.#externalThreadBusy(thread) || this.#pendingExternalCommandRequests.has(thread.id))
-      throw new ExternalSteerError(-32072, "External Thread already has an active Turn");
+      throw new ExternalSteerError(
+        -32072,
+        "External Thread already has an active Turn",
+        true,
+        "sessionBusy",
+      );
     const item = this.#externalQueue.find(thread.id, itemId);
     if (!item) throw new ExternalSteerError(-32072, "Queued message not found");
     const result = (async () => {
       const started = await this.#beginExternalInputTurn(
         thread,
         requestText({ input: item.input }),
-        undefined,
+        assertActive,
         item.clientUserMessageId,
         true,
         item.sourceHostId,
@@ -6848,9 +6951,17 @@ export class AppServerHost {
     const commands = thread.session.commands;
     if (!commands || !isExternalCommandCandidate(text)) {
       assertActive?.();
-      return this.#beginExternalTurn(thread, text, clientUserMessageId, publishInput, sourceHostId);
+      return this.#beginExternalTurn(
+        thread,
+        text,
+        clientUserMessageId,
+        publishInput,
+        sourceHostId,
+        assertActive,
+      );
     }
     this.#pendingExternalCommandRequests.add(thread.id);
+    let busyRefusal = false;
     try {
       const adapter = this.#externalAdapters.get(thread.harnessId);
       const command = await resolveExternalCommand(commands, text, {
@@ -6867,6 +6978,7 @@ export class AppServerHost {
           clientUserMessageId,
           publishInput,
           sourceHostId,
+          assertActive,
         );
       }
       return await this.#beginExternalCommand(
@@ -6875,8 +6987,10 @@ export class AppServerHost {
         command.arguments,
         undefined,
         sourceHostId,
+        assertActive,
       );
     } catch (error) {
+      busyRefusal = isUnacceptedSessionBusyError(error);
       if (error instanceof ExternalCommandError || error instanceof ExternalSteerError) throw error;
       this.#diagnose(error);
       throw new ExternalCommandError(
@@ -6885,7 +6999,13 @@ export class AppServerHost {
       );
     } finally {
       this.#pendingExternalCommandRequests.delete(thread.id);
-      if (!thread.running && !thread.activeTurnId && this.#externalQueue.pause(thread.id, "failed"))
+      if (
+        !busyRefusal &&
+        !thread.running &&
+        !thread.activeTurnId &&
+        !thread.admittingTurnId &&
+        this.#externalQueue.pause(thread.id, "failed")
+      )
         await this.#publishExternalQueue(thread.id);
     }
   }
@@ -6919,6 +7039,7 @@ export class AppServerHost {
     clientUserMessageId?: string,
     publishInput = false,
     sourceHostId?: unknown,
+    assertActive?: () => void,
   ): Promise<{
     turnId: HostTurnId;
     turn: JsonObject;
@@ -6930,9 +7051,15 @@ export class AppServerHost {
     if (
       thread.running ||
       thread.activeTurnId ||
+      thread.admittingTurnId ||
       this.#pendingExternalCommandRequests.has(thread.id)
     ) {
-      throw new ExternalSteerError(-32072, "External Thread already has an active Turn");
+      throw new ExternalSteerError(
+        -32072,
+        "External Thread already has an active Turn",
+        true,
+        "sessionBusy",
+      );
     }
     const turnId = hostTurnIdSchema.parse(randomUUID());
     const startedAtMs = Date.now();
@@ -6950,9 +7077,7 @@ export class AppServerHost {
       }),
     };
     const gate = turnProjectionGate();
-    thread.running = true;
-    thread.activeTurnId = turnId;
-    thread.projectedTerminalTurnId = null;
+    thread.admittingTurnId = turnId;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
 
@@ -6966,18 +7091,31 @@ export class AppServerHost {
       if (!this.#externalSessionAvailable(thread)) {
         throw new ExternalSteerError(-32073, "External Thread is no longer available");
       }
+      if (thread.running || thread.activeTurnId) {
+        throw new ExternalSteerError(
+          -32072,
+          "External Thread already has an active Turn",
+          true,
+          "sessionBusy",
+        );
+      }
+      assertActive?.();
       const result = await thread.session.execute({
         type: "turn.start",
         turnId,
         input: [{ type: "text", text: injected.text }],
       });
-      if (!result.ok) throw new ExternalSteerError(-32073, result.error.message);
+      if (!result.ok)
+        throw new ExternalSteerError(-32073, result.error.message, true, result.error.code);
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
+      thread.running = true;
+      thread.activeTurnId = turnId;
+      thread.projectedTerminalTurnId = null;
       await this.#releaseInjectedText(thread, turnId, injected);
       return { turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
       restoreExecutionHost();
-      thread.running = false;
-      thread.activeTurnId = null;
+      if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.projectedTurns.delete(turnId);
       thread.responseGates.delete(turnId);
       gate.resolve();
@@ -7062,15 +7200,27 @@ export class AppServerHost {
   }
 
   async #consumeHarnessOutputs(thread: ExternalThread): Promise<void> {
+    const loopState = { processing: null as Promise<void> | null, delivered: 0, ended: false };
+    this.#outputLoopStates.set(thread, loopState);
     try {
       for await (const output of thread.session.outputs) {
+        loopState.delivered += 1;
         const passiveTelemetry =
-          !thread.running && !thread.activeTurnId && isPassiveTelemetryOutput(output);
-        await this.#externalRuntime.idleRelease.consumeOutput(
+          !thread.running &&
+          !thread.activeTurnId &&
+          !thread.admittingTurnId &&
+          isPassiveTelemetryOutput(output);
+        const task = this.#externalRuntime.idleRelease.consumeOutput(
           thread,
           () => this.#projectHarnessOutput(thread, output),
           passiveTelemetry ? { touch: false } : undefined,
         );
+        loopState.processing = task;
+        try {
+          await task;
+        } finally {
+          if (loopState.processing === task) loopState.processing = null;
+        }
       }
       // Even an idle Session cannot deliver the next Turn's events after EOF.
       thread.sessionUnavailable = true;
@@ -7088,6 +7238,8 @@ export class AppServerHost {
         (failure) => this.#diagnose(failure),
       );
     } finally {
+      loopState.processing = null;
+      loopState.ended = true;
       this.#externalSteering.fault(
         thread.id,
         new Error("External Harness output ended before replacement"),
@@ -7413,7 +7565,8 @@ export class AppServerHost {
       if (this.#externalQueue.pause(thread.id, "outcome-unknown"))
         await this.#publishExternalQueue(thread.id);
       this.#diagnose(`${thread.harnessId} Harness Session faulted: ${event.error.message}`);
-      for (const { projector } of [...thread.projectedTurns.values()]) {
+      for (const [turnId, { projector }] of [...thread.projectedTurns]) {
+        if (turnId === thread.admittingTurnId) continue;
         for (const failure of projector.failureEvents(event.error)) {
           await this.#projectHarnessOutput(thread, { kind: "event", event: failure });
         }
@@ -7423,6 +7576,7 @@ export class AppServerHost {
       if (
         !thread.running &&
         !thread.activeTurnId &&
+        !thread.admittingTurnId &&
         !this.#hasRunningSubagents(thread.id) &&
         !thread.session.hasBackgroundWork?.()
       ) {
