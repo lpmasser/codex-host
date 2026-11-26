@@ -47,6 +47,10 @@ async function fixture(
       }),
     );
   }
+  await writeFile(
+    path.join(path.dirname(path.dirname(script)), "product.json"),
+    JSON.stringify({ dataFolderName: ".workbuddy-ai" }),
+  );
   await writeFile(preload, `process._linkedBinding = (name) => { ${provider} };`);
   const environment: NodeJS.ProcessEnv = Object.fromEntries(
     Object.entries(process.env).filter(

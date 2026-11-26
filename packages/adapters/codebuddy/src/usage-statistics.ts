@@ -88,12 +88,15 @@ export function createCodeBuddyUsageStatistics(
 ): HarnessUsageStatisticsCapability {
   return Object.freeze({
     // projects/<project>/<session>.jsonl and <session>/subagents/*.jsonl
-    listSources: (signal: AbortSignal) =>
+    listSources: async (signal: AbortSignal) =>
       jsonlUsageSources(
         path.join(codeBuddyConfigRoot(environment, profile), "projects"),
         3,
         signal,
       ),
-    readSource: (id: string, signal: AbortSignal) => readCodeBuddyUsage(id, signal),
+    readSource: async (id: string, signal: AbortSignal) => {
+      codeBuddyConfigRoot(environment, profile, id);
+      return readCodeBuddyUsage(id, signal);
+    },
   });
 }

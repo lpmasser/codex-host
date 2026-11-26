@@ -3,25 +3,30 @@ import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
 import { WorkBuddyAdapter } from "./workbuddy-adapter.js";
 import { WORKBUDDY_COMMAND_CATALOG } from "./common.js";
 import { workBuddyInvocation } from "./command.js";
+import { WORKBUDDY_DISTRIBUTIONS, type WorkBuddyDistribution } from "./distribution.js";
 import { CodeBuddyError } from "@codexhost/adapter-codebuddy";
 import { createWorkBuddyInstallation } from "./installation.js";
 
-export function createHarnessAdapter(context: HarnessPluginContext) {
+export function createHarnessAdapter(
+  context: HarnessPluginContext,
+  distribution: WorkBuddyDistribution = "global",
+) {
+  const { harnessId, commandEnvironmentVariable } = WORKBUDDY_DISTRIBUTIONS[distribution];
   if (context.platform === "darwin" && context.managedRemoteHost) {
     const environment = {
       ...context.environment,
-      ...(context.launchCommand ? { CODEXHOST_WORKBUDDY_COMMAND: context.launchCommand } : {}),
+      ...(context.launchCommand ? { [commandEnvironmentVariable]: context.launchCommand } : {}),
     };
     return new BrokeredHarnessAdapter({
       sessionImport: true,
       accountCredits: false,
-      harnessId: "workbuddy",
+      harnessId,
       commandCatalog: WORKBUDDY_COMMAND_CATALOG,
       forwardDelegationEnvironment: true,
       environment: { ...context.environment },
       isInstalled: () => {
         try {
-          workBuddyInvocation(environment, true);
+          workBuddyInvocation(environment, true, { distribution });
           return true;
         } catch (error) {
           return !(error instanceof CodeBuddyError && error.code === "notInstalled");
@@ -32,13 +37,19 @@ export function createHarnessAdapter(context: HarnessPluginContext) {
   }
   const environment = {
     ...context.environment,
-    ...(context.launchCommand ? { CODEXHOST_WORKBUDDY_COMMAND: context.launchCommand } : {}),
+    ...(context.launchCommand ? { [commandEnvironmentVariable]: context.launchCommand } : {}),
   };
   const platform: NodeJS.Platform | undefined =
     context.platform === "darwin" || context.platform === "win32" || context.platform === "linux"
       ? context.platform
       : undefined;
-  return Object.assign(new WorkBuddyAdapter({ environment, ...(platform ? { platform } : {}) }), {
-    installation: createWorkBuddyInstallation(environment, platform ? { platform } : {}),
-  });
+  return Object.assign(
+    new WorkBuddyAdapter({ distribution, environment, ...(platform ? { platform } : {}) }),
+    {
+      installation: createWorkBuddyInstallation(environment, {
+        distribution,
+        ...(platform ? { platform } : {}),
+      }),
+    },
+  );
 }
