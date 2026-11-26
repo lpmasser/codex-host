@@ -31,6 +31,7 @@ import {
   type ThreadListInput,
   type ThreadReadInput,
   type ThreadSendInput,
+  type ThreadMailInput,
   type ThreadSendResult,
   type ThreadWaitInput,
   type ThreadWatchInput,
@@ -616,7 +617,8 @@ export class DelegationControlRegistry implements DelegationControlApi, Delegati
     }
     const registration = await this.#registrationForThread(local.threadId);
     if (!local.interrupt) return registration.send(local);
-    const send = { threadId: local.threadId, message: local.message };
+    // `interrupt` tells the registration this send may go ahead of queued follow-ups.
+    const send = { threadId: local.threadId, message: local.message, interrupt: true };
     return this.#watchService.holdNotifications(local.threadId, () =>
       interruptAndSend(registration, send),
     );
@@ -815,6 +817,19 @@ export class DelegationControlRegistry implements DelegationControlApi, Delegati
 
   async watches() {
     return this.#watchService.watches();
+  }
+
+  async mail(input: ThreadMailInput) {
+    const authContext = getCallerAuthContext(input);
+    const { callerThreadId, ...local } = input;
+    // The sender is only a label in the delivered Turn; Host-verified identity comes first.
+    const from =
+      authContext?.kind === "external-client"
+        ? clientOrigin(authContext.client)
+        : authContext?.kind === "agent" && authContext.boundThreadId
+          ? authContext.boundThreadId
+          : callerThreadId;
+    return this.#watchService.mail({ ...local, ...(from ? { from } : {}) });
   }
 
   /** Stops watching in this process; stored watches resume in the next Runtime. */
