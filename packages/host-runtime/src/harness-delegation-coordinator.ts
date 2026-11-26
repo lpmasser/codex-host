@@ -181,7 +181,9 @@ export class HarnessDelegationCoordinator {
   readonly #listOfficial: (input: ThreadListInput) => Promise<DelegationThreadListResult>;
   readonly #officialThreadMetadata: (threadId: string) => Promise<ParentMetadata>;
   readonly #activeOfficialParents: () => string[];
+  readonly #activeOfficialThreads: () => string[];
   readonly #externalThreadBusy: (thread: ExternalThread) => boolean;
+  readonly #externalThreadActive: (thread: ExternalThread) => boolean;
   readonly #pendingQuestions: (threadId: string) => DelegationPendingQuestion[];
 
   constructor(input: {
@@ -216,7 +218,9 @@ export class HarnessDelegationCoordinator {
     listOfficial(input: ThreadListInput): Promise<DelegationThreadListResult>;
     officialThreadMetadata(threadId: string): Promise<ParentMetadata>;
     activeOfficialParents(): string[];
+    activeOfficialThreads?: () => string[];
     externalThreadBusy(thread: ExternalThread): boolean;
+    externalThreadActive?: (thread: ExternalThread) => boolean;
     pendingQuestions(threadId: string): DelegationPendingQuestion[];
   }) {
     this.#adapters = input.adapters;
@@ -238,7 +242,9 @@ export class HarnessDelegationCoordinator {
     this.#listOfficial = input.listOfficial;
     this.#officialThreadMetadata = input.officialThreadMetadata;
     this.#activeOfficialParents = input.activeOfficialParents;
+    this.#activeOfficialThreads = input.activeOfficialThreads ?? input.activeOfficialParents;
     this.#externalThreadBusy = input.externalThreadBusy;
+    this.#externalThreadActive = input.externalThreadActive ?? input.externalThreadBusy;
     this.#pendingQuestions = input.pendingQuestions;
   }
 
@@ -697,13 +703,14 @@ export class HarnessDelegationCoordinator {
     const delegations = await this.#repository.listDelegations(parent);
     const records = await this.#repository.list();
     const byId = new Map(records.map((record) => [record.hostThreadId, record] as const));
+    const active = new Set(this.#activeOverlayThreadIds());
     const rows = delegations.map((delegation) => {
       const record = byId.get(delegation.childHostThreadId);
       return {
         threadId: delegation.childHostThreadId,
         harnessId: delegation.targetHarnessId as RoutedHarnessId,
         deepLink: `codex://threads/${delegation.childHostThreadId}`,
-        status: delegation.status,
+        status: active.has(delegation.childHostThreadId) ? "running" : delegation.status,
         ...(record
           ? {
               cwd: record.cwd,
@@ -749,13 +756,20 @@ export class HarnessDelegationCoordinator {
     };
   }
 
-  /** External and native Codex Threads that currently have an active Turn. */
+  /** External and native Codex Threads active on this Host connection. */
   activeThreadIds(): string[] {
-    const external = this.#externalRuntime
+    return [...this.#activeExternalThreadIds(), ...this.#activeOfficialParents()];
+  }
+
+  #activeExternalThreadIds(): string[] {
+    return this.#externalRuntime
       .values()
-      .filter((thread) => this.#externalThreadBusy(thread))
+      .filter((thread) => this.#externalThreadActive(thread))
       .map((thread) => thread.id);
-    return [...external, ...this.#activeOfficialParents()];
+  }
+
+  #activeOverlayThreadIds(): string[] {
+    return [...this.#activeExternalThreadIds(), ...this.#activeOfficialThreads()];
   }
 
   async #resolveParent(explicit?: string): Promise<string> {
@@ -809,13 +823,16 @@ export class HarnessDelegationCoordinator {
   async #existingResult(delegation: StoredDelegationRecordV1): Promise<DelegationStartResult> {
     const record = await this.#repository.find(delegation.childHostThreadId);
     const turnId = record?.turnMappings.at(-1)?.hostTurnId ?? "pending";
+    const status = this.#activeOverlayThreadIds().includes(delegation.childHostThreadId)
+      ? "running"
+      : delegation.status;
     return {
       ...this.#result(
         delegation.delegationId,
         delegation.childHostThreadId,
         turnId,
         delegation.targetHarnessId as RoutedHarnessId,
-        delegation.status,
+        status,
       ),
       ...(record ? { cwd: record.cwd, title: record.title } : {}),
       parentThreadId: delegation.parentHostThreadId,
