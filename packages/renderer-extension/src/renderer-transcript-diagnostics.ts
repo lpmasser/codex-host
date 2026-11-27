@@ -5,6 +5,7 @@ type DesktopLogger = { warning(message: string, tags?: LogTags): void };
 type NativeCatalog = { documentUrl: string; complete: boolean; urls: readonly string[] };
 
 const ERROR_NAMES = new Set([
+  "AbortError",
   "AggregateError",
   "Error",
   "RangeError",
@@ -15,22 +16,54 @@ const ERROR_NAMES = new Set([
 const STACK_LOCATION = /app:\/\/-\/assets\/(?:async\/)?[\w.-]+\.js:\d+:\d+/;
 const KNOWN_ERROR =
   /^(?:Maximum call stack size exceeded|Maximum update depth exceeded|Cannot read properties of (?:undefined|null)|Invalid array length|Minified React error #\d{1,4})\b/;
+const MAX_LEAVES = 4;
+const MAX_VISITED = 10_000;
 
-function transcriptErrorDetails(error: unknown, depth = 0): unknown {
-  if (!(error instanceof Error)) return { name: "NonError" };
+function errorSummary(error: unknown) {
+  if (!(error instanceof Error)) {
+    const thenable = typeof (error as { then?: unknown } | null)?.then === "function";
+    return { name: "NonError", type: thenable ? "thenable" : typeof error };
+  }
   return {
     name: ERROR_NAMES.has(error.name) ? error.name : "Error",
     kind: error.message.match(KNOWN_ERROR)?.[0],
     frames: error.stack
       ?.split("\n", 10)
       .slice(1)
-      .flatMap((line) => line.match(STACK_LOCATION)?.[0] ?? []),
-    ...(error instanceof AggregateError && depth < 2
-      ? {
-          count: error.errors.length,
-          errors: error.errors.slice(0, 4).map((inner) => transcriptErrorDetails(inner, depth + 1)),
-        }
-      : {}),
+      .filter((line) => line.trimStart().startsWith("at "))
+      .map((line) => line.match(STACK_LOCATION)?.[0] ?? "other"),
+  };
+}
+
+function transcriptErrorDetails(error: unknown): unknown {
+  const leaves: unknown[] = [];
+  const pending: Array<[unknown, number]> = [[error, 0]];
+  const expanded = new Set<AggregateError>();
+  let visited = 0;
+  let leafCount = 0;
+  let maxDepth = 0;
+  let truncated = false;
+  for (let next = pending.pop(); next != null; next = pending.pop()) {
+    if (visited++ >= MAX_VISITED) {
+      truncated = true;
+      break;
+    }
+    const [current, depth] = next;
+    maxDepth = Math.max(maxDepth, depth);
+    if (current instanceof AggregateError && current.errors.length > 0 && !expanded.has(current)) {
+      expanded.add(current);
+      for (const inner of [...current.errors].reverse()) pending.push([inner, depth + 1]);
+      continue;
+    }
+    leafCount += 1;
+    if (leaves.length < MAX_LEAVES) leaves.push({ depth, ...errorSummary(current) });
+  }
+  return {
+    ...errorSummary(error),
+    maxDepth,
+    leafCount,
+    leaves,
+    ...(truncated ? { truncated } : {}),
   };
 }
 
