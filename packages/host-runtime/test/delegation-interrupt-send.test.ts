@@ -80,9 +80,11 @@ describe("interrupt before send", () => {
     const { registry, api, order } = setup();
     await expect(registry.send(send)).resolves.toMatchObject({ turnId: "new-turn" });
     expect(order).toEqual(["cancel", "stopped", "send"]);
+    // `interrupt` lets the stopped Thread take this message ahead of queued follow-ups.
     expect(api.send).toHaveBeenCalledExactlyOnceWith({
       threadId: "target",
       message: "new direction",
+      interrupt: true,
     });
     expect(api.wait).toHaveBeenCalledWith({
       threadId: "target",
@@ -307,7 +309,10 @@ describe("send with watch", () => {
       status: "running" as const,
       timeoutMs: 1234,
     }));
-    const router = externalClientRouter({ api: registry, watchApi: { watch, watches: vi.fn() } });
+    const router = externalClientRouter({
+      api: registry,
+      watchApi: { watch, watches: vi.fn(), mail: vi.fn() },
+    });
     const call = { client: "caller", scope: "dispatch" } as Parameters<typeof router>[0];
     await router(call, "/v1/thread/send", {
       threadId: "target",

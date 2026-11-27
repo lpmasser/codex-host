@@ -1363,6 +1363,7 @@ export class AppServerHost {
       activeOfficialThreads: () => this.#activeOfficialThreadIds(),
       externalThreadBusy: (thread) => this.#externalThreadBusy(thread),
       externalThreadActive: (thread) => this.#externalThreadActive(thread),
+      externalQueueWaiting: (thread) => this.#externalQueue.has(thread.id),
       pendingQuestions: (threadId) => this.#pendingDelegationQuestions(threadId),
     });
     options.sharedThreads?.setLocalOwnershipProbe((threadId) => this.#hasLocalThread(threadId));
