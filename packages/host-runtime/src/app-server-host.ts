@@ -5028,6 +5028,7 @@ export class AppServerHost {
     };
     const gate = turnProjectionGate();
     thread.admittingTurnId = turnId;
+    thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
     thread.ephemeralTurnIds.add(turnId);
@@ -5058,10 +5059,12 @@ export class AppServerHost {
       });
       if (!result.ok)
         throw new ExternalCommandError(-32073, result.error.message, true, result.error.code);
+      if (!this.#externalSessionAvailable(thread) || this.#outputLoopStates.get(thread)?.ended) {
+        throw new ExternalCommandError(-32073, "External Thread is no longer available");
+      }
       if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.running = true;
       thread.activeTurnId = turnId;
-      thread.projectedTerminalTurnId = null;
       thread.clientCommand = {
         name: descriptor.invocation.slice(1),
         turn: projection.projector.snapshotTurn(),
@@ -6505,6 +6508,7 @@ export class AppServerHost {
     };
     const gate = turnProjectionGate();
     thread.admittingTurnId = turnId;
+    thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
     try {
@@ -6530,10 +6534,12 @@ export class AppServerHost {
         }
         throw new Error(result.error.message);
       }
+      if (!this.#externalSessionAvailable(thread) || this.#outputLoopStates.get(thread)?.ended) {
+        throw new Error("External Harness Session is no longer available");
+      }
       if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.running = true;
       thread.activeTurnId = turnId;
-      thread.projectedTerminalTurnId = null;
       gate.resolve();
       await this.#releaseInjectedText(thread, turnId, injected);
     } catch (error) {
@@ -6735,6 +6741,12 @@ export class AppServerHost {
         isUnacceptedSessionBusyError(error) &&
         (await this.#waitForAutonomousOccupation(thread, autonomousBefore))
       ) {
+        // Wait for any in-flight terminal projection (including queue pause on failed/cancelled
+        // autonomous Turns) before deciding whether to retry advancing the head item.
+        const loopState = this.#outputLoopStates.get(thread);
+        while (loopState?.processing) {
+          await loopState.processing.catch(() => undefined);
+        }
         if (
           !thread.running &&
           thread.activeTurnId === null &&
@@ -7323,6 +7335,7 @@ export class AppServerHost {
     };
     const gate = turnProjectionGate();
     thread.admittingTurnId = turnId;
+    thread.projectedTerminalTurnId = null;
     thread.projectedTurns.set(turnId, projection);
     thread.responseGates.set(turnId, gate);
 
@@ -7352,10 +7365,12 @@ export class AppServerHost {
       });
       if (!result.ok)
         throw new ExternalSteerError(-32073, result.error.message, true, result.error.code);
+      if (!this.#externalSessionAvailable(thread) || this.#outputLoopStates.get(thread)?.ended) {
+        throw new ExternalSteerError(-32073, "External Thread is no longer available");
+      }
       if (thread.admittingTurnId === turnId) thread.admittingTurnId = null;
       thread.running = true;
       thread.activeTurnId = turnId;
-      thread.projectedTerminalTurnId = null;
       await this.#releaseInjectedText(thread, turnId, injected);
       return { turnId, turn: projection.projector.pendingTurn(), gate };
     } catch (error) {
