@@ -80,17 +80,19 @@ export function codeBuddyCanonicalCwd(cwd: string) {
 export function codeBuddyConfigRoot(
   environment: NodeJS.ProcessEnv,
   profile: CodeBuddyRuntimeProfile,
+  source?: string,
 ) {
   const configuredRoot = profile.configDirectoryEnvironmentVariables
     .map((name) => environment[name])
     .find((value): value is string => typeof value === "string" && value.trim().length > 0);
-  return (
+  const root =
     configuredRoot ||
     path.join(
       environment.HOME || environment.USERPROFILE || homedir(),
       profile.defaultConfigDirectoryName,
-    )
-  );
+    );
+  profile.validateConfigRoot?.(root, source);
+  return root;
 }
 
 export function codeBuddyPrimaryHistoryPath(
