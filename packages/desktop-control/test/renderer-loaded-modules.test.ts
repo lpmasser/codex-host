@@ -7,12 +7,22 @@ function fixture(modules = ["app://-/assets/deep.js"]) {
   const listeners = new Map<string, Set<(params: unknown) => void>>();
   const pages = new Map<
     string,
-    { location: { href: string }; __codexhostLoadedModulesV1?: Catalog }
+    {
+      location: { href: string };
+      Event: typeof Event;
+      dispatchEvent: (event: Event) => boolean;
+      __codexhostLoadedModulesV1?: Catalog;
+    }
   >();
   const page = (uniqueId: string) => {
     let value = pages.get(uniqueId);
     if (!value) {
-      value = { location: { href: "app://-/index.html" } };
+      const target = new EventTarget();
+      value = {
+        location: { href: "app://-/index.html" },
+        Event,
+        dispatchEvent: target.dispatchEvent.bind(target),
+      };
       pages.set(uniqueId, value);
     }
     return value;
