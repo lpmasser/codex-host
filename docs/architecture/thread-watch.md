@@ -97,12 +97,12 @@ EOF
 
 `thread send --mailbox true`（HTTP/MCP `mailbox: true`）给忙碌的 Thread 发消息时不返回 `THREAD_BUSY`，也不打断它：
 
-- 收件 Thread 空闲、信箱里没有等它的内容、也不在 `--interrupt` 停止再发的过程中时，直接发送，与普通 `thread send` 相同，返回 `delivery: "started"`。
+- 收件 Thread 空闲、信箱里没有等它的内容、也没有待投递的 watch 通知、也不在 `--interrupt` 停止再发的过程中时，直接发送，与普通 `thread send` 相同，返回 `delivery: "started"`。
 - 否则消息进入信箱，返回 `delivery: "mailbox"` 和收件 Thread 当时的状态。信箱里已有内容时新消息排在后面，即使收件 Thread 此刻空闲，保证先后顺序。
 - 收件 Thread 空闲（外部 Thread 还要求 Desktop/Web 跟进队列为空）后，信箱里的消息按发出先后，连同同时到期的 watch 通知合成一轮送达，只启动一个 Turn。被 `--interrupt` 停止再发期间不投递。
 - 送达的文字以 `[codexhost mailbox] Messages sent to you while you were busy, oldest first:` 开头，每条前写明发件方和发出多久：发件方是 Thread 时为它的会话引用（标题读不到时用 ID），外部客户端为 `client <名称>`，无法识别时为 `an unidentified sender`。发件方取 Host 验证过的调用身份，其次是 CLI 的 `CODEXHOST_THREAD_ID` / `CODEX_THREAD_ID`，只用于显示，不参与授权。watch 通知部分保持原格式，接在最后；含信箱消息的一轮在 Web 中按普通用户消息显示，不折叠成通知卡片。
 - `--watch true` 搭配信箱时，观察的是处理这条消息的那一轮，而不是收件 Thread 当时正在跑的那一轮。直接发送时返回 `watch: { state: "watching" }`；消息进入信箱时返回 `watch: { state: "afterDelivery" }`，观察请求随消息存盘。两种情况都在发送成功后立即登记，不先读取状态，所以那一轮即使在第一次观察前就已结束，也会按它的结果通知；若那时收件 Thread 已开始另一轮，则在那一轮停下时通知。通知目标在发送前按 `thread watch` 的规则检查，不合格时消息照常发送，`watch` 为 `notRegistered` 并给出原因。
-- 只有 `THREAD_BUSY` 会把消息留进信箱；其他发送失败（Thread 不存在、只读等）照常返回给发件方。
+- 在发送失败的情况中，只有 `THREAD_BUSY` 会把消息留进信箱；其他发送失败（Thread 不存在、只读等）照常返回给发件方。
 - 投递规则与 watch 通知相同：最长等 6 小时（发送前若已超过 6 小时投递窗口，直接标记 `undeliverable` 而不继续发送），送达结果未知时不重发并标记 `undeliverable`，Host 重启后继续投递（可能重复一次）。等待中和无法送达的消息出现在 `thread watches` 中，带 `message` 和 `from`；此时 `threadId` 与 `notifyThreadId` 都是收件 Thread。
 - 单个收件 Thread 的待送达信箱最多保留 50 条消息、正文 UTF-8 总大小不超过 256 KiB；超限时返回 `MAILBOX_FULL` 且不写入新消息。
 - 主动 `thread cancel` 收件 Thread 不会删除别人发给它的信箱消息。用户在跟进队列为空时 Stop 收件 Thread，它空闲后信箱照常送达。

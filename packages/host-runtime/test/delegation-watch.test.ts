@@ -415,6 +415,23 @@ describe("DelegationWatchService", () => {
     ]);
   });
 
+  it("reuses the existing watch timeoutMs when a direct mailbox send already has an active watch", async () => {
+    const fake = runtime({ coord: { status: "running" }, line: { status: "running" } });
+    const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });
+    await service.watch({ threadId: "coord", notifyThreadId: "line", timeoutMs: 60_000 });
+    await expect(
+      service.mail({
+        threadId: "coord",
+        message: "follow up",
+        from: "line",
+        watch: { notifyThreadId: "line", timeoutMs: 5_000 },
+      }),
+    ).resolves.toMatchObject({
+      delivery: "started",
+      watch: { state: "watching", notifyThreadId: "line", timeoutMs: 60_000 },
+    });
+  });
+
   it("reports a mailbox watch that cannot be registered without holding the message", async () => {
     const fake = runtime({ coord: { status: "completed" } });
     const service = new DelegationWatchService(fake, { pollIntervalMs: POLL_MS });

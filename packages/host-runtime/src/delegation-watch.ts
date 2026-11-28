@@ -794,7 +794,8 @@ export class DelegationWatchService {
       status: "running",
       timeoutMs,
     };
-    if (this.#watching(threadId, notifyThreadId)) return result;
+    const existing = this.#watching(threadId, notifyThreadId);
+    if (existing) return { ...result, timeoutMs: existing.timeoutMs };
     const now = Date.now();
     const watch: Watch = {
       id: randomUUID(),
