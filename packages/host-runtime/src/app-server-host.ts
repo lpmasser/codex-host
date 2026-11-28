@@ -5204,6 +5204,7 @@ export class AppServerHost {
       if (thread.unsubmittedPrewarm && (await this.#externalRuntime.submitPrewarm(thread))) {
         await this.#notifyExternalThreadStarted(thread.thread);
       }
+      await this.#drainPendingAutonomousOutputs(thread);
       if (!this.#externalSessionAvailable(thread)) {
         throw new ExternalCommandError(-32073, "External Thread is no longer available");
       }
@@ -6675,6 +6676,7 @@ export class AppServerHost {
     thread.responseGates.set(turnId, gate);
     try {
       const stored = await this.#repository.find(thread.id);
+      await this.#drainPendingAutonomousOutputs(thread);
       if (!this.#externalSessionAvailable(thread)) {
         throw new Error("External Harness Session is no longer available");
       }
@@ -6845,6 +6847,21 @@ export class AppServerHost {
     await this.#writer.json({ method: "thread/queue/changed", params: { threadId } });
   }
 
+  async #drainPendingAutonomousOutputs(thread: ExternalThread): Promise<void> {
+    if (!thread.session.capabilities.autonomousTurns?.observe) return;
+    const state = this.#outputLoopStates.get(thread);
+    if (!state) return;
+    while (!state.ended) {
+      if (state.processing) {
+        await state.processing.catch(() => undefined);
+        continue;
+      }
+      const delivered = state.delivered;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (!state.processing && state.delivered === delivered) break;
+    }
+  }
+
   async #waitForAutonomousOccupation(
     thread: ExternalThread,
     autonomousBefore: number,
@@ -6913,6 +6930,7 @@ export class AppServerHost {
         if (
           !thread.running &&
           thread.activeTurnId === null &&
+          thread.admittingTurnId === null &&
           !this.#externalQueue.isPaused(thread.id)
         ) {
           void this.#startNextQueuedExternalTurn(thread, next.id);
@@ -7115,6 +7133,9 @@ export class AppServerHost {
     }
     try {
       this.#assertQueuedExternalItemUnclaimed(thread.id, itemId);
+      if (thread.admittingTurnId !== null) {
+        throw new ExternalQueueError(-32072, "External Thread is already starting a Turn");
+      }
       const started = this.#externalThreadBusy(thread)
         ? await this.#externalSteering.run(
             thread,
@@ -7156,6 +7177,7 @@ export class AppServerHost {
         !(error instanceof ExternalQueueError) &&
         !thread.running &&
         !thread.activeTurnId &&
+        !thread.admittingTurnId &&
         this.#externalQueue.pause(thread.id, "failed")
       )
         await this.#publishExternalQueue(thread.id);
@@ -7305,6 +7327,7 @@ export class AppServerHost {
         else if (
           !thread.running &&
           !thread.activeTurnId &&
+          !thread.admittingTurnId &&
           !this.#externalQueue.isPaused(thread.id)
         )
           this.#externalQueue.pause(thread.id, "failed");
@@ -7509,6 +7532,7 @@ export class AppServerHost {
       }
       const stored = await this.#repository.find(thread.id);
       const injected = withInjectedText(stored, rewriteDelegationMentionText(text));
+      await this.#drainPendingAutonomousOutputs(thread);
       if (!this.#externalSessionAvailable(thread)) {
         throw new ExternalSteerError(-32073, "External Thread is no longer available");
       }
